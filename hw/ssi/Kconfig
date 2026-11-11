@@ -1,0 +1,51 @@
+config PL022
+    bool
+    select SSI
+
+config SIFIVE_SPI
+    bool
+    select SSI
+
+config SSI
+    bool
+
+config DRA7_MCSPI
+    bool
+    select SSI
+
+config TJA1145
+    bool
+    select SSI
+    select CAN_BUS
+
+config LIS331DLH
+    bool
+    select SSI
+
+config XILINX_SPI
+    bool
+    select SSI
+
+config XILINX_SPIPS
+    bool
+    select SSI
+
+config STM32F2XX_SPI
+    bool
+    select SSI
+
+config BCM2835_SPI
+    bool
+    select SSI
+
+config PNV_SPI
+    bool
+    select SSI
+
+config ALLWINNER_A10_SPI
+    bool
+    select SSI
+
+config TEGRA124_SPI
+    bool
+    select SSI

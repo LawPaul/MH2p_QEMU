@@ -1,0 +1,51 @@
+# See docs/devel/tracing.rst for syntax documentation.
+
+# wctablet.c
+wct_init(void) ""
+wct_cmd_re(void) ""
+wct_cmd_st(void) ""
+wct_cmd_sp(void) ""
+wct_cmd_ts(int input) "0x%02x"
+wct_cmd_other(const char *cmd) "%s"
+wct_speed(int speed) "%d"
+
+# spice.c
+spice_chr_discard_write(int len) "spice chr write discarded %d"
+spice_vmc_write(ssize_t out, int len) "spice wrote %zd of requested %d"
+spice_vmc_read(int bytes, int len) "spice read %d of requested %d"
+spice_vmc_register_interface(void *scd) "spice vmc registered interface %p"
+spice_vmc_unregister_interface(void *scd) "spice vmc unregistered interface %p"
+spice_vmc_event(int event) "spice vmc event %d"
+
+# char-socket.c
+chr_socket_poll_err(void *chrdev, const char *label) "chardev socket poll error %p (%s)"
+chr_socket_recv_err(void *chrdev, const char *label, const char *err) "chardev socket recv error %p (%s): %s"
+chr_socket_recv_eof(void *chrdev, const char *label) "chardev socket recv end-of-file %p (%s)"
+chr_socket_write_err(void *chrdev, const char *label, const char *err) "chardev socket write error %p (%s): %s"
+chr_socket_disconnect(void *chrdev, const char *label) "chardev socket disconnect %p (%s)"
+chr_socket_hangup(void *chrdev, const char *label) "chardev socket hangup %p (%s)"
+chr_socket_ws_handshake_err(void *chrdev, const char *label, const char *err) "chardev socket websock handshake error %p (%s): %s"
+chr_socket_tls_handshake_err(void *chrdev, const char *label, const char *err) "chardev socket TLS handshake error %p (%s): %s"
+chr_socket_tls_init_err(void *chrdev, const char *label, const char *err) "chardev socket TLS init error %p (%s): %s"
+
+# mh2p-rstp.c
+mh2p_rstp_rx(uint8_t flag, uint8_t chn, uint8_t sqn, unsigned len) "flag 0x%02x chn 0x%02x sqn %u len %u"
+mh2p_rstp_rx_data(uint8_t chn, unsigned len, uint8_t first) "chn 0x%02x len %u first 0x%02x"
+mh2p_rstp_tx(uint8_t flag, uint8_t chn, uint8_t sqn, unsigned len) "flag 0x%02x chn 0x%02x sqn %u len %u"
+mh2p_rstp_retransmit(uint8_t chn, uint8_t sqn) "chn 0x%02x sqn %u"
+mh2p_rstp_resync(uint8_t chn, uint8_t last, uint8_t sqn) "chn 0x%02x last %u sqn %u"
+mh2p_rstp_drop(const char *why, uint8_t flag, unsigned len) "%s flag 0x%02x len %u"
+mh2p_rstp_ack_ignored(uint8_t chn, uint8_t sqn) "chn 0x%02x unsent or retired sqn %u"
+mh2p_rstp_overflow(uint8_t flag, unsigned len) "flag 0x%02x len %u"
+mh2p_rstp_tx_full(uint8_t chn, uint8_t fid) "chn 0x%02x fid 0x%02x"
+mh2p_rstp_keypanel(uint8_t fid, unsigned len) "fid 0x%02x len %u"
+mh2p_rstp_touch(uint8_t fingers, int x, int y, uint8_t dt) "fingers %u x %d y %d dt %u"
+mh2p_rstp_multitouch(unsigned updates, unsigned fingers, uint8_t dt) "updates %u fingers %u dt %u"
+mh2p_rstp_touch_contact(unsigned id, bool active, unsigned x, unsigned y) "id %u active %d raw-x %u raw-y %u"
+mh2p_rstp_key(uint8_t kbd, uint8_t key, uint8_t state) "kbd %u key %u state %u"
+mh2p_rstp_watchdog_tx(uint32_t counter) "counter %u"
+mh2p_rstp_watchdog_rx(uint32_t counter) "counter %u"
+mh2p_rstp_watchdog_reply_ignored(uint32_t reply, uint32_t next) "reply %u next %u"
+mh2p_rstp_uart_blocked(int64_t guest_ns, unsigned queued) "guest-ns %" PRId64 " queued %u"
+mh2p_rstp_uart_write(int64_t guest_ns, unsigned len, unsigned queued) "guest-ns %" PRId64 " len %u queued %u"
+mh2p_rstp_encoder(uint8_t kbd, int steps) "kbd %u steps %d"

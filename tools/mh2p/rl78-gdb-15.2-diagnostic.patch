@@ -1,0 +1,844 @@
+--- a/sim/rl78/mem.c
++++ b/sim/rl78/mem.c
+@@ -41,0 +42,233 @@
++static int diagnostic_erased_data_flash;
++static int diagnostic_pfdl_api;
++static int diagnostic_pfdl_open;
++static int diagnostic_f13_pior;
++static int diagnostic_f13_clock;
++static int diagnostic_cmc_written;
++static int diagnostic_f13_tau;
++static int diagnostic_f13_trd;
++static unsigned short diagnostic_tps0;
++static unsigned short diagnostic_pwmdly1;
++static int diagnostic_f13_irq;
++static int diagnostic_f13_ports;
++
++static int
++f13_port_mask (int address)
++{
++  switch (address)
++    {
++    case 0xf0077:
++      return 0x01;
++    case 0xf0076:
++      return 0x1f;
++    case 0xf0030:
++    case 0xf0026:
++    case 0xf0056:
++    case 0xfff00:
++    case 0xfff20:
++      return 0x0f;
++    case 0xf0023:
++    case 0xf0043:
++      return 0x01;
++    case 0xf0024:
++      return 0x08;
++    case 0xf0025:
++      return 0x1d;
++    case 0xf0027:
++      return 0xeb;
++    case 0xf0033:
++    case 0xf0057:
++      return 0x07;
++    case 0xf0045:
++      return 0x10;
++    case 0xf0046:
++      return 0x0c;
++    case 0xf0047:
++      return 0x0b;
++    case 0xfff03:
++    case 0xfff23:
++      return 0x1f;
++    case 0xf0051:
++    case 0xf0031:
++    case 0xf0034:
++    case 0xf0035:
++    case 0xf0036:
++    case 0xf0037:
++    case 0xfff01:
++    case 0xfff21:
++    case 0xfff04:
++    case 0xfff24:
++    case 0xfff05:
++    case 0xfff25:
++    case 0xfff06:
++    case 0xfff26:
++    case 0xfff07:
++    case 0xfff27:
++      return 0xff;
++    case 0xf0041:
++    case 0xf0021:
++      return 0xdb;
++    default:
++      return 0;
++    }
++}
++
++static void
++f13_port_check_word (int address)
++{
++  if (diagnostic_f13_ports
++      && (f13_port_mask (address) || f13_port_mask (address + 1)))
++    {
++      fprintf (stderr, "Unsupported word access to F13 port register "
++               "0x%05x, PC 0x%05x\n", address, pc);
++      exit (1);
++    }
++}
++
++static int
++f13_irq_register (int address)
++{
++  if (address >= 0xfff38 && address <= 0xfff3b)
++    return 3;
++  if ((address >= 0xfffd0 && address <= 0xfffd2)
++      || (address >= 0xfffe0 && address <= 0xfffe3))
++    return 1;
++  if ((address >= 0xfffd4 && address <= 0xfffd6)
++      || (address >= 0xfffd8 && address <= 0xfffda)
++      || (address >= 0xfffdc && address <= 0xfffde)
++      || (address >= 0xfffe4 && address <= 0xfffef))
++    return 2;
++  return 0;
++}
++
++static void
++f13_irq_check_word (int address)
++{
++  if (diagnostic_f13_irq
++      && (f13_irq_register (address) || f13_irq_register (address + 1))
++      && (f13_irq_register (address) == 3
++          || f13_irq_register (address + 1) == 3
++          || (address & 1) || !f13_irq_register (address)
++          || !f13_irq_register (address + 1)))
++    {
++      fprintf (stderr, "Unsupported word access to F13 interrupt register "
++               "0x%05x, PC 0x%05x\n", address, pc);
++      exit (1);
++    }
++}
++
++static int
++f13_tau_register (int address)
++{
++  return address == 0xf0190 || address == 0xf0191
++    || (address >= 0xf01b4 && address <= 0xf01bb)
++    || address == 0xf022a || address == 0xf022b;
++}
++
++static void
++f13_trd_require_clock (void)
++{
++  if (!(memory[0xf02c0] & 0x10))
++    {
++      fprintf (stderr, "F13 Timer RD clock disabled, PC 0x%05x\n", pc);
++      exit (1);
++    }
++}
++
++static void
++f13_tau_check_word (int address)
++{
++  if (diagnostic_f13_trd && (address == 0xf0227 || address == 0xf0229))
++    {
++      fprintf (stderr, "Unsupported overlapping word access to F13 "
++               "PWMDLY0, PC 0x%05x\n", pc);
++      exit (1);
++    }
++  if (diagnostic_f13_trd && (address == 0xf0262 || address == 0xf0263))
++    {
++      fprintf (stderr, "Unsupported word access to byte-only F13 Timer RD "
++               "start-control register, PC 0x%05x\n", pc);
++      exit (1);
++    }
++  if (diagnostic_f13_tau
++      && (address == 0xf0070 || address == 0xf0071
++          || address == 0xf0073 || address == 0xf0074
++          || ((f13_tau_register (address)
++               || f13_tau_register (address + 1))
++              && ((address & 1) || !f13_tau_register (address)
++                  || !f13_tau_register (address + 1)))))
++    {
++      fprintf (stderr, "Unsupported word access to F13 TAU0 register at "
++               "0x%05x, PC 0x%05x\n", address, pc);
++      exit (1);
++    }
++}
++
++static void
++f13_tau_require_clock (void)
++{
++  if (!(memory[0xf00f0] & 1))
++    {
++      fprintf (stderr, "F13 TAU0 configuration while PER0.TAU0EN "
++               "is disabled, PC 0x%05x\n", pc);
++      exit (1);
++    }
++}
++
++static int
++f13_clock_mask (int address)
++{
++  switch (address)
++    {
++    case 0xf00a0:
++      return 0x3f;
++    case 0xf00a8:
++    case 0xf02c7:
++      return 0x07;
++    case 0xf00f3:
++      return 0x90;
++    case 0xf00f0:
++      return 0xbf;
++    case 0xf02c0:
++      return 0xb9;
++    case 0xf02c1:
++      return 0x0d;
++    case 0xf02c4:
++      return 0x05;
++    case 0xf02c5:
++      return 0xf7;
++    case 0xf02c2:
++      return 0x01;
++    case 0xf02c3:
++      return 0x33;
++    case 0xf02c8:
++      return 0xc3;
++    case 0xfffa0:
++      return 0xf7;
++    case 0xfffa1:
++      return 0xc1;
++    case 0xfffa4:
++      return 0x50;
++    default:
++      return 0;
++    }
++}
++
++static int
++f13_pior_mask (int address)
++{
++  switch (address)
++    {
++    case 0xf0016:
++    case 0xf0017:
++      return 0xff;
++    case 0xf001a:
++      return 0x7f;
++    case 0xf001b:
++      return 0x0d;
++    case 0xf001d:
++      return 0x0b;
++    default:
++      return 0;
++    }
++}
+@@ -47,0 +281,4 @@
++  int address;
++
++  fprintf (stderr, "MH2P strict RL78 diagnostic v2; "
++           "unmodeled peripherals rejected, synthetic timer disabled.\n");
+@@ -49,0 +287,111 @@
++  memory[0xf0090] = 0;
++  diagnostic_erased_data_flash =
++    getenv ("MH2P_DIAGNOSTIC_ERASED_DATA_FLASH") != NULL;
++  diagnostic_pfdl_api = getenv ("MH2P_DIAGNOSTIC_PFDL_API") != NULL;
++  diagnostic_pfdl_open = 0;
++  diagnostic_f13_ports = getenv ("MH2P_DIAGNOSTIC_F13_PORTS") != NULL;
++  if (diagnostic_f13_ports)
++    {
++      for (address = 0xf0021; address <= 0xfff27; address++)
++        if (f13_port_mask (address))
++          memory[address] = address >= 0xfff20 ? 0xff : 0;
++      memory[0xf0034] = 1;
++      fprintf (stderr, "Diagnostic F13/F14 initial P0/P1/P3-P7 configuration "
++               "enabled; 100-pin profile, package unverified. No external "
++               "pin values, pull-up levels or alternate-function data "
++               "supplied.\n");
++    }
++  diagnostic_f13_irq = getenv ("MH2P_DIAGNOSTIC_F13_IRQ") != NULL;
++  if (diagnostic_f13_irq)
++    {
++      for (address = 0xfff38; address <= 0xfff3b; address++)
++        memory[address] = 0;
++      for (address = 0xfffd0; address <= 0xfffef; address++)
++        if (f13_irq_register (address))
++          memory[address] = f13_irq_register (address) == 1 ? 0 : 0xff;
++      fprintf (stderr, "Diagnostic F13/F14 interrupt configuration enabled; "
++               "100-pin register profile, package unverified. No IRQ "
++               "generation or dispatch supplied; software requests rejected.\n");
++    }
++  diagnostic_f13_clock = getenv ("MH2P_DIAGNOSTIC_F13_CLOCK") != NULL;
++  diagnostic_f13_tau = getenv ("MH2P_DIAGNOSTIC_F13_TAU") != NULL;
++  diagnostic_f13_trd = getenv ("MH2P_DIAGNOSTIC_F13_TRD") != NULL;
++  if (diagnostic_f13_trd)
++    {
++      if (!diagnostic_f13_clock)
++        {
++          fprintf (stderr, "F13 Timer RD diagnostic requires explicit "
++                   "F13 clock retention.\n");
++          exit (1);
++        }
++      memory[0xf0263] = 0x0c;
++      memory[0xf0228] = 0;
++      memory[0xf0229] = 0;
++      fprintf (stderr, "Diagnostic F13/F14 Timer RD stopped start-control "
++               "and PWMDLY0 retention enabled; no running counter, compare "
++               "match, pin or IRQ supplied.\n");
++    }
++  diagnostic_tps0 = 0;
++  diagnostic_pwmdly1 = 0;
++  if (diagnostic_f13_tau)
++    {
++      memory[0xf0071] = 0;
++      memory[0xf0074] = 0;
++      memory[0xf0190] = 0;
++      memory[0xf0191] = 0;
++      memory[0xf01b8] = 0;
++      memory[0xf01b9] = 0;
++      memory[0xf01ba] = 0;
++      memory[0xf01bb] = 0;
++      if (!diagnostic_f13_clock)
++        {
++          fprintf (stderr, "F13 TAU0 diagnostic requires explicit "
++                   "F13 clock retention.\n");
++          exit (1);
++        }
++      fprintf (stderr, "Diagnostic F13/F14 TAU0 stopped configuration "
++               "enabled; no running timer, pin signal, waveform or IRQ "
++               "supplied. TIS0 product-group-dependent sources rejected.\n");
++    }
++  diagnostic_cmc_written = 0;
++  if (diagnostic_f13_clock)
++    {
++      memory[0xf00f3] = 0;
++      memory[0xf00f0] = 0;
++      memory[0xf02c0] = 0;
++      memory[0xf02c1] = 0;
++      memory[0xf02c4] = 0;
++      memory[0xf02c5] = 0;
++      memory[0xf02c2] = 0;
++      memory[0xf02c3] = 0;
++      memory[0xf02c8] = 0;
++      memory[0xfffa0] = 0;
++      memory[0xfffa1] = 0xc0;
++      memory[0xfffa4] = 0;
++      fprintf (stderr, "Diagnostic F13/F14 clock request retention enabled; "
++               "no oscillator stabilization, PLL lock or clock switch "
++               "completion is supplied.\n");
++    }
++  diagnostic_f13_pior = getenv ("MH2P_DIAGNOSTIC_F13_PIOR") != NULL;
++  if (diagnostic_f13_pior)
++    {
++      for (address = 0xf0016; address <= 0xf001d; address++)
++        if (f13_pior_mask (address))
++          memory[address] = 0;
++      fprintf (stderr, "Diagnostic F13/F14 PIOR0/1/4/5/7 retention enabled; "
++               "package, board pin wiring and external signals unverified.\n");
++    }
++  if (diagnostic_pfdl_api)
++    {
++      if (!diagnostic_erased_data_flash)
++        {
++          fprintf (stderr, "PFDL API diagnostic requires explicit erased "
++                   "read-only data-flash fixture.\n");
++          exit (1);
++        }
++      fprintf (stderr, "Diagnostic PFDL open/close API substitution enabled; "
++               "not original MCU ROM execution or verified board timing.\n");
++    }
++  if (diagnostic_erased_data_flash)
++    fprintf (stderr, "Diagnostic erased data-flash reads enabled; "
++             "not recovered factory contents or writable flash.\n");
+@@ -53,0 +402,11 @@
++  if (diagnostic_f13_clock)
++    {
++      initted[0xf00a0] = 0;
++      initted[0xf00a8] = 0;
++      initted[0xf02c7] = 0;
++    }
++  if (diagnostic_pfdl_api)
++    {
++      memset (initted + 0xf0800, 0, 8);
++      memset (initted + 0xf0880, 0, 2);
++    }
+@@ -105,0 +465,116 @@
++diagnostic_pfdl_parameter (int address)
++{
++  return diagnostic_pfdl_api
++    && ((address >= 0xf0800 && address < 0xf0808)
++        || address == 0xf0880 || address == 0xf0881);
++}
++
++static void
++reject_unmodeled_peripheral (int address, const char *operation)
++{
++  if (diagnostic_f13_trd && address == 0xf0263)
++    {
++      f13_trd_require_clock ();
++      return;
++    }
++  if (diagnostic_f13_trd && (address == 0xf0228 || address == 0xf0229))
++    {
++      fprintf (stderr, "Unsupported byte or bit access to word-only F13 "
++               "PWMDLY0, PC 0x%05x\n", pc);
++      exit (1);
++    }
++  if (diagnostic_f13_ports && f13_port_mask (address))
++    return;
++  if (diagnostic_f13_irq && f13_irq_register (address))
++    return;
++  if (diagnostic_f13_tau && (address == 0xf0071 || address == 0xf0074))
++    return;
++  if (diagnostic_f13_tau && f13_tau_register (address))
++    {
++      fprintf (stderr, "Unsupported byte %s to word-only F13 TAU0 "
++               "diagnostic register 0x%05x, PC 0x%05x\n",
++               operation, address, pc);
++      exit (1);
++    }
++  if (diagnostic_f13_clock && f13_clock_mask (address))
++    {
++      if (strcmp (operation, "read") == 0 && !initted[address])
++        {
++          fprintf (stderr, "Unknown chip/option-dependent F13 clock reset "
++                   "read at 0x%05x, PC 0x%05x\n", address, pc);
++          exit (1);
++        }
++      return;
++    }
++  if (diagnostic_f13_pior && f13_pior_mask (address))
++    return;
++  if (diagnostic_pfdl_parameter (address))
++    {
++      if (strcmp (operation, "read") == 0 && !initted[address])
++        {
++          fprintf (stderr, "Uninitialized diagnostic PFDL parameter read "
++                   "at 0x%05x, PC 0x%05x\n", address, pc);
++          exit (1);
++        }
++      return;
++    }
++  if (((address >= 0xf0000 && address < 0xf2000)
++       || address >= 0xfff00)
++      && address != RL78_SFR_SP && address != RL78_SFR_SP + 1
++      && address != RL78_SFR_PSW && address != RL78_SFR_CS
++      && address != RL78_SFR_ES && address != RL78_SFR_PMC
++      && address != 0xf0090)
++    {
++      fprintf (stderr, "Unmodeled MH2P SubCPU peripheral %s at 0x%05x, "
++               "PC 0x%05x\n", operation, address, pc);
++      exit (1);
++    }
++}
++
++int
++mh2p_diagnostic_pfdl_call (int target)
++{
++  int descriptor;
++  int frequency;
++  int voltage;
++
++  if (!diagnostic_pfdl_api
++      || (target != 0xefff8 && target != 0xef004 && target != 0xef008))
++    return 0;
++  if (target == 0xef008 && diagnostic_pfdl_open && pc == 0x124e)
++    {
++      diagnostic_pfdl_open = 0;
++      fprintf (stderr, "Diagnostic PFDL API close at PC 0x%05x; "
++               "no flash writes performed.\n", pc);
++      return 1;
++    }
++  if (target != 0xefff8 || diagnostic_pfdl_open
++      || pc != 0x11d6
++      || get_reg (RL78_Reg_C) != 0 || !(memory[0xf0090] & 1)
++      || !initted[0xf0803] || memory[0xf0803] != 1
++      || !initted[0xf0804] || !initted[0xf0805])
++    {
++      fprintf (stderr, "Unsupported diagnostic PFDL API call 0x%05x, "
++               "command 0x%02x, PC 0x%05x\n",
++               target, get_reg (RL78_Reg_C), pc);
++      exit (1);
++    }
++  descriptor = 0xf0000 | memory[0xf0804] | (memory[0xf0805] << 8);
++  frequency = mem_get_qi (descriptor);
++  voltage = mem_get_qi (descriptor + 1);
++  if (frequency != 8 || voltage != 0)
++    {
++      fprintf (stderr, "Unsupported diagnostic PFDL descriptor "
++               "frequency=%d voltage=%d, PC 0x%05x\n",
++               frequency, voltage, pc);
++      exit (1);
++    }
++  diagnostic_pfdl_open = 1;
++  set_reg (RL78_Reg_C, 0);
++  fprintf (stderr, "Diagnostic PFDL API open: original descriptor "
++           "8 MHz/full-speed; oscillator precondition assumed, "
++           "not measured. No MCU ROM instructions executed.\n");
++  return 1;
++}
++
++static int
+@@ -126,0 +602,11 @@
++  reject_unmodeled_peripheral (address, "write");
++  if (diagnostic_f13_tau && address == 0xf0074)
++    {
++      if ((value & ~7) || (value & 7) == 1 || (value & 7) > 5)
++        {
++          fprintf (stderr, "Unsupported F13 TIS0 selection 0x%02x; "
++                   "reserved, prohibited or product-group-dependent "
++                   "source, PC 0x%05x\n", value, pc);
++          exit (1);
++        }
++    }
+@@ -127,0 +614,114 @@
++  reject_unmodeled_peripheral (address, "write");
++  if (diagnostic_f13_trd && address == 0xf0263 && (value & ~0x0c))
++    {
++      fprintf (stderr, "Unsupported F13 Timer RD start or reserved bits "
++               "0x%02x, PC 0x%05x\n", value, pc);
++      exit (1);
++    }
++  if (diagnostic_f13_ports && f13_port_mask (address))
++    {
++      int mask = f13_port_mask (address);
++      int fixed = address >= 0xfff20 && address <= 0xfff27 ? ~mask & 0xff : 0;
++      if ((value & ~mask) != fixed)
++        fprintf (stderr, "Ignoring fixed F13 port bits at 0x%05x: "
++                 "value=0x%02x mask=0x%02x, PC 0x%05x\n",
++                 address, value, mask, pc);
++      value = (value & mask) | fixed;
++      if (address == 0xf0076 && value > 0x18)
++        {
++          fprintf (stderr, "Prohibited F13 ADPC value 0x%02x, "
++                   "PC 0x%05x\n", value, pc);
++          exit (1);
++        }
++    }
++  if (diagnostic_f13_irq && f13_irq_register (address) == 1 && value)
++    {
++      fprintf (stderr, "Unmodeled F13 software interrupt request at "
++               "0x%05x: value=0x%02x, PC 0x%05x\n", address, value, pc);
++      exit (1);
++    }
++  if (diagnostic_f13_irq && f13_irq_register (address) == 3)
++    {
++      int mask = address < 0xfff3a ? 0xff : 0x3f;
++      if (value & ~mask)
++        {
++          fprintf (stderr, "Reserved F13 external interrupt edge bits at "
++                   "0x%05x: value=0x%02x, PC 0x%05x\n", address, value, pc);
++          exit (1);
++        }
++    }
++  if (diagnostic_f13_clock && f13_clock_mask (address))
++    {
++      int mask = f13_clock_mask (address);
++      int reserved = address == 0xfffa4 ? 0x0f : ~mask & 0xff;
++      if (value & reserved)
++        {
++          fprintf (stderr, "Reserved F13 clock bits at 0x%05x: "
++                   "value=0x%02x, PC 0x%05x\n", address, value, pc);
++          exit (1);
++        }
++      if ((address == 0xf00a8 && value > 3)
++          || (address == 0xf02c7 && value > 6))
++        {
++          fprintf (stderr, "Unsupported F13 clock divider "
++                   "0x%02x at 0x%05x, PC 0x%05x\n", value, address, pc);
++          exit (1);
++        }
++      if (address == 0xfffa0)
++        {
++          if (diagnostic_cmc_written || (value & 6) == 6)
++            {
++              fprintf (stderr, "Unsupported CMC rewrite or prohibited gain "
++                       "0x%02x, PC 0x%05x\n", value, pc);
++              exit (1);
++            }
++          diagnostic_cmc_written = 1;
++        }
++      if (address == 0xfffa1
++          && (!diagnostic_cmc_written || (value & 1)))
++        {
++          fprintf (stderr, "Unsupported CSC request before CMC setup or "
++                   "stopping active CPU oscillator, PC 0x%05x\n", pc);
++          exit (1);
++        }
++      if (address == 0xfffa4 && (value & mask))
++        {
++          fprintf (stderr, "Unmodeled F13 CPU clock switch request "
++                   "0x%02x, PC 0x%05x\n", value, pc);
++          exit (1);
++        }
++      if (address == 0xf02c5
++          && ((value & 5) || (value & 0xc0) == 0xc0))
++        {
++          fprintf (stderr, "Unsupported PLL start/switch or prohibited "
++                   "lock counter 0x%02x, PC 0x%05x\n", value, pc);
++          exit (1);
++        }
++      if (address == 0xfffa4 && (value & 0xa0))
++        fprintf (stderr, "Ignoring read-only CKC status write "
++                 "0x%02x, PC 0x%05x\n", value, pc);
++      if (diagnostic_f13_tau && address == 0xf00f0 && !(value & 1)
++          && (diagnostic_tps0 || diagnostic_pwmdly1
++              || memory[0xf0190] || memory[0xf0191] || memory[0xf01b8]))
++        {
++          fprintf (stderr, "Unsupported TAU0 clock disable after "
++                   "configuration, PC 0x%05x\n", pc);
++          exit (1);
++        }
++      value &= mask;
++    }
++  if (diagnostic_f13_pior && f13_pior_mask (address))
++    {
++      int mask = f13_pior_mask (address);
++      if (value & ~mask)
++        fprintf (stderr, "Ignoring read-only PIOR bits at 0x%05x: "
++                 "value=0x%02x mask=0x%02x, PC 0x%05x\n",
++                 address, value, mask, pc);
++      value &= mask;
++    }
++  if (address == 0xf0090 && (value & ~1))
++    {
++      fprintf (stderr, "Unsupported DFLCTL value 0x%02x, PC 0x%05x\n",
++               value, pc);
++      exit (1);
++    }
+@@ -229,0 +830,12 @@
++  if (diagnostic_erased_data_flash
++      && address >= 0xf1000 && address < 0xf2000)
++    {
++      if (!(memory[0xf0090] & 1))
++        {
++          fprintf (stderr, "Data-flash read while DFLCTL disabled, PC 0x%05x\n",
++                   pc);
++          exit (1);
++        }
++      return 0xff;
++    }
++  reject_unmodeled_peripheral (address, "read");
+@@ -230,0 +843,25 @@
++  reject_unmodeled_peripheral (address, "read");
++  if (diagnostic_pfdl_parameter (address))
++    return memory[address];
++  if (diagnostic_f13_pior && f13_pior_mask (address))
++    return memory[address];
++  if (diagnostic_f13_clock && f13_clock_mask (address))
++    return memory[address];
++  if (diagnostic_f13_irq && f13_irq_register (address))
++    return memory[address];
++  if (diagnostic_f13_tau && (address == 0xf0071 || address == 0xf0074))
++    return memory[address];
++  if (diagnostic_f13_trd && address == 0xf0263)
++    return memory[address];
++  if (diagnostic_f13_ports && f13_port_mask (address))
++    {
++      if ((address >= 0xfff00 && address <= 0xfff07)
++          && ((memory[address + 0x20] & f13_port_mask (address))
++              || (memory[0xf0077] & 1)))
++        {
++          fprintf (stderr, "Unmodeled F13 external pin read at "
++                   "0x%05x, PC 0x%05x\n", address, pc);
++          exit (1);
++        }
++      return memory[address];
++    }
+@@ -232,0 +870,2 @@
++    case 0xf0090:
++      return memory[address];
+@@ -295,0 +935,7 @@
++  if (!skip_init && address >= ram_base && address < 0xffee0
++      && !initted[address])
++    {
++      fprintf (stderr, "Uninitialized MH2P SubCPU RAM read at "
++               "0x%05x, PC 0x%05x\n", address, pc);
++      exit (1);
++    }
+@@ -317,0 +964,13 @@
++mem_put_qi_bit (int address, int bit, int value)
++{
++  int previous;
++  if (diagnostic_f13_ports && address >= 0xfff00 && address <= 0xfff07
++      && f13_port_mask (address))
++    previous = memory[address];
++  else
++    previous = mem_get_qi (address);
++  mem_put_qi (address, value ? previous | (1 << bit)
++              : previous & ~(1 << bit));
++}
++
++void
+@@ -319,0 +979,71 @@
++  f13_port_check_word (address);
++  f13_irq_check_word (address);
++  f13_tau_check_word (address);
++  if (diagnostic_f13_trd && address == 0xf0228)
++    {
++      f13_trd_require_clock ();
++      memory[address] = value;
++      memory[address + 1] = value >> 8;
++      return;
++    }
++  if (diagnostic_f13_tau
++      && (address == 0xf0190 || address == 0xf01b8 || address == 0xf01ba))
++    {
++      f13_tau_require_clock ();
++      if (address == 0xf0190)
++        {
++          int trigger = (value >> 8) & 7;
++          int mode = value & 15;
++          if ((value & 0x2030) || trigger > 2
++              || !(mode == 0 || mode == 1 || mode == 4 || mode == 5
++                   || mode == 6 || mode == 8 || mode == 9 || mode == 12))
++            {
++              fprintf (stderr, "Prohibited F13 TMR00 configuration "
++                       "0x%04x, PC 0x%05x\n", value, pc);
++              exit (1);
++            }
++          if (value & 0x0800)
++            fprintf (stderr, "Ignoring fixed F13 TMR00 bit 11, "
++                     "PC 0x%05x\n", pc);
++          value &= ~0x0800;
++        }
++      else if (value & 0xff00)
++        {
++          fprintf (stderr, "Reserved F13 TAU0 output bits at "
++                   "0x%05x: value=0x%04x, PC 0x%05x\n",
++                   address, value, pc);
++          exit (1);
++        }
++      if (address == 0xf01ba && value)
++        {
++          fprintf (stderr, "Unmodeled F13 TAU0 waveform output enable "
++                   "0x%04x, PC 0x%05x\n", value, pc);
++          exit (1);
++        }
++      memory[address] = value;
++      memory[address + 1] = value >> 8;
++      return;
++    }
++  if (diagnostic_f13_tau
++      && (address == 0xf01b4 || address == 0xf01b6 || address == 0xf022a))
++    {
++      int mask = address == 0xf01b4 ? 0x0aff
++        : address == 0xf022a ? 0xfffc : 0xffff;
++      f13_tau_require_clock ();
++      if (value & ~mask)
++        fprintf (stderr, "Ignoring reserved TAU0 write bits at 0x%05x: "
++                 "value=0x%04x mask=0x%04x, PC 0x%05x\n",
++                 address, value, mask, pc);
++      if (address == 0xf01b6)
++        diagnostic_tps0 = value;
++      else if (address == 0xf022a)
++        diagnostic_pwmdly1 = value & mask;
++      return;
++    }
++  if (diagnostic_f13_clock
++      && (f13_clock_mask (address) || f13_clock_mask (address + 1)))
++    {
++      fprintf (stderr, "Unsupported word write to F13 clock register "
++               "0x%05x, PC 0x%05x\n", address, pc);
++      exit (1);
++    }
+@@ -385,0 +1116,21 @@
++unsigned char
++mem_get_qi_masked (int address, unsigned char mask)
++{
++  if (diagnostic_f13_ports && address >= 0xfff00 && address <= 0xfff07
++      && f13_port_mask (address))
++    {
++      int unknown = memory[address + 0x20];
++      if (memory[0xf0077] & 1)
++        unknown = 0xff;
++      if (mask & unknown & f13_port_mask (address))
++        {
++          fprintf (stderr, "Unmodeled F13 external pin read at "
++                   "0x%05x: required mask=0x%02x, PC 0x%05x\n",
++                   address, mask, pc);
++          exit (1);
++        }
++      return memory[address] & mask;
++    }
++  return mem_get_qi (address);
++}
++
+@@ -389,0 +1141,32 @@
++
++  f13_port_check_word (address);
++  f13_irq_check_word (address);
++  f13_tau_check_word (address);
++  if (diagnostic_f13_trd && address == 0xf0228)
++    {
++      f13_trd_require_clock ();
++      return memory[address] | memory[address + 1] << 8;
++    }
++  if (diagnostic_f13_tau
++      && (address == 0xf0190 || address == 0xf01b8 || address == 0xf01ba))
++    {
++      f13_tau_require_clock ();
++      return memory[address] | memory[address + 1] << 8;
++    }
++  if (diagnostic_f13_tau
++      && (address == 0xf01b4 || address == 0xf01b6 || address == 0xf022a))
++    {
++      f13_tau_require_clock ();
++      if (address == 0xf01b6)
++        return diagnostic_tps0;
++      if (address == 0xf022a)
++        return diagnostic_pwmdly1;
++      return 0;
++    }
++  if (diagnostic_f13_clock
++      && (f13_clock_mask (address) || f13_clock_mask (address + 1)))
++    {
++      fprintf (stderr, "Unsupported word read from F13 clock register "
++               "0x%05x, PC 0x%05x\n", address, pc);
++      exit (1);
++    }
+--- a/sim/rl78/mem.h
++++ b/sim/rl78/mem.h
+@@ -30,0 +31 @@
++int mh2p_diagnostic_pfdl_call (int target);
+@@ -38,0 +40 @@
++void mem_put_qi_bit (int address, int bit, int value);
+@@ -47,0 +50 @@
++unsigned char mem_get_qi_masked (int address, unsigned char mask);
+--- a/sim/rl78/rl78.c
++++ b/sim/rl78/rl78.c
+@@ -116,0 +117,4 @@
++      else if (i == 0 && rd->op[1].type == RL78_Operand_Immediate
++               && (rd->id == RLO_and || rd->id == RLO_or))
++        v = mem_get_qi_masked (v, rd->id == RLO_and
++                              ? rd->op[1].addend : ~rd->op[1].addend);
+@@ -124 +128,2 @@
+-      v = (mem_get_qi (v) & (1 << o->bit_number)) ? 1 : 0;
++      v = (mem_get_qi_masked (v, 1 << o->bit_number)
++           & (1 << o->bit_number)) ? 1 : 0;
+@@ -203,6 +208 @@
+-      r = mem_get_qi (a);
+-      if (v)
+-	r |= (1 << o->bit_number);
+-      else
+-	r &= ~(1 << o->bit_number);
+-      mem_put_qi (a, r);
++      mem_put_qi_bit (a, o->bit_number, v);
+@@ -526,0 +527,6 @@
++      if (mh2p_diagnostic_pfdl_call (v))
++        {
++          set_reg (RL78_Reg_SP, a);
++          CLOCKS (9);
++          break;
++        }
+--- a/sim/rl78/cpu.c
++++ b/sim/rl78/cpu.c
+@@ -36 +36 @@
+-int timer_enabled = 2;
++int timer_enabled = 0;
+@@ -88,2 +88,2 @@
+-  /* This means "by default" */
+-  timer_enabled = 2;
++  /* CPU-only MH2P observation: no fabricated board timer interrupts.  */
++  timer_enabled = 0;

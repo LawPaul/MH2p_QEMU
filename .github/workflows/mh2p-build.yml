@@ -1,0 +1,68 @@
+name: MH2P source build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'hw/**'
+      - 'target/arm/**'
+      - 'tools/mh2p/**'
+      - 'tools/mhi2/**'
+      - 'tools/check_publication.py'
+      - 'tools/test_check_publication.py'
+      - 'subprojects/**'
+      - 'tests/qtest/mh2p*-test.c'
+      - '.github/workflows/mh2p-build.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 1
+      - name: Check publication hygiene
+        run: |
+          python3 tools/check_publication.py
+          python3 -m unittest discover -s tools -p 'test_check_publication.py'
+      - name: Extract source ZIP without Git metadata
+        run: |
+          git archive --format=zip --output="$RUNNER_TEMP/source.zip" HEAD
+          mkdir "$RUNNER_TEMP/source"
+          unzip -q "$RUNNER_TEMP/source.zip" -d "$RUNNER_TEMP/source"
+          test ! -e "$RUNNER_TEMP/source/.git"
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config libglib2.0-dev libpixman-1-dev zlib1g-dev python3-venv
+      - name: macOS dependencies
+        if: runner.os == 'macOS'
+        run: brew install ninja pkgconf glib pixman python
+      - name: Build MH2P boards
+        run: |
+          mkdir "$RUNNER_TEMP/build"
+          cd "$RUNNER_TEMP/build"
+          "$RUNNER_TEMP/source/configure" --target-list=arm-softmmu --disable-download -Dfdt=internal --disable-docs --disable-sdl --disable-gtk --disable-fuse --disable-rust --disable-werror --disable-tools --disable-guest-agent
+          ninja -j 3 qemu-system-arm tests/qtest/mh2p-test tests/qtest/mh2p-rcc-test
+          ./qemu-system-arm -machine help | grep -E '^mh2p '
+          ./qemu-system-arm -machine help | grep -E '^mh2p-rcc '
+      - name: Check firmware-free boards and display evidence
+        run: |
+          cd "$RUNNER_TEMP/build"
+          export QTEST_QEMU_BINARY="$RUNNER_TEMP/build/qemu-system-arm"
+          tests/qtest/mh2p-test
+          tests/qtest/mh2p-rcc-test
+          cd "$RUNNER_TEMP/source"
+          PYTHONPATH=tools/mh2p:python "$RUNNER_TEMP/build/pyvenv/bin/python3" \
+            -m unittest -v test_hmi_readiness test_rcc_axi_error test_arm_cpsr \
+            test_arm_asid test_probe_pcie_sideband test_probe_rcc
