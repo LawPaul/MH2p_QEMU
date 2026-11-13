@@ -1,5 +1,8 @@
 # MH2p QEMU - work in progress
 
+> **This fork:** native Windows build, ANGLE renderer and a live HMI window with touch.
+> See [README.Windows.md](README.Windows.md).
+
 **This is an experimental work in progress, not a complete or supported
 MH2P head-unit emulator.** This source preview is intended for developers
 and researchers. It does not include proprietary firmware, prepared disks
