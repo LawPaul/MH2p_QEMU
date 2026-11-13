@@ -150,8 +150,10 @@ static bool frame_dump_enabled(void)
 static bool write_frame(const char *path, const uint8_t *rgba,
                          int width, int height, int stride, bool inverted)
 {
-    if (!strcmp(path, frame_path())) {
-        window_publish(rgba, width, height, stride, inverted);
+    if (!strcmp(path, frame_path()) &&
+        window_publish(rgba, width, height, stride, inverted) &&
+        !window_frame_file_due()) {
+        return true;
     }
     char temporary[4096];
     int length = snprintf(temporary, sizeof(temporary), "%s.tmp", path);

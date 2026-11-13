@@ -129,6 +129,9 @@ glhost.exe
 
 - `MHI2_GL_WINDOW=1` shows each published display frame in a window titled
   "MH2P HMI (glhost)". glhost still renders offscreen; the window is a GDI view of the same frame.
+  While the window is open, `MHI2_GL_FRAME` is rewritten at most once per
+  `MHI2_GL_FRAME_INTERVAL_MS` (default 1000; 0 = every frame). Without the window, every frame is
+  written.
 - With `MHI2_GL_INPUT` pointing at the MMX QMP socket:
   - left-button press, drag and release are sent as absolute pointer events
     (`input-send-event`);

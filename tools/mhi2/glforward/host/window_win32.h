@@ -254,16 +254,17 @@ static void *window_thread(void *unused)
     return NULL;
 }
 
-/* Called with each frame written to MHI2_GL_FRAME (RGBA, possibly bottom-up). */
-static void window_publish(const uint8_t *rgba, int width, int height, int stride,
-                           bool inverted)
+/* Called with each frame written to MHI2_GL_FRAME (RGBA, possibly bottom-up).
+ * Returns 1 when the window is enabled. */
+static int window_publish(const uint8_t *rgba, int width, int height, int stride,
+                          bool inverted)
 {
     if (!window.enabled) {
         const char *e = getenv("MHI2_GL_WINDOW");
         window.enabled = e && *e == '1' ? 1 : -1;
     }
     if (window.enabled < 0 || width <= 0 || height <= 0) {
-        return;
+        return window.enabled > 0;
     }
     pthread_mutex_lock(&window.lock);
     if (window.width != width || window.height != height || !window.bgra) {
@@ -294,12 +295,38 @@ static void window_publish(const uint8_t *rgba, int width, int height, int strid
     } else if (window.hwnd) {
         InvalidateRect(window.hwnd, NULL, FALSE);
     }
+    return 1;
+}
+
+/* With the window showing frames, the MHI2_GL_FRAME file is only a snapshot: write it at
+ * most every MHI2_GL_FRAME_INTERVAL_MS (default 1000; 0 = every frame). Writing a 4 MB PPM
+ * per frame sits in the synchronous bridge path, so the guest waits for it. */
+static int window_frame_file_due(void)
+{
+    static ULONGLONG last;
+    static long interval = -1;
+    if (interval < 0) {
+        const char *e = getenv("MHI2_GL_FRAME_INTERVAL_MS");
+        interval = e && *e ? atol(e) : 1000;
+    }
+    ULONGLONG now = GetTickCount64();
+    if (interval && last && now - last < (ULONGLONG)interval) {
+        return 0;
+    }
+    last = now;
+    return 1;
 }
 #else
-static void window_publish(const uint8_t *rgba, int width, int height, int stride,
-                           bool inverted)
+static int window_publish(const uint8_t *rgba, int width, int height, int stride,
+                          bool inverted)
 {
     (void)rgba; (void)width; (void)height; (void)stride; (void)inverted;
+    return 0;
+}
+
+static int window_frame_file_due(void)
+{
+    return 1;
 }
 #endif
 
