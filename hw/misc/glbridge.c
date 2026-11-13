@@ -4,7 +4,9 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #include "qemu/osdep.h"
+#ifndef _WIN32
 #include <fcntl.h>
+#endif
 #include "qemu/units.h"
 #include "qemu/module.h"
 #include "qemu/log.h"
@@ -12,9 +14,12 @@
 #include "qapi/error.h"
 #include "chardev/char-fe.h"
 #include "chardev/char-fd.h"
+#include "chardev/char-socket.h"
 #include "io/channel-file.h"
 #include "qemu/timer.h"
+#ifndef _WIN32
 #include <poll.h>
+#endif
 #include "hw/core/sysbus.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
@@ -174,7 +179,7 @@ static void gl_receive(void *opaque, const uint8_t *buf, int size)
     s->rx_count += size;
 }
 
-static int gl_channel_fd(QIOChannel *ioc)
+static G_GNUC_UNUSED int gl_channel_fd(QIOChannel *ioc)
 {
     return ioc && object_dynamic_cast(OBJECT(ioc), TYPE_QIO_CHANNEL_FILE) ?
            QIO_CHANNEL_FILE(ioc)->fd : -1;
@@ -189,6 +194,79 @@ static int gl_channel_fd(QIOChannel *ioc)
  */
 static void gl_wait_reply(GLBridgeState *s)
 {
+#ifdef _WIN32
+    /*
+     * Windows has no FIFO chardev; the ANGLE renderer connects to a socket
+     * chardev instead. Same synchronous exchange, on the socket's fd.
+     */
+    Chardev *chr = qemu_chr_fe_get_driver(&s->chr);
+    SocketChardev *sock;
+    SOCKET handle;
+    int fd;
+    int64_t deadline;
+
+    if (!s->reply_wait_ms || s->rx_count || s->direct_got || !chr ||
+        !object_dynamic_cast(OBJECT(chr), TYPE_CHARDEV_SOCKET) ||
+        !qemu_chr_fe_backend_open(&s->chr)) {
+        return;
+    }
+    sock = SOCKET_CHARDEV(chr);
+    if (sock->state != TCP_CHARDEV_STATE_CONNECTED || !sock->sioc) {
+        return;
+    }
+    fd = sock->sioc->fd;
+    handle = _get_osfhandle(fd);
+    if (handle == INVALID_SOCKET) {
+        return;
+    }
+    if (!s->nonblocking_in) {
+        u_long on = 1;
+
+        ioctlsocket(handle, FIONBIO, &on);
+        s->nonblocking_in = true;
+    }
+    deadline = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + s->reply_wait_ms;
+    while (!s->rx_count && !s->direct_got) {
+        int64_t remaining = deadline - qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+        struct timeval tv;
+        fd_set set;
+        ssize_t n;
+
+        if (remaining <= 0) {
+            break;
+        }
+        tv.tv_sec = remaining / 1000;
+        tv.tv_usec = (remaining % 1000) * 1000;
+        FD_ZERO(&set);
+        FD_SET(handle, &set);
+        if (select(0, s->tx_count ? NULL : &set, s->tx_count ? &set : NULL,
+                   NULL, &tv) <= 0) {
+            break;
+        }
+        if (s->tx_count) {
+            unsigned chunk = MIN(s->tx_count, GL_TX_BYTES - s->tx_head);
+
+            n = send(fd, s->pending + s->tx_head, chunk, 0);
+            if (n > 0) {
+                s->tx_head = (s->tx_head + n) % GL_TX_BYTES;
+                s->tx_count -= n;
+            }
+        } else if (s->direct_dest) {
+            n = recv(fd, s->direct_dest, s->direct_cap, 0);
+            if (n > 0) {
+                s->direct_got = n;
+            }
+        } else {
+            n = recv(fd, s->rx, GL_BULK_BYTES, 0);
+            if (n > 0) {
+                s->rx_count = n;
+            }
+        }
+        if (n == 0 || (n < 0 && errno != EAGAIN && errno != EINTR)) {
+            break;
+        }
+    }
+#else
     Chardev *chr = qemu_chr_fe_get_driver(&s->chr);
     FDChardev *fd_chr;
     int in, out;
@@ -260,15 +338,25 @@ static void gl_wait_reply(GLBridgeState *s)
             break;
         }
     }
+#endif
 }
 
 static bool gl_sync_capable(GLBridgeState *s)
 {
+#ifdef _WIN32
+    Chardev *chr = qemu_chr_fe_get_driver(&s->chr);
+
+    return s->reply_wait_ms && chr &&
+           object_dynamic_cast(OBJECT(chr), TYPE_CHARDEV_SOCKET) &&
+           SOCKET_CHARDEV(chr)->state == TCP_CHARDEV_STATE_CONNECTED &&
+           qemu_chr_fe_backend_open(&s->chr);
+#else
     Chardev *chr = qemu_chr_fe_get_driver(&s->chr);
 
     return s->reply_wait_ms && chr &&
            object_dynamic_cast(OBJECT(chr), TYPE_CHARDEV_FD) &&
            qemu_chr_fe_backend_open(&s->chr);
+#endif
 }
 
 static uint32_t gl_le32(const uint8_t *p)

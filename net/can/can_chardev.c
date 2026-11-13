@@ -25,7 +25,7 @@ struct CanHostChardev {
 
 static void can_chardev_flush(CanHostChardev *s);
 
-static gboolean can_chardev_writable(GIOChannel *channel,
+static gboolean can_chardev_writable(void *channel,
                                      GIOCondition condition, void *opaque)
 {
     CanHostChardev *s = opaque;

@@ -4,6 +4,7 @@
  */
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qapi/qapi-visit-sockets.h"
 #include "qemu/bswap.h"
 #include "qemu/error-report.h"
 #include "qemu/main-loop.h"
@@ -199,6 +200,14 @@ static bool config_transfer(MH2PPCIeConfigState *s, uint8_t *frame,
             qio_channel_read(ioc, frame + offset, FRAME_SIZE - offset, errp);
 
         if (count == QIO_CHANNEL_ERR_BLOCK) {
+#ifdef _WIN32
+            if (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) >= deadline) {
+                error_setg(errp, "configuration request timed out");
+                return false;
+            }
+            g_usleep(20);
+            continue;
+#else
             GPollFD pollfd = {
                 .fd = s->socket->fd,
                 .events = write ? G_IO_OUT : G_IO_IN,
@@ -217,6 +226,7 @@ static bool config_transfer(MH2PPCIeConfigState *s, uint8_t *frame,
                 return false;
             }
             continue;
+#endif
         }
         if (count <= 0) {
             if (!count) {
@@ -354,9 +364,77 @@ static void config_reset(DeviceState *dev)
     }
 }
 
+/*
+ * Portable transport: "listen:HOST:PORT" blocks until the peer connects;
+ * "connect:HOST:PORT" retries for up to 120 s while the peer starts.
+ * Needed on hosts (Windows) where an inherited socketpair fd is unavailable.
+ */
+static QIOChannelSocket *config_open_inet(const char *spec, Error **errp)
+{
+    bool listen = g_str_has_prefix(spec, "listen:");
+    g_autofree char *address = g_strconcat("tcp:", strchr(spec, ':') + 1, NULL);
+    SocketAddress *addr = socket_parse(address, errp);
+    QIOChannelSocket *sioc = NULL;
+
+    if (!addr) {
+        return NULL;
+    }
+    if (listen) {
+        g_autoptr(QIOChannelSocket) lsn = qio_channel_socket_new();
+
+        if (qio_channel_socket_listen_sync(lsn, addr, 1, errp) == 0) {
+            info_report("mh2p-pcie-config: waiting for peer on %s", spec);
+            while (!sioc) {
+                sioc = qio_channel_socket_accept(lsn, NULL);
+                if (!sioc) {
+                    g_usleep(10000);
+                }
+            }
+        }
+    } else {
+        for (int tries = 0; tries < 12000 && !sioc; tries++) {
+            QIOChannelSocket *c = qio_channel_socket_new();
+
+            if (qio_channel_socket_connect_sync(c, addr, NULL) == 0) {
+                sioc = c;
+            } else {
+                object_unref(c);
+                g_usleep(10000);
+            }
+        }
+        if (!sioc) {
+            error_setg(errp, "mh2p-pcie-config: cannot connect to %s", spec);
+        }
+    }
+    qapi_free_SocketAddress(addr);
+    if (sioc) {
+        qio_channel_set_delay(QIO_CHANNEL(sioc), false);
+    }
+    return sioc;
+}
+
 static void config_realize(DeviceState *dev, Error **errp)
 {
     MH2PPCIeConfigState *s = MH2P_PCIE_CONFIG(dev);
+    if (g_str_has_prefix(s->fd, "listen:") ||
+        g_str_has_prefix(s->fd, "connect:")) {
+        s->socket = config_open_inet(s->fd, errp);
+        if (!s->socket ||
+            !qio_channel_set_blocking(QIO_CHANNEL(s->socket), false, errp)) {
+            return;
+        }
+        if (s->ready) {
+            s->watch = qio_channel_add_watch(QIO_CHANNEL(s->socket),
+                                            G_IO_IN, config_receive, s, NULL);
+        }
+        return;
+    }
+#ifdef _WIN32
+    error_setg(errp, "mh2p-pcie-config: on Windows use listen:HOST:PORT or "
+               "connect:HOST:PORT instead of an inherited fd");
+    return;
+#else
+    {
     struct sockaddr_un peer;
     socklen_t length = sizeof(peer);
     int type, fd = monitor_fd_param(monitor_cur(), s->fd, errp);
@@ -382,6 +460,8 @@ static void config_realize(DeviceState *dev, Error **errp)
         s->watch = qio_channel_add_watch(QIO_CHANNEL(s->socket),
                                         G_IO_IN, config_receive, s, NULL);
     }
+    }
+#endif
 }
 
 static void config_unrealize(DeviceState *dev)

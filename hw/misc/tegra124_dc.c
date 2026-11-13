@@ -18,6 +18,10 @@
 #include "ui/console.h"
 #include "system/ramblock.h"
 
+#ifdef DC_ACTIVE
+#undef DC_ACTIVE /* <wingdi.h> on Windows */
+#endif
+
 enum {
     DC_ASSEMBLY,
     DC_ARM,

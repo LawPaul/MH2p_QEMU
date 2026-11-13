@@ -28,6 +28,16 @@ for source, dest in json.loads(out).items():
     try:
         os.symlink(source, bundle_dest)
     except BaseException as e:
+        if os.name == 'nt' and isinstance(e, OSError) and                 e.errno != errno.EEXIST:
+            # No symlink privilege (Developer Mode off): copy instead.
+            import shutil
+            if not os.path.exists(source):
+                continue
+            if os.path.isdir(source):
+                shutil.copytree(source, bundle_dest, dirs_exist_ok=True)
+            else:
+                shutil.copy2(source, bundle_dest)
+            continue
         if not isinstance(e, OSError) or e.errno != errno.EEXIST:
             if os.name == 'nt':
                 print('Please enable Developer Mode to support soft link '
