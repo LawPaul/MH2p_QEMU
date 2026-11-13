@@ -1,5 +1,19 @@
 /* Host encoder workers. Only native EGLImage pixels enter this pipeline.
  * Graphics submission and TS retrieval never wait for FFmpeg or the GPU. */
+#ifdef _WIN32
+/* Windows (ANGLE) build: the cockpit MOST encoder spawns ffmpeg through
+ * posix_spawn and is not ported; every request reports encoder failure. */
+#include <signal.h>
+#include <time.h>
+struct Encoder { bool used; };
+static struct Encoder encoders[4];
+static uint32_t encoder_submit(uint32_t owner,const uint8_t *p)
+{(void)owner;(void)p;return 1;}
+static uint32_t encoder_poll(uint32_t owner,uint32_t id,uint8_t **data)
+{(void)owner;(void)id;*data=NULL;return UINT32_MAX;}
+static void encoder_close(uint32_t owner,uint32_t id){(void)owner;(void)id;}
+static void encoder_stop(struct Encoder *e){(void)e;}
+#else
 #include <poll.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -205,3 +219,4 @@ static void encoder_close(uint32_t owner,uint32_t id)
 {struct Encoder *e=encoder_find(owner,id);if(e){pthread_mutex_lock(&e->lock);e->stop=true;pthread_mutex_unlock(&e->lock);}}
 static void encoder_stop(struct Encoder *e)
 {if(e->used){encoder_close(e->owner,e->id);pthread_join(e->thread,NULL);pthread_mutex_destroy(&e->lock);memset(e,0,sizeof(*e));}}
+#endif

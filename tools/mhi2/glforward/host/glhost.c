@@ -13,9 +13,11 @@
  *   31-32 draws  33-43 pipeline state  50-58 textures  100/101 sync getters
  */
 #include <GLES2/gl2.h>
+#ifndef _WIN32
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#endif
 #include <errno.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -26,6 +28,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "gl_io.h"
 #include "known_shaders.h"
 
 #define DEFAULT_PORT 5005
@@ -130,6 +133,7 @@ static uint32_t u32(const uint8_t *p, int off) { uint32_t v; memcpy(&v, p + off,
 #include "encoder.h"
 #include "video_decoder.h"
 #include "menu_texture.h"
+#include "window_win32.h"
 
 static unsigned char *display_rgba;
 
@@ -146,6 +150,9 @@ static bool frame_dump_enabled(void)
 static bool write_frame(const char *path, const uint8_t *rgba,
                          int width, int height, int stride, bool inverted)
 {
+    if (!strcmp(path, frame_path())) {
+        window_publish(rgba, width, height, stride, inverted);
+    }
     char temporary[4096];
     int length = snprintf(temporary, sizeof(temporary), "%s.tmp", path);
     if (length < 0 || (size_t)length >= sizeof(temporary)) {
@@ -255,7 +262,7 @@ static int read_full(struct CommandStream *stream, void *buf, size_t n)
         }
         /* Large pixel payloads bypass the staging buffer once drained. */
         bool direct = n >= sizeof(stream->bytes);
-        ssize_t r = read(stream->fd, direct ? p : stream->bytes,
+        ssize_t r = gl_io_read(stream->fd, direct ? p : stream->bytes,
                          direct ? n : sizeof(stream->bytes));
         if (r == 0) return -1;
         if (r < 0) { if (errno == EINTR) continue; return -1; }
@@ -276,7 +283,11 @@ static void ensure_window(int w, int h)
     if (w <= 0 || w > 8192) w = DEFAULT_W;
     if (h <= 0 || h > 8192) h = DEFAULT_H;
 
+#ifdef _WIN32
+    display = eglGetDisplay(EGL_DEFAULT_DISPLAY); /* ANGLE: D3D11 */
+#else
     display = eglGetPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA, NULL, NULL);
+#endif
     EGLint major, minor, count;
     const EGLint attrs[] = {EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
         EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT, EGL_RED_SIZE, 8,
@@ -672,7 +683,7 @@ static void serve(int cfd)
             uint32_t error = pixmap_control(current_client, p);
             if (error) fprintf(stderr, "glhost: pixmap action %u image %u "
                                "failed: %x\n", u32(p, 0), u32(p, 4), error);
-            if (write(STDOUT_FILENO, &error, 4) != 4) return;
+            if (gl_io_write(STDOUT_FILENO, &error, 4) != 4) return;
             break;
         }
         case 146: {
@@ -686,7 +697,7 @@ static void serve(int cfd)
             if (reply[0]) fprintf(stderr, "glhost: pixmap readback failed: %x\n", reply[0]);
             size_t sent = 0;
             while (sent < bytes + 4) {
-                ssize_t n = write(STDOUT_FILENO, (uint8_t *)reply + sent,
+                ssize_t n = gl_io_write(STDOUT_FILENO, (uint8_t *)reply + sent,
                                   bytes + 4 - sent);
                 if (n < 0 && errno == EINTR) continue;
                 if (n <= 0) break;
@@ -702,12 +713,12 @@ static void serve(int cfd)
         case 144: {
             uint32_t error = cached_program(u32(p, 0), u32(p, 4), p + 12,
                                              u32(p, 8));
-            if (write(STDOUT_FILENO, &error, 4) != 4) return;
+            if (gl_io_write(STDOUT_FILENO, &error, 4) != 4) return;
             break;
         }
         case 141: {
             uint32_t supported = astc_supported();
-            if (write(STDOUT_FILENO, &supported, 4) != 4) return;
+            if (gl_io_write(STDOUT_FILENO, &supported, 4) != 4) return;
             break;
         }
         case 142: case 143:
@@ -720,7 +731,7 @@ static void serve(int cfd)
             if(op==135)status=video_decode(request_pid,p);
             if(op==136)status=video_attributes(request_pid,p);
             if(op==137)video_close(request_pid,u32(p,0));
-            if(write(STDOUT_FILENO,&status,4)!=4)return;
+            if(gl_io_write(STDOUT_FILENO,&status,4)!=4)return;
             break;
         }
         case 119: request_pid=u32(p,0); request_thread=0; break;
@@ -729,7 +740,7 @@ static void serve(int cfd)
             uint32_t error = client_egl_control(request_pid, p);
             if (error != EGL_SUCCESS)
                 fprintf(stderr,"glhost: EGL action %u failed: %x\n",u32(p,0),error);
-            if(write(STDOUT_FILENO,&error,4)!=4)return;
+            if(gl_io_write(STDOUT_FILENO,&error,4)!=4)return;
             break;
         }
         case 125: primary_display_pid=current_pid;break;
@@ -740,26 +751,26 @@ static void serve(int cfd)
             if(op==123)glGetActiveAttrib(M(u32(p,0)),u32(p,4),count,&length,&size,&type,name);
             else glGetActiveUniform(M(u32(p,0)),u32(p,4),count,&length,&size,&type,name);
             header[0]=length;header[1]=size;header[2]=type;
-            if(write(STDOUT_FILENO,header,12)!=12)return;
-            unsigned done=0;while(done<count){ssize_t n=write(STDOUT_FILENO,name+done,count-done);
+            if(gl_io_write(STDOUT_FILENO,header,12)!=12)return;
+            unsigned done=0;while(done<count){ssize_t n=gl_io_write(STDOUT_FILENO,name+done,count-done);
                 if(n<0&&errno==EINTR)continue;if(n<=0)return;done+=n;}
             break;
         }
         case 127: {
             uint32_t status=encoder_submit(request_pid,p);
-            if(write(STDOUT_FILENO,&status,4)!=4)return;
+            if(gl_io_write(STDOUT_FILENO,&status,4)!=4)return;
             break;
         }
         case 126: {
             uint8_t *data;uint32_t count=encoder_poll(request_pid,u32(p,0),&data);
-            if(write(STDOUT_FILENO,&count,4)!=4){free(data);return;}
-            size_t off=0;while(data&&off<count){ssize_t n=write(STDOUT_FILENO,data+off,count-off);
+            if(gl_io_write(STDOUT_FILENO,&count,4)!=4){free(data);return;}
+            size_t off=0;while(data&&off<count){ssize_t n=gl_io_write(STDOUT_FILENO,data+off,count-off);
                 if(n<0&&errno==EINTR)continue;if(n<=0){free(data);return;}off+=n;}
             free(data);break;
         }
         case 132: {
             uint32_t hit=native_frame_upload(u32(p,0),u32(p,4),u32(p,8));
-            if(write(STDOUT_FILENO,&hit,4)!=4)return;
+            if(gl_io_write(STDOUT_FILENO,&hit,4)!=4)return;
             break;
         }
         case 133: native_frame_remove(u32(p,0));break;
@@ -771,7 +782,7 @@ static void serve(int cfd)
             fast_read_pixels(i32(p,0),i32(p,4),i32(p,8),i32(p,12),pixels);
             glPixelStorei(GL_PACK_ALIGNMENT,alignment);
             size_t done=0;
-            while(done<size){ssize_t n=write(STDOUT_FILENO,pixels+done,size-done);
+            while(done<size){ssize_t n=gl_io_write(STDOUT_FILENO,pixels+done,size-done);
                 if(n<0&&errno==EINTR)continue;
                 if(n<=0){free(pixels);return;}done+=n;}
             if(op==131)native_frame_store(u32(p,24),u32(p,8),u32(p,12),pixels);
@@ -871,7 +882,7 @@ static void serve(int cfd)
                     unmap(GL_ELEMENT_ARRAY_BUFFER);
                 }
             }
-            fwrite(&maximum, 4, 1, stdout); fflush(stdout);
+            if (gl_io_write(STDOUT_FILENO, &maximum, 4) != 4) return;
             break;
         }
         case 20: glEnableVertexAttribArray(u32(p,0)); break;
@@ -1009,7 +1020,7 @@ static void serve(int cfd)
                 pname != GL_NUM_SHADER_BINARY_FORMATS) {
                 glGetIntegerv(pname,out);
             }
-            if(write(STDOUT_FILENO,out,sizeof(out)) != sizeof(out))return;
+            if(gl_io_write(STDOUT_FILENO,out,sizeof(out)) != sizeof(out))return;
             break;
         }
         case 106: {
@@ -1021,7 +1032,7 @@ static void serve(int cfd)
                 pname != GL_NUM_SHADER_BINARY_FORMATS) {
                 glGetBooleanv(pname,out);
             }
-            if(write(STDOUT_FILENO,out,sizeof(out))!=sizeof(out))return;
+            if(gl_io_write(STDOUT_FILENO,out,sizeof(out))!=sizeof(out))return;
             break;
         }
         case 107: {
@@ -1033,24 +1044,24 @@ static void serve(int cfd)
                 pname != GL_NUM_SHADER_BINARY_FORMATS) {
                 glGetFloatv(pname,out);
             }
-            if(write(STDOUT_FILENO,out,sizeof(out))!=sizeof(out))return;
+            if(gl_io_write(STDOUT_FILENO,out,sizeof(out))!=sizeof(out))return;
             break;
         }
         case 108: {
             GLint out[3]={0};glGetShaderPrecisionFormat(u32(p,0),u32(p,4),out,out+2);
-            if(write(STDOUT_FILENO,out,sizeof(out))!=sizeof(out))return;
+            if(gl_io_write(STDOUT_FILENO,out,sizeof(out))!=sizeof(out))return;
             break;
         }
         case 105: {
             int32_t out=client_gl_error(current_client);
-            if(write(STDOUT_FILENO,&out,4)!=4)return;
+            if(gl_io_write(STDOUT_FILENO,&out,4)!=4)return;
             break;
         }
         case 102: case 103: {
             GLint out = 0;
             if (op == 102) glGetShaderiv(M(u32(p,0)),u32(p,4),&out);
             else glGetProgramiv(M(u32(p,0)),u32(p,4),&out);
-            if (write(STDOUT_FILENO,&out,4) != 4) return;
+            if (gl_io_write(STDOUT_FILENO,&out,4) != 4) return;
             break;
         }
         case 60: glBindFramebuffer(u32(p,0),M(u32(p,4))); break;
@@ -1084,7 +1095,7 @@ static void serve(int cfd)
         case 77: glStencilOpSeparate(u32(p,0),u32(p,4),u32(p,8),u32(p,12)); break;
         case 78: {unsigned count=u32(p,0);for(unsigned i=0;i<count;i++){GLuint o;glGenFramebuffers(1,&o);gmap[u32(p,4+4*i)]=o;}break;}
         case 79: {unsigned count=u32(p,0);for(unsigned i=0;i<count;i++){GLuint o;glGenRenderbuffers(1,&o);gmap[u32(p,4+4*i)]=o;}break;}
-        case 109: {uint32_t out=glCheckFramebufferStatus(u32(p,0));if(write(STDOUT_FILENO,&out,4)!=4)return;break;}
+        case 109: {uint32_t out=glCheckFramebufferStatus(u32(p,0));if(gl_io_write(STDOUT_FILENO,&out,4)!=4)return;break;}
         case 80: glUniform1iv(i32(p,0),i32(p,4),(const GLint *)(p+8));break;
         case 81: glUniform2iv(i32(p,0),i32(p,4),(const GLint *)(p+8));break;
         case 82: glUniform3iv(i32(p,0),i32(p,4),(const GLint *)(p+8));break;
@@ -1099,7 +1110,7 @@ static void serve(int cfd)
             GLint loc = (op == 100) ? glGetAttribLocation(M(pid), nm)
                                     : glGetUniformLocation(M(pid), nm);
             int32_t out = loc;
-            if (write(STDOUT_FILENO, &out, 4) != 4) { fprintf(stderr, "glhost: getter reply failed\n"); }
+            if (gl_io_write(STDOUT_FILENO, &out, 4) != 4) { fprintf(stderr, "glhost: getter reply failed\n"); }
             } break;
 
         default: /* unknown: drained, stay in sync */ break;
@@ -1113,7 +1124,10 @@ static void serve(int cfd)
 
 int main(int argc, char **argv)
 {
+#ifdef SIGPIPE
     signal(SIGPIPE,SIG_IGN);
+#endif
+    gl_io_init();
     menu_texture_init();
     if (argc == 2 && strcmp(argv[1], "--check-shaders") == 0) {
         ensure_window(DEFAULT_W, DEFAULT_H);

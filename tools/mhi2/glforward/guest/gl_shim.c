@@ -244,6 +244,7 @@ const char *eglQueryString(void *dpy, i32 name) {
 }
 /* EGL_NV_system_time uses the guest's monotonic nanosecond clock. */
 extern int ClockTime(int, const unsigned long long *, unsigned long long *);
+extern int strcmp(const char *, const char *);
 unsigned long long eglGetSystemTimeFrequencyNV(void) { return 1000000000ULL; }
 unsigned long long eglGetSystemTimeNV(void)
 {
