@@ -263,6 +263,7 @@ struct MH2PMachineState {
     MemoryRegion dpaux_pad;
     IOMMUMemoryRegion host1x_iommu;
     IOMMUMemoryRegion vic_iommu;
+    IOMMUMemoryRegion gpu_iommu;
     MH2PDisplayIOMMU display_iommu[2][3];
     Clock *display_clock[2];
     uint32_t dpaux_pad_control;
@@ -302,6 +303,7 @@ struct MH2PMachineState {
     uint32_t clock_mask_arm;
     unsigned fuse_security_mode;
     uint32_t pex_dpd_request, pex_dpd_status;
+    uint32_t io_dpd2_request, io_dpd2_status, dpd_sample, sel_dpd_tim;
     uint32_t gpu_clamp;
     uint32_t powergate_toggle;
     uint32_t powergate_status;
@@ -417,6 +419,27 @@ static IOMMUTLBEntry mh2p_vic_translate(IOMMUMemoryRegion *iommu,
     return mh2p_smmu_translate(s, 12, 0x6c, "VIC", addr, flag);
 }
 
+/* Linux tegra124.c: GPU swgroup ASID register 0xaa8, client gpusrd 0x58. */
+static IOMMUTLBEntry mh2p_gpu_translate(IOMMUMemoryRegion *iommu,
+                                      hwaddr addr, IOMMUAccessFlags flag,
+                                      int iommu_idx)
+{
+    MH2PMachineState *s = container_of(iommu, MH2PMachineState, gpu_iommu);
+
+    return mh2p_smmu_translate(s, 23, 0x58, "GPU", addr, flag);
+}
+
+static void mh2p_gpu_iommu_class_init(ObjectClass *klass, const void *data)
+{
+    IOMMU_MEMORY_REGION_CLASS(klass)->translate = mh2p_gpu_translate;
+}
+
+static const TypeInfo mh2p_gpu_iommu_info = {
+    .name = "mh2p-gpu-iommu",
+    .parent = TYPE_IOMMU_MEMORY_REGION,
+    .class_init = mh2p_gpu_iommu_class_init,
+};
+
 static void mh2p_iommu_class_init(ObjectClass *klass, const void *data)
 {
     IOMMU_MEMORY_REGION_CLASS(klass)->translate = mh2p_host1x_translate;
@@ -466,6 +489,7 @@ static void mh2p_register_iommu(void)
 {
     type_register_static(&mh2p_iommu_info);
     type_register_static(&mh2p_vic_iommu_info);
+    type_register_static(&mh2p_gpu_iommu_info);
     type_register_static(&mh2p_display_iommu_info);
 }
 
@@ -954,6 +978,18 @@ static MemTxResult mh2p_boot_read(void *opaque, hwaddr offset, uint64_t *value,
     case 0x7000e5bc:
         *value = s->pex_dpd_status;
         return MEMTX_OK;
+    case 0x7000e5c0: /* IO_DPD2_REQ */
+        *value = s->io_dpd2_request;
+        return MEMTX_OK;
+    case 0x7000e5c4: /* IO_DPD2_STATUS */
+        *value = s->io_dpd2_status;
+        return MEMTX_OK;
+    case 0x7000e5c8: /* SEL_DPD_TIM */
+        *value = s->sel_dpd_tim;
+        return MEMTX_OK;
+    case 0x7000e420: /* DPD_SAMPLE */
+        *value = s->dpd_sample;
+        return MEMTX_OK;
     case 0x7000e430:
         *value = s->powergate_toggle;
         return MEMTX_OK;
@@ -1384,6 +1420,36 @@ static MemTxResult mh2p_boot_write_register(void *opaque, hwaddr offset,
         }
         return MEMTX_OK;
     }
+    case 0x7000e5c0: {
+        /*
+         * IO_DPD2_REQ (Linux tegra pmc.c): code 1 takes the selected pads
+         * out of deep power-down, code 2 puts them in; completes at once.
+         */
+        uint32_t pads = value & 0x3fffffffU;
+        unsigned command = value >> 30;
+
+        if (command != 1 && command != 2) {
+            qemu_log_mask(LOG_UNIMP, "mh2p: unsupported IO DPD2 request "
+                          "0x%" PRIx64 "\n", value);
+            return MEMTX_DECODE_ERROR;
+        }
+        s->io_dpd2_request = pads;
+        if (command == 2) {
+            s->io_dpd2_status |= pads;
+        } else {
+            s->io_dpd2_status &= ~pads;
+        }
+        return MEMTX_OK;
+    }
+    case 0x7000e5c8: /* SEL_DPD_TIM: DPD entry timer, no timing modelled. */
+        s->sel_dpd_tim = value;
+        return MEMTX_OK;
+    case 0x7000e420: /* DPD_SAMPLE: pad-state sampling enable. */
+        if (value & ~1U) {
+            break;
+        }
+        s->dpd_sample = value;
+        return MEMTX_OK;
     case 0x60006080 ... 0x6000608c:
         s->pll_c[(offset - 0x6080) / 4] =
             offset == 0x6080 ? value & ~BIT(27) : value;
@@ -2179,6 +2245,8 @@ static void mh2p_reset(void *opaque)
     s->clock_mask_arm = 0;
     memset(s->pmc_secure_scratch, 0, sizeof(s->pmc_secure_scratch));
     s->pex_dpd_request = s->pex_dpd_status = 0;
+    s->io_dpd2_request = s->io_dpd2_status = 0;
+    s->dpd_sample = s->sel_dpd_tim = 0;
     s->mselect_config = 0;
     for (unsigned i = 0; i < ARRAY_SIZE(mh2p_pcie_registers); i++) {
         s->pcie_registers[i] = mh2p_pcie_registers[i].reset;
@@ -2472,8 +2540,14 @@ static void mh2p_init(MachineState *ms)
 
     gpu = qdev_new(TYPE_GK20A);
     object_property_add_child(OBJECT(ms), "gpu", OBJECT(gpu));
+    memory_region_init_iommu(&s->gpu_iommu, sizeof(s->gpu_iommu),
+                             "mh2p-gpu-iommu", OBJECT(ms),
+                             "gpu-smmu", 1ULL << 32);
+    object_property_set_link(OBJECT(gpu), "smmu",
+                             OBJECT(&s->gpu_iommu), &error_fatal);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(gpu), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(gpu), 0, 0x57000000);
+    sysbus_mmio_map(SYS_BUS_DEVICE(gpu), 1, 0x58000000);
     glbridge_create(OBJECT(ms));
     s->gpu_reset = qdev_get_gpio_in_named(gpu, "reset", 0);
 

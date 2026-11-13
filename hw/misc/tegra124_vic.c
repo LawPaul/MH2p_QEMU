@@ -54,6 +54,8 @@ struct Tegra124VicState {
     bool clock_enabled;
     bool dma_faulted;
     bool experimental_execution;
+    bool experimental_permissive;
+    uint32_t permissive_regs[0x1000];
     bool cpu_stopped;
     bool cpu_sleeping;
     bool cpu_faulted;
@@ -336,8 +338,14 @@ static MemTxResult vic_read(void *opaque, hwaddr addr, uint64_t *value,
     }
 unsupported:
     qemu_log_mask(LOG_UNIMP, "tegra124-vic: unsupported read at 0x%"
-                  HWADDR_PRIx "%s\n", addr,
-                  s->reset_asserted ? " during reset" : "");
+                  HWADDR_PRIx "%s%s\n", addr,
+                  s->reset_asserted ? " during reset" : "",
+                  s->experimental_permissive ? " (permissive: stored)" : "");
+    if (s->experimental_permissive &&
+        addr / 4 < ARRAY_SIZE(s->permissive_regs)) {
+        *value = s->permissive_regs[addr / 4];
+        return MEMTX_OK;
+    }
     return MEMTX_ERROR;
 }
 
@@ -540,8 +548,14 @@ static MemTxResult vic_write(void *opaque, hwaddr addr, uint64_t value,
     }
 unsupported:
     qemu_log_mask(LOG_UNIMP, "tegra124-vic: unsupported write at 0x%"
-                  HWADDR_PRIx " = 0x%" PRIx64 "%s\n", addr, value,
-                  s->reset_asserted ? " during reset" : "");
+                  HWADDR_PRIx " = 0x%" PRIx64 "%s%s\n", addr, value,
+                  s->reset_asserted ? " during reset" : "",
+                  s->experimental_permissive ? " (permissive: stored)" : "");
+    if (s->experimental_permissive &&
+        addr / 4 < ARRAY_SIZE(s->permissive_regs)) {
+        s->permissive_regs[addr / 4] = value;
+        return MEMTX_OK;
+    }
     return MEMTX_ERROR;
 }
 
@@ -1213,6 +1227,8 @@ static void vic_unrealize(DeviceState *dev)
 static const Property vic_properties[] = {
     DEFINE_PROP_BOOL("experimental-execution", Tegra124VicState,
                      experimental_execution, false),
+    DEFINE_PROP_BOOL("experimental-permissive", Tegra124VicState,
+                     experimental_permissive, false),
     DEFINE_PROP_LINK("dma", Tegra124VicState, dma_mr, TYPE_MEMORY_REGION,
                      MemoryRegion *),
     DEFINE_PROP_LINK("host1x", Tegra124VicState, host1x, TYPE_TEGRA124_HOST1X,

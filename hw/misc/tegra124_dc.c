@@ -46,6 +46,8 @@ struct Tegra124DCState {
     unsigned sync_count[4];
     bool reset_asserted;
     bool experimental_window_scanout;
+    bool experimental_permissive;
+    uint32_t permissive_regs[0x10000];
     uint32_t sync_control[4];
     uint32_t interrupt_control[4];
     uint32_t state_access;
@@ -733,7 +735,13 @@ static MemTxResult dc_read(void *opaque, hwaddr offset, uint64_t *value,
         return MEMTX_OK;
     }
     qemu_log_mask(LOG_UNIMP, "tegra124-dc: unsupported read at 0x%"
-                  HWADDR_PRIx "\n", s->iomem.addr + offset);
+                  HWADDR_PRIx "%s\n", s->iomem.addr + offset,
+                  s->experimental_permissive ? " (permissive: stored)" : "");
+    if (s->experimental_permissive &&
+        offset / 4 < ARRAY_SIZE(s->permissive_regs)) {
+        *value = s->permissive_regs[offset / 4];
+        return MEMTX_OK;
+    }
     return MEMTX_DECODE_ERROR;
 }
 
@@ -749,19 +757,30 @@ static MemTxResult dc_write(void *opaque, hwaddr offset, uint64_t value,
         return MEMTX_ERROR;
     }
     if (dc_general_register(offset / 4, &mask)) {
-        if (value & ~mask) {
+        if ((value & ~mask) && !s->experimental_permissive) {
             goto unsupported;
         }
-        if (bank == DC_ACTIVE && (s->general[DC_ACTIVE][0x032] ||
-                                 (offset / 4 == 0x032 && value))) {
+        /*
+         * Hardware accepts direct active-bank (WRITE_MUX) writes during
+         * scanout; the model refuses them unless explicitly permissive.
+         */
+        if (bank == DC_ACTIVE && !s->experimental_permissive &&
+            (s->general[DC_ACTIVE][0x032] ||
+             (offset / 4 == 0x032 && value))) {
             goto unsupported;
+        }
+        if (value & ~mask) {
+            qemu_log_mask(LOG_UNIMP, "tegra124-dc: permissive write 0x%"
+                          HWADDR_PRIx " = 0x%" PRIx64 " outside mask 0x%x\n",
+                          s->iomem.addr + offset, value, mask);
         }
         s->general[bank][offset / 4] = value;
         return MEMTX_OK;
     }
     if (dc_window_register(s, offset / 4, &mask)) {
-        if ((value & ~mask) || !s->window_header ||
-            (bank == DC_ACTIVE && s->general[DC_ACTIVE][0x032])) {
+        if (((value & ~mask) || !s->window_header ||
+             (bank == DC_ACTIVE && s->general[DC_ACTIVE][0x032])) &&
+            !s->experimental_permissive) {
             goto unsupported;
         }
         for (unsigned i = 0; i < 3; i++) {
@@ -849,8 +868,14 @@ static MemTxResult dc_write(void *opaque, hwaddr offset, uint64_t value,
     }
 unsupported:
     qemu_log_mask(LOG_UNIMP, "tegra124-dc: unsupported write at 0x%"
-                  HWADDR_PRIx " = 0x%" PRIx64 "\n",
-                  s->iomem.addr + offset, value);
+                  HWADDR_PRIx " = 0x%" PRIx64 "%s\n",
+                  s->iomem.addr + offset, value,
+                  s->experimental_permissive ? " (permissive: stored)" : "");
+    if (s->experimental_permissive &&
+        offset / 4 < ARRAY_SIZE(s->permissive_regs)) {
+        s->permissive_regs[offset / 4] = value;
+        return MEMTX_OK;
+    }
     return MEMTX_ERROR;
 }
 
@@ -971,6 +996,8 @@ static void dc_finalize(Object *obj)
 static const Property dc_properties[] = {
     DEFINE_PROP_BOOL("experimental-window-scanout", Tegra124DCState,
                      experimental_window_scanout, false),
+    DEFINE_PROP_BOOL("experimental-permissive", Tegra124DCState,
+                     experimental_permissive, false),
     DEFINE_PROP_LINK("dma-a", Tegra124DCState, dma_mr[0], TYPE_MEMORY_REGION,
                      MemoryRegion *),
     DEFINE_PROP_LINK("dma-b", Tegra124DCState, dma_mr[1], TYPE_MEMORY_REGION,

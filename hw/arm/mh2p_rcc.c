@@ -30,6 +30,7 @@
 #include "system/address-spaces.h"
 #include "system/blockdev.h"
 #include "system/reset.h"
+#include "system/runstate.h"
 #include "system/system.h"
 #include "target/arm/cpu.h"
 #include "target/arm/cpregs.h"
@@ -4720,6 +4721,9 @@ static MemTxResult rcc_unknown_write(void *opaque, hwaddr offset,
                 }
                 rcc_uart_set_clock(uart, value & 2);
             }
+            trace_mh2p_rcc_clkctrl(rcc_peripheral_clkctrl[i], value,
+                                   current_cpu ? current_cpu->cpu_index : -1,
+                                   current_cpu ? CPU_GET_CLASS(current_cpu)->get_pc(current_cpu) : 0);
             for (unsigned j = 0; j < ARRAY_SIZE(s->spi); j++) {
                 if (rcc_peripheral_clkctrl[i] == rcc_spis[j].clock) {
                     dra7_mcspi_set_clock(s->spi[j], value & 2);
@@ -4887,8 +4891,22 @@ static void rcc_reset(void *opaque)
     rcc_gpmc_reset(s, s->entry != 0x40300000 && s->entry != 0x40340000);
     memset(s->spinlocks, 0, sizeof(s->spinlocks));
     for (unsigned i = 0; i < ARRAY_SIZE(s->spi); i++) {
+        /*
+         * Direct IPU1 loading skips the bootloader, which enables all four
+         * McSPI clocks (tools/mh2p/probe_pcie_sideband.py IPL_SPI_CLOCKS).
+         * P2865's M4 driver relies on that for McSPI3 (accelerometer): it
+         * soft-resets McSPI3 without any CLKCTRL write, and no A15 code
+         * enables it, so a gated clock bus-faults T_M4_Accl_Ctrl.
+         */
+        bool preboot = s->ipu1_firmware;
+
         device_cold_reset(s->spi[i]);
-        dra7_mcspi_set_clock(s->spi[i], false);
+        dra7_mcspi_set_clock(s->spi[i], preboot);
+        for (unsigned j = 0; j < ARRAY_SIZE(rcc_peripheral_clkctrl); j++) {
+            if (rcc_peripheral_clkctrl[j] == rcc_spis[i].clock) {
+                s->peripheral_clkctrl[j] = preboot ? 2 : 0;
+            }
+        }
     }
     for (unsigned i = 0; i < ARRAY_SIZE(s->i2c); i++) {
         device_cold_reset(s->i2c[i]);

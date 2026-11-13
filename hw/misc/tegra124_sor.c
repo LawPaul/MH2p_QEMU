@@ -14,6 +14,7 @@ struct Tegra124SorState {
     MemoryRegion iomem;
     uint32_t regs[0x80];
     bool experimental_configuration;
+    bool experimental_permissive;
     bool reset_asserted;
     bool clock_enabled;
 };
@@ -50,9 +51,24 @@ static MemTxResult sor_read(void *opaque, hwaddr addr, uint64_t *value,
         return MEMTX_OK;
     }
     qemu_log_mask(LOG_UNIMP, "tegra124-sor: unsupported read at 0x%"
-                  HWADDR_PRIx " (enabled=%d reset=%d clock=%d)\n", addr,
+                  HWADDR_PRIx " (enabled=%d reset=%d clock=%d)%s\n", addr,
                   s->experimental_configuration, s->reset_asserted,
-                  s->clock_enabled);
+                  s->clock_enabled,
+                  s->experimental_permissive ? " (permissive: stored)" : "");
+    if (s->experimental_permissive && addr / 4 < ARRAY_SIZE(s->regs)) {
+        *value = s->regs[addr / 4];
+        if (addr == 0x16 * 4) {
+            /*
+             * SOR_TEST reflects SOR_SUPER_STATE1 (Linux sor.h): ATTACHED
+             * (super bit 3 -> test bit 10) and HEAD_MODE (1:0 -> 9:8).
+             */
+            uint32_t super = s->regs[0x02];
+
+            *value &= ~(BIT(10) | (3U << 8));
+            *value |= ((super >> 3) & 1) << 10 | (super & 3) << 8;
+        }
+        return MEMTX_OK;
+    }
     return MEMTX_ERROR;
 }
 
@@ -68,9 +84,25 @@ static MemTxResult sor_write(void *opaque, hwaddr addr, uint64_t value,
     }
     qemu_log_mask(LOG_UNIMP, "tegra124-sor: unsupported write at 0x%"
                   HWADDR_PRIx " = 0x%" PRIx64
-                  " (enabled=%d reset=%d clock=%d)\n", addr, value,
+                  " (enabled=%d reset=%d clock=%d)%s\n", addr, value,
                   s->experimental_configuration, s->reset_asserted,
-                  s->clock_enabled);
+                  s->clock_enabled,
+                  s->experimental_permissive ? " (permissive: stored)" : "");
+    if (s->experimental_permissive && addr / 4 < ARRAY_SIZE(s->regs)) {
+        /*
+         * Linux drivers/gpu/drm/tegra/sor.h self-clearing triggers, which
+         * complete immediately because no link or pad sequencer is modelled:
+         * SOR_PWR (0x15) TRIGGER bit 31; SOR_LANE_SEQ_CTL (0x21) TRIGGER
+         * bit 31 and STATE_BUSY bit 28.
+         */
+        if (addr == 0x15 * 4) {
+            value &= ~BIT(31);
+        } else if (addr == 0x21 * 4) {
+            value &= ~(BIT(31) | BIT(28));
+        }
+        s->regs[addr / 4] = value;
+        return MEMTX_OK;
+    }
     return MEMTX_ERROR;
 }
 
@@ -119,6 +151,8 @@ static void sor_init(Object *obj)
 static const Property sor_properties[] = {
     DEFINE_PROP_BOOL("experimental-configuration", Tegra124SorState,
                      experimental_configuration, false),
+    DEFINE_PROP_BOOL("experimental-permissive", Tegra124SorState,
+                     experimental_permissive, false),
 };
 
 static void sor_class_init(ObjectClass *klass, const void *data)

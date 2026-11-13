@@ -58,6 +58,8 @@ struct Tegra124Host1xState {
     QEMUBH *resume_bh;
     QEMUTimer *delay_timer;
     bool reset_asserted;
+    bool experimental_permissive;
+    uint32_t permissive_regs[0x1000];
     uint32_t syncpt[NUM_SYNCPTS];
     uint32_t threshold[NUM_SYNCPTS];
     uint32_t enabled[NUM_BANKS];
@@ -472,7 +474,13 @@ static MemTxResult host1x_read(void *opaque, hwaddr offset, uint64_t *value,
         return MEMTX_OK;
     default:
         qemu_log_mask(LOG_UNIMP, "tegra124-host1x: unsupported read at 0x%"
-                      HWADDR_PRIx "\n", offset);
+                      HWADDR_PRIx "%s\n", offset,
+                      s->experimental_permissive ? " (permissive: stored)" : "");
+        if (s->experimental_permissive &&
+            offset / 4 < ARRAY_SIZE(s->permissive_regs)) {
+            *value = s->permissive_regs[offset / 4];
+            return MEMTX_OK;
+        }
         return MEMTX_DECODE_ERROR;
     }
 }
@@ -603,7 +611,13 @@ static MemTxResult host1x_write(void *opaque, hwaddr offset, uint64_t value,
     }
 unsupported:
     qemu_log_mask(LOG_UNIMP, "tegra124-host1x: unsupported write at 0x%"
-                  HWADDR_PRIx " value 0x%" PRIx64 "\n", offset, value);
+                  HWADDR_PRIx " value 0x%" PRIx64 "%s\n", offset, value,
+                  s->experimental_permissive ? " (permissive: stored)" : "");
+    if (s->experimental_permissive &&
+        offset / 4 < ARRAY_SIZE(s->permissive_regs)) {
+        s->permissive_regs[offset / 4] = value;
+        return MEMTX_OK;
+    }
     return MEMTX_DECODE_ERROR;
 }
 
@@ -687,6 +701,8 @@ static void host1x_unrealize(DeviceState *dev)
 static const Property host1x_properties[] = {
     DEFINE_PROP_LINK("dma", Tegra124Host1xState, dma_mr, TYPE_MEMORY_REGION,
                      MemoryRegion *),
+    DEFINE_PROP_BOOL("experimental-permissive", Tegra124Host1xState,
+                     experimental_permissive, false),
 };
 
 static void host1x_class_init(ObjectClass *klass, const void *data)
