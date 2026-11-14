@@ -9,7 +9,15 @@
 #include "system/address-spaces.h"
 #include "system/memory.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/core/irq.h"
 #include "hw/misc/gk20a.h"
+
+/*
+ * PMU falcon data memory (model choice: 32 KiB, HWCFG reports it).  It must
+ * be below 64 KiB: the driver checks that DMEMC's 16-bit auto-increment
+ * offset ends at "top of DMEM" after writing its boot arguments there.
+ */
+#define GK20A_PMU_DMEM_SIZE 0x8000
 
 /* Documented MC_ENABLE reset-release controls; no execution is implied. */
 #define GK20A_MC_ENABLE_MASK 0x3830317cU
@@ -51,7 +59,623 @@ struct GK20AState {
     uint32_t pri_timeout;
     bool ring_started;
     uint32_t ring_sys_decode;
+    /* experimental-ctxsw: FECS/GPCCS context-switch controller protocol */
+    bool experimental_ctxsw;
+    uint32_t ctxsw_golden_size;
+    uint32_t ctxsw_zcull_size;
+    uint32_t ctxsw_pm_size;
+    uint32_t ctxsw_reglist_size;
+    uint32_t fecs_cpuctl;
+    uint32_t gpccs_cpuctl;
+    uint32_t fecs_falcon_mailbox[2];
+    uint32_t fecs_ctxsw_mailbox[16];
+    uint32_t fecs_method_data;
+    uint32_t fecs_current_ctx;
+    uint32_t fecs_new_ctx;
+    /* experimental-pmu: PMU falcon message protocol and MC interrupts */
+    bool experimental_pmu;
+    qemu_irq irq_stall;
+    qemu_irq irq_nonstall;
+    uint32_t mc_intr_en[2];
+    uint32_t mc_intr_mask[2];
+    uint8_t pmu_dmem[GK20A_PMU_DMEM_SIZE];
+    uint32_t pmu_dmemc[4];
+    uint32_t pmu_cpuctl;
+    uint32_t pmu_irqstat;
+    uint32_t pmu_irqmask;
+    uint32_t pmu_irqdest;
+    uint32_t pmu_irqmode;
+    uint32_t pmu_mailbox[2];
+    uint32_t pmu_queue_head[4];
+    uint32_t pmu_queue_tail[4];
+    uint32_t pmu_msgq_head;
+    uint32_t pmu_msgq_tail;
+    uint32_t pmu_mutex[16];
+    uint32_t pmu_next_mutex_id;
+    uint32_t pmu_regs[0x400];   /* plain storage for other PMU registers */
 };
+
+/*
+ * Context-switch controller (FECS) protocol, as the original nvhost driver
+ * (a QNX port of NVIDIA's gk20a gr_gk20a.c) drives it:
+ *   - it DMA-boots FECS and GPCCS (DMACTL, DMEM bootloader args,
+ *     BOOTVEC, CPUCTL.STARTCPU) and waits for CTXSW_MAILBOX(0) == 1
+ *     ("init complete");
+ *   - each method is CTXSW_MAILBOX_CLEAR(0) = clr, METHOD_DATA = data,
+ *     METHOD_PUSH = method; it then polls CTXSW_MAILBOX(0) against the
+ *     method's ok/fail condition.
+ * Only the controller's answers are modelled; the microcode itself is not
+ * run.  The context image sizes are model parameters: on hardware the
+ * microcode derives them from its register lists.
+ */
+#define FECS_BASE 0x409000
+#define GPCCS_BASE 0x41a000
+#define FALCON_CPUCTL 0x100
+#define FALCON_CPUCTL_STARTCPU 0x2
+#define FALCON_CPUCTL_HALTED 0x10
+#define FALCON_DMACTL 0x10c
+#define FECS_CTXSW_MAILBOX(i) (0x409800 + 4 * (i))
+#define FECS_CTXSW_MAILBOX_CLEAR(i) (0x409840 + 4 * (i))
+#define FECS_METHOD_DATA 0x409500
+#define FECS_METHOD_PUSH 0x409504
+#define FECS_CURRENT_CTX 0x409b00
+#define FECS_NEW_CTX 0x409b04
+#define FECS_ARB_CTX_CMD 0x409a10
+#define GK20A_MC_ENABLE_PGRAPH 0x1000
+
+static void gk20a_ctxsw_reset(GK20AState *s)
+{
+    s->fecs_cpuctl = FALCON_CPUCTL_HALTED;
+    s->gpccs_cpuctl = FALCON_CPUCTL_HALTED;
+    memset(s->fecs_falcon_mailbox, 0, sizeof(s->fecs_falcon_mailbox));
+    memset(s->fecs_ctxsw_mailbox, 0, sizeof(s->fecs_ctxsw_mailbox));
+    s->fecs_method_data = 0;
+    s->fecs_current_ctx = 0;
+    s->fecs_new_ctx = 0;
+}
+
+static bool gk20a_ctxsw_active(GK20AState *s)
+{
+    return s->experimental_ctxsw && (s->mc_enable & GK20A_MC_ENABLE_PGRAPH);
+}
+
+static void gk20a_fecs_method(GK20AState *s, uint32_t method)
+{
+    uint32_t *mb0 = &s->fecs_ctxsw_mailbox[0];
+
+    switch (method) {
+    case 0x03: /* BIND_POINTER: ok bit 4, fail bit 5 */
+        *mb0 |= 0x10;
+        break;
+    case 0x09: /* WFI_GOLDEN_SAVE: ok bit 0, fail bit 1 */
+        *mb0 |= 0x1;
+        break;
+    case 0x10: /* DISCOVER_IMAGE_SIZE */
+        *mb0 = s->ctxsw_golden_size;
+        break;
+    case 0x16: /* DISCOVER_ZCULL_IMAGE_SIZE */
+        *mb0 = s->ctxsw_zcull_size;
+        break;
+    case 0x25: /* DISCOVER_PM_IMAGE_SIZE */
+        *mb0 = s->ctxsw_pm_size;
+        break;
+    case 0x30: /* DISCOVER_REGLIST_IMAGE_SIZE */
+        *mb0 = s->ctxsw_reglist_size;
+        break;
+    case 0x31: /* SET_REGLIST_BIND_INSTANCE (instance in mailbox 4) */
+    case 0x32: /* SET_REGLIST_VIRTUAL_ADDRESS (address in mailbox 4) */
+        *mb0 = 1; /* ok: mailbox 0 == 1 */
+        break;
+    case 0x21: /* SET_WATCHDOG_TIMEOUT: no reply is awaited */
+        break;
+    default:
+        qemu_log_mask(LOG_UNIMP, "gk20a: FECS method 0x%x data 0x%x "
+                      "(no reply modelled)\n", method, s->fecs_method_data);
+        return;
+    }
+    qemu_log_mask(LOG_UNIMP, "gk20a: FECS method 0x%x data 0x%x -> "
+                  "mailbox0 0x%x\n", method, s->fecs_method_data, *mb0);
+}
+
+static bool gk20a_ctxsw_read(GK20AState *s, hwaddr offset, uint64_t *value)
+{
+    if (!gk20a_ctxsw_active(s)) {
+        return false;
+    }
+    switch (offset) {
+    case FECS_BASE + FALCON_CPUCTL:
+        *value = s->fecs_cpuctl;
+        return true;
+    case GPCCS_BASE + FALCON_CPUCTL:
+        *value = s->gpccs_cpuctl;
+        return true;
+    case FECS_BASE + FALCON_DMACTL: /* memory scrubbing already finished */
+    case GPCCS_BASE + FALCON_DMACTL:
+        *value = 0;
+        return true;
+    case FECS_BASE + 0x40:
+    case FECS_BASE + 0x44:
+        *value = s->fecs_falcon_mailbox[(offset - FECS_BASE - 0x40) / 4];
+        return true;
+    case FECS_CTXSW_MAILBOX(0) ... FECS_CTXSW_MAILBOX(15):
+        *value = s->fecs_ctxsw_mailbox[(offset - FECS_CTXSW_MAILBOX(0)) / 4];
+        return true;
+    case FECS_METHOD_DATA:
+        *value = s->fecs_method_data;
+        return true;
+    case FECS_CURRENT_CTX:
+        *value = s->fecs_current_ctx;
+        return true;
+    case FECS_NEW_CTX:
+        *value = s->fecs_new_ctx;
+        return true;
+    case FECS_ARB_CTX_CMD: /* the arbiter completes commands at once */
+        *value = 0;
+        return true;
+    /*
+     * GR unit configuration of a GK20A (Tegra K1): one GPC with one TPC,
+     * one zcull bank and one PES, one FBP (public nvgpu hw_*_gk20a.h).
+     */
+    case 0x22430: /* TOP_NUM_GPCS */
+    case 0x22434: /* TOP_TPC_PER_GPC */
+    case 0x22438: /* TOP_NUM_FBPS */
+        *value = 1;
+        return true;
+    case 0x502608: /* GPC0_FS_GPC: available TPCs 4:0, zculls 20:16 */
+        *value = 0x00010001;
+        return true;
+    case 0x500c30: /* GPC0_GPM_PD_PES_TPC_ID_MASK(0): PES 0 owns TPC 0 */
+        *value = 1;
+        return true;
+    case 0x17e8dc:
+        /*
+         * LTCS_LTSS_CBC_PARAM: comptags per cache line 15:0, cache line
+         * size 27:24 (512 << n), slices per FBP 31:28.  Model choice:
+         * 4 comptags, 1 KiB lines, 2 slices.
+         */
+        *value = 0x21000004;
+        return true;
+    case 0x50469c:
+        /*
+         * GPC0_TPC0_SM_ARCH: warp count 7:0, SPA version 11:8.  The driver
+         * accepts only SPA 0xc (Kepler LP, GK20A's SM 3.2); any other value
+         * prints "Unknown SM version".  Kepler SMs hold 64 warps.
+         */
+        *value = 0x00000c40;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool gk20a_ctxsw_write(GK20AState *s, hwaddr offset, uint32_t value)
+{
+    if (!gk20a_ctxsw_active(s)) {
+        return false;
+    }
+    switch (offset) {
+    case FECS_BASE + FALCON_CPUCTL:
+        if (value & FALCON_CPUCTL_STARTCPU) {
+            /* The booted microcode reports "init complete" in mailbox 0. */
+            s->fecs_cpuctl = 0;
+            s->fecs_ctxsw_mailbox[0] = 1;
+            qemu_log_mask(LOG_UNIMP, "gk20a: FECS started\n");
+        }
+        return true;
+    case GPCCS_BASE + FALCON_CPUCTL:
+        if (value & FALCON_CPUCTL_STARTCPU) {
+            s->gpccs_cpuctl = 0;
+        }
+        return true;
+    case FECS_BASE + 0x40:
+    case FECS_BASE + 0x44:
+        s->fecs_falcon_mailbox[(offset - FECS_BASE - 0x40) / 4] = value;
+        return true;
+    case FECS_CTXSW_MAILBOX(0) ... FECS_CTXSW_MAILBOX(15):
+        s->fecs_ctxsw_mailbox[(offset - FECS_CTXSW_MAILBOX(0)) / 4] = value;
+        return true;
+    case FECS_CTXSW_MAILBOX_CLEAR(0) ... FECS_CTXSW_MAILBOX_CLEAR(15):
+        s->fecs_ctxsw_mailbox[(offset - FECS_CTXSW_MAILBOX_CLEAR(0)) / 4] &=
+            ~value;
+        return true;
+    case FECS_METHOD_DATA:
+        s->fecs_method_data = value;
+        return true;
+    case FECS_METHOD_PUSH:
+        gk20a_fecs_method(s, value & 0xfff);
+        return true;
+    case FECS_CURRENT_CTX:
+        s->fecs_current_ctx = value;
+        return true;
+    case FECS_NEW_CTX:
+        s->fecs_new_ctx = value;
+        return true;
+    default:
+        return false;
+    }
+}
+
+/*
+ * PMU (power-management falcon) message protocol, as the original nvhost
+ * driver (pmu_gk20a.c; gpmu_ucode.bin interface 0x01013663) drives it.  The
+ * PMU microcode is not run.  When the driver starts the PMU, the model posts
+ * the INIT message the booted microcode sends (unit 7, type 0): the DMEM
+ * layout of the five queues and of the driver-managed DMEM area.  The driver
+ * creates its queue locks only on that message, and destroys them whenever
+ * it powers the GPU off.  Commands queued by the driver are logged and
+ * consumed; replies are modelled for the requests the driver waits on.
+ * Messages are signalled with SWGEN0 through MC_INTR_0 on the stall line.
+ */
+#define PMU_BASE 0x10a000
+#define PMU_IRQ_SWGEN0 (1U << 6)
+#define MC_INTR_PMU (1U << 24)
+#define GK20A_MC_ENABLE_PWR 0x2000
+#define PMU_UNIT_REWIND 0x00
+#define PMU_UNIT_PG 0x03
+#define PMU_UNIT_INIT 0x07
+#define PMU_UNIT_PERFMON 0x12
+#define PMU_MSG_FLAGS_EVENT 0x04
+#define PMU_PG_STAT_OFFSET 0x5000 /* PG statistics buffer (model choice) */
+
+/* DMEM layout the modelled microcode reports (model choice). */
+#define PMU_SW_AREA_OFFSET 0x3000
+#define PMU_SW_AREA_SIZE 0x2000
+static const struct {
+    uint16_t offset, size;
+    uint8_t index;
+} gk20a_pmu_queues[5] = {
+    { 0x6000, 0x200, 0 }, /* command queue: high priority */
+    { 0x6200, 0x200, 1 }, /* command queue: low priority */
+    { 0x6400, 0x100, 2 },
+    { 0x6500, 0x100, 3 },
+    { 0x6800, 0x400, 0 }, /* message queue (MSGQ registers) */
+};
+#define PMU_MSGQ 4
+
+static void gk20a_update_irq(GK20AState *s)
+{
+    uint32_t intr0 = 0;
+
+    if (!s->experimental_pmu) {
+        return;
+    }
+    if (s->pmu_irqstat & s->pmu_irqmask & s->pmu_irqdest & 0xffff) {
+        intr0 |= MC_INTR_PMU;
+    }
+    qemu_set_irq(s->irq_stall,
+                 (s->mc_intr_en[0] & 1) && (intr0 & s->mc_intr_mask[0]));
+    qemu_set_irq(s->irq_nonstall, 0);
+}
+
+static uint32_t gk20a_mc_intr0(GK20AState *s)
+{
+    return (s->pmu_irqstat & s->pmu_irqmask & s->pmu_irqdest & 0xffff) ?
+           MC_INTR_PMU : 0;
+}
+
+static void gk20a_pmu_reset(GK20AState *s)
+{
+    memset(s->pmu_dmem, 0, sizeof(s->pmu_dmem));
+    memset(s->pmu_dmemc, 0, sizeof(s->pmu_dmemc));
+    s->pmu_cpuctl = FALCON_CPUCTL_HALTED;
+    s->pmu_irqstat = 0;
+    s->pmu_irqmask = 0;
+    s->pmu_irqdest = 0;
+    s->pmu_irqmode = 0;
+    memset(s->pmu_mailbox, 0, sizeof(s->pmu_mailbox));
+    memset(s->pmu_queue_head, 0, sizeof(s->pmu_queue_head));
+    memset(s->pmu_queue_tail, 0, sizeof(s->pmu_queue_tail));
+    s->pmu_msgq_head = 0;
+    s->pmu_msgq_tail = 0;
+    memset(s->pmu_mutex, 0, sizeof(s->pmu_mutex));
+    s->pmu_next_mutex_id = 1;
+    memset(s->pmu_regs, 0, sizeof(s->pmu_regs));
+    gk20a_update_irq(s);
+}
+
+static void gk20a_pmu_post_msg(GK20AState *s, const uint8_t *msg,
+                               unsigned len)
+{
+    unsigned q_off = gk20a_pmu_queues[PMU_MSGQ].offset;
+    unsigned q_end = q_off + gk20a_pmu_queues[PMU_MSGQ].size;
+    unsigned alen = ROUND_UP(len, 4);
+    uint32_t head = s->pmu_msgq_head;
+
+    if (head < q_off || head + alen > q_end) {
+        if (head >= q_off && head + 4 <= q_end) {
+            static const uint8_t rewind[4] = { PMU_UNIT_REWIND, 4, 0, 0 };
+            memcpy(&s->pmu_dmem[head], rewind, 4);
+        }
+        head = q_off;
+    }
+    memcpy(&s->pmu_dmem[head], msg, len);
+    s->pmu_msgq_head = head + alen;
+    s->pmu_irqstat |= PMU_IRQ_SWGEN0;
+    gk20a_update_irq(s);
+}
+
+static void gk20a_pmu_boot(GK20AState *s)
+{
+    uint8_t m[0x28] = { PMU_UNIT_INIT, sizeof(m), 0, 0, /* type 0: INIT */ };
+
+    for (unsigned i = 0; i < 4; i++) {
+        s->pmu_queue_head[i] = s->pmu_queue_tail[i] =
+            gk20a_pmu_queues[i].offset;
+    }
+    s->pmu_msgq_head = s->pmu_msgq_tail = gk20a_pmu_queues[PMU_MSGQ].offset;
+    for (unsigned i = 0; i < 5; i++) {
+        uint8_t *q = &m[4 + 2 + 6 * i];
+
+        stw_le_p(q, gk20a_pmu_queues[i].size);
+        stw_le_p(q + 2, gk20a_pmu_queues[i].offset);
+        q[4] = gk20a_pmu_queues[i].index;
+    }
+    stw_le_p(&m[4 + 0x20], PMU_SW_AREA_OFFSET);
+    stw_le_p(&m[4 + 0x22], PMU_SW_AREA_SIZE);
+    qemu_log_mask(LOG_UNIMP, "gk20a: PMU started, INIT message posted\n");
+    gk20a_pmu_post_msg(s, m, sizeof(m));
+}
+
+static void gk20a_pmu_command(GK20AState *s, const uint8_t *c, unsigned size)
+{
+    g_autoptr(GString) hex = g_string_new(NULL);
+
+    for (unsigned i = 0; i < size; i++) {
+        g_string_append_printf(hex, " %02x", c[i]);
+    }
+    if (c[0] == PMU_UNIT_PG && size >= 8 && c[4] == 0) {
+        /* ELPG command -> ELPG message: INIT, DISALLOW, ALLOW, FREEZE ack */
+        static const uint8_t ack[] = { 0, 1, 2, 3, 5 };
+        uint16_t cmd = lduw_le_p(&c[6]);
+
+        if (cmd < ARRAY_SIZE(ack)) {
+            uint8_t m[8] = { PMU_UNIT_PG, 8, 0, c[3], 0, c[5] };
+
+            stw_le_p(&m[6], ack[cmd]);
+            qemu_log_mask(LOG_UNIMP, "gk20a: PMU command%s -> ELPG ack %u\n",
+                          hex->str, ack[cmd]);
+            gk20a_pmu_post_msg(s, m, sizeof(m));
+            return;
+        }
+    }
+    if (c[0] == PMU_UNIT_PG && size >= 12 && c[4] == 3 && c[6] == 0) {
+        /* PG_STAT ALLOC_DMEM -> RESP_DMEM_OFFSET with the stats buffer */
+        uint8_t m[12] = { PMU_UNIT_PG, 12, 0, c[3], 3, c[5], 0, 0 };
+
+        stl_le_p(&m[8], PMU_PG_STAT_OFFSET);
+        qemu_log_mask(LOG_UNIMP, "gk20a: PMU command%s -> PG stat DMEM "
+                      "0x%x\n", hex->str, PMU_PG_STAT_OFFSET);
+        gk20a_pmu_post_msg(s, m, sizeof(m));
+        return;
+    }
+    if (c[0] == PMU_UNIT_PERFMON && size >= 5 && c[4] == 2) {
+        /* PERFMON INIT -> INIT_EVENT (an event message, not a reply) */
+        uint8_t m[8] = { PMU_UNIT_PERFMON, 8, PMU_MSG_FLAGS_EVENT, 0, 2 };
+
+        qemu_log_mask(LOG_UNIMP, "gk20a: PMU command%s -> perfmon "
+                      "INIT_EVENT\n", hex->str);
+        gk20a_pmu_post_msg(s, m, sizeof(m));
+        return;
+    }
+    qemu_log_mask(LOG_UNIMP, "gk20a: PMU command%s (no reply modelled)\n",
+                  hex->str);
+}
+
+static void gk20a_pmu_cmdq(GK20AState *s, unsigned index)
+{
+    unsigned q;
+    uint32_t pos = s->pmu_queue_tail[index];
+    uint32_t head = s->pmu_queue_head[index];
+
+    for (q = 0; q < 4 && gk20a_pmu_queues[q].index != index; q++) {
+    }
+    for (unsigned n = 0; q < 4 && pos != head && n < 64; n++) {
+        uint8_t *c = &s->pmu_dmem[pos & (GK20A_PMU_DMEM_SIZE - 1)];
+
+        if (pos + 4 > GK20A_PMU_DMEM_SIZE || c[1] < 4 ||
+            pos + c[1] > GK20A_PMU_DMEM_SIZE) {
+            qemu_log_mask(LOG_GUEST_ERROR, "gk20a: PMU queue %u: bad command "
+                          "at 0x%x\n", index, pos);
+            break;
+        }
+        if (c[0] == PMU_UNIT_REWIND) {
+            pos = gk20a_pmu_queues[q].offset;
+            continue;
+        }
+        gk20a_pmu_command(s, c, c[1]);
+        pos += ROUND_UP(c[1], 4);
+    }
+    s->pmu_queue_tail[index] = head;
+}
+
+static bool gk20a_pmu_read(GK20AState *s, hwaddr offset, uint64_t *value)
+{
+    if (!s->experimental_pmu) {
+        return false;
+    }
+    switch (offset) {
+    case 0x100: /* MC_INTR_0 */
+        *value = gk20a_mc_intr0(s);
+        return true;
+    case 0x104: /* MC_INTR_1 */
+        *value = 0;
+        return true;
+    case 0x140: /* MC_INTR_EN_0/1 */
+    case 0x144:
+        *value = s->mc_intr_en[(offset - 0x140) / 4];
+        return true;
+    case 0x640: /* MC_INTR_MASK_0/1 */
+    case 0x644:
+        *value = s->mc_intr_mask[(offset - 0x640) / 4];
+        return true;
+    }
+    if (offset < PMU_BASE || offset >= PMU_BASE + 0x1000 ||
+        !(s->mc_enable & GK20A_MC_ENABLE_PWR)) {
+        return false;
+    }
+    switch (offset - PMU_BASE) {
+    case 0x008: /* IRQSTAT */
+        *value = s->pmu_irqstat;
+        return true;
+    case 0x00c:
+        *value = s->pmu_irqmode;
+        return true;
+    case 0x018: /* IRQMASK */
+        *value = s->pmu_irqmask;
+        return true;
+    case 0x01c:
+        *value = s->pmu_irqdest;
+        return true;
+    case 0x040:
+    case 0x044:
+        *value = s->pmu_mailbox[(offset - PMU_BASE - 0x40) / 4];
+        return true;
+    case FALCON_CPUCTL:
+        *value = s->pmu_cpuctl;
+        return true;
+    case 0x108: /* HWCFG: IMEM 8:0, DMEM 17:9, in 256-byte blocks */
+        *value = ((GK20A_PMU_DMEM_SIZE >> 8) << 9) | (0x8000 >> 8);
+        return true;
+    case FALCON_DMACTL: /* memory scrubbing already finished */
+        *value = 0;
+        return true;
+    case 0x1c0: case 0x1c8: case 0x1d0: case 0x1d8: /* DMEMC(i) */
+        *value = s->pmu_dmemc[(offset - PMU_BASE - 0x1c0) / 8];
+        return true;
+    case 0x1c4: case 0x1cc: case 0x1d4: case 0x1dc: { /* DMEMD(i) */
+        uint32_t *c = &s->pmu_dmemc[(offset - PMU_BASE - 0x1c4) / 8];
+        uint32_t a = *c & 0xfffc;
+
+        *value = ldl_le_p(&s->pmu_dmem[a & (GK20A_PMU_DMEM_SIZE - 4)]);
+        if (*c & (1U << 25)) {
+            *c = (*c & ~0xffffU) | ((a + 4) & 0xfffc);
+        }
+        return true;
+    }
+    case 0x488: /* PMU_MUTEX_ID: hand out an owner id */
+        *value = s->pmu_next_mutex_id;
+        s->pmu_next_mutex_id = s->pmu_next_mutex_id % 0xfe + 1;
+        return true;
+    case 0x4a0 ... 0x4ac:
+        *value = s->pmu_queue_head[(offset - PMU_BASE - 0x4a0) / 4];
+        return true;
+    case 0x4b0 ... 0x4bc:
+        *value = s->pmu_queue_tail[(offset - PMU_BASE - 0x4b0) / 4];
+        return true;
+    case 0x4c8:
+        *value = s->pmu_msgq_head;
+        return true;
+    case 0x4cc:
+        *value = s->pmu_msgq_tail;
+        return true;
+    case 0x580 ... 0x5bc:
+        *value = s->pmu_mutex[(offset - PMU_BASE - 0x580) / 4];
+        return true;
+    default:
+        *value = s->pmu_regs[(offset - PMU_BASE) / 4];
+        return true;
+    }
+}
+
+static bool gk20a_pmu_write(GK20AState *s, hwaddr offset, uint32_t value)
+{
+    if (!s->experimental_pmu) {
+        return false;
+    }
+    switch (offset) {
+    case 0x140:
+    case 0x144:
+        s->mc_intr_en[(offset - 0x140) / 4] = value;
+        gk20a_update_irq(s);
+        return true;
+    case 0x640:
+    case 0x644:
+        s->mc_intr_mask[(offset - 0x640) / 4] = value;
+        gk20a_update_irq(s);
+        return true;
+    }
+    if (offset < PMU_BASE || offset >= PMU_BASE + 0x1000 ||
+        !(s->mc_enable & GK20A_MC_ENABLE_PWR)) {
+        return false;
+    }
+    switch (offset - PMU_BASE) {
+    case 0x000: /* IRQSSET */
+        s->pmu_irqstat |= value;
+        break;
+    case 0x004: /* IRQSCLR */
+        s->pmu_irqstat &= ~value;
+        break;
+    case 0x00c:
+        s->pmu_irqmode = value;
+        return true;
+    case 0x010: /* IRQMSET */
+        s->pmu_irqmask |= value;
+        break;
+    case 0x014: /* IRQMCLR */
+        s->pmu_irqmask &= ~value;
+        break;
+    case 0x01c:
+        s->pmu_irqdest = value;
+        break;
+    case 0x040:
+    case 0x044:
+        s->pmu_mailbox[(offset - PMU_BASE - 0x40) / 4] = value;
+        return true;
+    case FALCON_CPUCTL:
+        if ((value & FALCON_CPUCTL_STARTCPU) &&
+            (s->pmu_cpuctl & FALCON_CPUCTL_HALTED)) {
+            s->pmu_cpuctl = 0;
+            gk20a_pmu_boot(s);
+        }
+        return true;
+    case 0x1c0: case 0x1c8: case 0x1d0: case 0x1d8:
+        s->pmu_dmemc[(offset - PMU_BASE - 0x1c0) / 8] = value;
+        return true;
+    case 0x1c4: case 0x1cc: case 0x1d4: case 0x1dc: {
+        uint32_t *c = &s->pmu_dmemc[(offset - PMU_BASE - 0x1c4) / 8];
+        uint32_t a = *c & 0xfffc;
+
+        stl_le_p(&s->pmu_dmem[a & (GK20A_PMU_DMEM_SIZE - 4)], value);
+        if (*c & (1U << 24)) {
+            *c = (*c & ~0xffffU) | ((a + 4) & 0xfffc);
+        }
+        return true;
+    }
+    case 0x48c: /* PMU_MUTEX_ID_RELEASE */
+        return true;
+    case 0x4a0 ... 0x4ac: {
+        unsigned i = (offset - PMU_BASE - 0x4a0) / 4;
+
+        s->pmu_queue_head[i] = value;
+        if (!(s->pmu_cpuctl & FALCON_CPUCTL_HALTED)) {
+            gk20a_pmu_cmdq(s, i);
+        }
+        return true;
+    }
+    case 0x4b0 ... 0x4bc:
+        s->pmu_queue_tail[(offset - PMU_BASE - 0x4b0) / 4] = value;
+        return true;
+    case 0x4c8:
+        s->pmu_msgq_head = value;
+        return true;
+    case 0x4cc:
+        s->pmu_msgq_tail = value;
+        return true;
+    case 0x580 ... 0x5bc: { /* PMU_MUTEX(i): take if free, 0 releases */
+        uint32_t *m = &s->pmu_mutex[(offset - PMU_BASE - 0x580) / 4];
+
+        if (!value || !*m) {
+            *m = value & 0xff;
+        }
+        return true;
+    }
+    default:
+        s->pmu_regs[(offset - PMU_BASE) / 4] = value;
+        return true;
+    }
+    gk20a_update_irq(s);
+    return true;
+}
 
 static void gk20a_engine_reset(GK20AState *s, bool pbdma_only)
 {
@@ -101,6 +725,10 @@ static MemTxResult gk20a_read(void *opaque, hwaddr offset, uint64_t *value,
     config = gk20a_config_register(s, offset, &mask);
     if (config) {
         *value = *config;
+        return MEMTX_OK;
+    }
+    if (gk20a_ctxsw_read(s, offset, value) ||
+        gk20a_pmu_read(s, offset, value)) {
         return MEMTX_OK;
     }
     switch (offset) {
@@ -220,6 +848,10 @@ static MemTxResult gk20a_write(void *opaque, hwaddr offset, uint64_t value,
         *config = value;
         return MEMTX_OK;
     }
+    if (gk20a_ctxsw_write(s, offset, value) ||
+        gk20a_pmu_write(s, offset, value)) {
+        return MEMTX_OK;
+    }
     switch (offset) {
     case 0x1100:
         if (value & ~0xeU) {
@@ -258,6 +890,12 @@ static MemTxResult gk20a_write(void *opaque, hwaddr offset, uint64_t value,
         }
         if (!(value & 0x100000)) {
             s->mmu_page_size = 0;
+        }
+        if (!(value & GK20A_MC_ENABLE_PGRAPH)) {
+            gk20a_ctxsw_reset(s);
+        }
+        if (!(value & GK20A_MC_ENABLE_PWR)) {
+            gk20a_pmu_reset(s);
         }
         s->mc_enable = value;
         return MEMTX_OK;
@@ -484,6 +1122,10 @@ static void gk20a_reset(DeviceState *dev)
     gk20a_engine_reset(s, false);
     s->pri_timeout = 0;
     gk20a_ring_reset(s);
+    gk20a_ctxsw_reset(s);
+    memset(s->mc_intr_en, 0, sizeof(s->mc_intr_en));
+    memset(s->mc_intr_mask, 0, sizeof(s->mc_intr_mask));
+    gk20a_pmu_reset(s);
 }
 
 static void gk20a_reset_line(void *opaque, int n, int level)
@@ -507,6 +1149,8 @@ static void gk20a_init(Object *obj)
                           16 * 1024 * 1024);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->bar1);
     qdev_init_gpio_in_named(DEVICE(obj), gk20a_reset_line, "reset", 1);
+    sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq_stall);
+    sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq_nonstall);
 }
 
 static void gk20a_realize(DeviceState *dev, Error **errp)
@@ -525,6 +1169,19 @@ static void gk20a_class_init(ObjectClass *klass, const void *data)
                          experimental_engine_init, false),
         DEFINE_PROP_BOOL("experimental-permissive", GK20AState,
                          experimental_permissive, false),
+        DEFINE_PROP_BOOL("experimental-ctxsw", GK20AState,
+                         experimental_ctxsw, false),
+        DEFINE_PROP_BOOL("experimental-pmu", GK20AState,
+                         experimental_pmu, false),
+        /* context image sizes the modelled FECS reports (bytes) */
+        DEFINE_PROP_UINT32("ctxsw-golden-size", GK20AState,
+                           ctxsw_golden_size, 0x10000),
+        DEFINE_PROP_UINT32("ctxsw-zcull-size", GK20AState,
+                           ctxsw_zcull_size, 0x1000),
+        DEFINE_PROP_UINT32("ctxsw-pm-size", GK20AState,
+                           ctxsw_pm_size, 0x1000),
+        DEFINE_PROP_UINT32("ctxsw-reglist-size", GK20AState,
+                           ctxsw_reglist_size, 0x1000),
         DEFINE_PROP_LINK("smmu", GK20AState, smmu_mr, TYPE_MEMORY_REGION,
                          MemoryRegion *),
     };

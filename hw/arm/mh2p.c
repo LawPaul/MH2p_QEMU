@@ -2548,6 +2548,9 @@ static void mh2p_init(MachineState *ms)
     sysbus_realize_and_unref(SYS_BUS_DEVICE(gpu), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(gpu), 0, 0x57000000);
     sysbus_mmio_map(SYS_BUS_DEVICE(gpu), 1, 0x58000000);
+    /* Linux tegra124.dtsi: GPU stall/nonstall interrupts SPI 157/158 */
+    sysbus_connect_irq(SYS_BUS_DEVICE(gpu), 0, s->legacy_irq[157]);
+    sysbus_connect_irq(SYS_BUS_DEVICE(gpu), 1, s->legacy_irq[158]);
     glbridge_create(OBJECT(ms));
     s->gpu_reset = qdev_get_gpio_in_named(gpu, "reset", 0);
 
