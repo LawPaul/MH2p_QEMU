@@ -510,6 +510,12 @@ static void rstp_timer_cb(void *opaque)
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     if (!s->link_up) {
+        /*
+         * Bytes left over from an earlier INIT block the next one. Retry the
+         * flush here as well, so a missed accept_input from the UART cannot
+         * stall the link bring-up.
+         */
+        rstp_flush(s);
         if (now >= s->init_sent_ns + RSTP_INIT_RETRY_NS) {
             rstp_send_init(s);
         }
