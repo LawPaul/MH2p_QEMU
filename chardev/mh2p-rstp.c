@@ -9,6 +9,10 @@
  * that link so the unmodified MMX firmware receives native pointer and
  * keyboard input from any QEMU display.  Explicit vehicle clamp and main
  * power-state inputs are delivered to the original OOC on PWRMAN.
+ * Optionally (experimental, see rstp_chr_open) PERSISTENCE requests from the
+ * original rccpersistencebackend are answered like an RCC without stored
+ * values (PE_NO_SUCH_KEY), and hidcontroller setProperty requests are
+ * confirmed with a property report.
  *
  * Copyright (c) 2025
  *
@@ -17,6 +21,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/module.h"
+#include "qemu/cutils.h"
 #include "qemu/bswap.h"
 #include "qemu/error-report.h"
 #include "qemu/fifo8.h"
@@ -50,21 +55,42 @@
 
 #define RSTP_CHN_KEYPANEL   0x40
 #define RSTP_CHN_PWRMAN     0x10
+#define RSTP_CHN_PERSISTENCE 0x60
 #define RSTP_CHN_WATCHDOG   0xff
 #define RSTP_WATCHDOG_NS    (1000 * SCALE_MS)
 
-#define RSTP_TX_DEPTH       64
+#define RSTP_TX_DEPTH       128
 #define RSTP_TX_WINDOW      8
 #define RSTP_RETRANSMIT_NS  (200 * SCALE_MS)
 #define RSTP_INIT_RETRY_NS  (100 * SCALE_MS)
 #define RSTP_NACK_HOLDOFF_NS (20 * SCALE_MS)
 #define RSTP_OUTBUF_SIZE    8192
 
+/*
+ * rccpersistencebackend wire format (PersistenceChannel parser): byte 0 high
+ * nibble selects the header (0x0_: LE16 namespace + LE16 key; 0x8_: LE32 +
+ * LE32), low nibble is the operation. Values carry a LE24 length + data;
+ * errors carry one asi.persistence status byte.
+ */
+#define PERS_OP_REQUEST     0x0
+#define PERS_OP_UPDATE      0x1
+#define PERS_OP_UPDATE2     0x2
+#define PERS_OP_ERROR       0xf
+#define PE_NO_SUCH_KEY      2
+
 /* Keypanel function IDs consumed by hidcontroller. */
 #define KP_FID_KEY2             0x00
 #define KP_FID_ENCODER2         0x01
 #define KP_FID_INPUT_PANEL_RDY  0x0d
 #define KP_FID_TOUCH_COORD      0x0f
+/*
+ * hidcontroller property records are 128 bytes: function, keyboard, three
+ * property bytes, 123 data bytes; the MMX sends them as four 32-byte frames.
+ * 0x8f is setProperty (MMX -> RCC), 0x0e the property report (RCC -> MMX).
+ */
+#define KP_PROP_LEN             128
+#define KP_SET_PROPERTY         0x8f
+#define KP_FID_PROPERTY         0x0e
 
 /* org.dsi.ifc.keypanel.Constants */
 #define KBD_FCC                 1
@@ -134,9 +160,14 @@ struct MH2PRstpChardev {
     bool link_up;
     int64_t init_sent_ns;
     bool panels_ready;
+    bool prop_reply;
+    uint8_t kp_prop[KP_PROP_LEN];
+    unsigned kp_prop_len;
 
     RstpTxChannel keypanel;
     RstpTxChannel pwrman;
+    RstpTxChannel persistence;
+    bool persistence_enabled;
     bool pwrman_seen;
     int clamp_state;
     int power_state;
@@ -275,6 +306,10 @@ static void rstp_send_data(MH2PRstpChardev *s, uint8_t chn,
 {
     uint8_t body[4 + RSTP_MAX_DATA];
 
+    if (trace_event_get_state_backends(TRACE_MH2P_RSTP_HEX)) {
+        g_autoptr(GString) hex = qemu_hexdump_line(NULL, e->data, e->len, 1, 0);
+        trace_mh2p_rstp_hex("tx", chn, e->len, hex->str);
+    }
     body[0] = RSTP_FLAG_DATA;
     body[1] = e->len + 2;
     body[2] = chn;
@@ -285,7 +320,8 @@ static void rstp_send_data(MH2PRstpChardev *s, uint8_t chn,
 
 static void rstp_arm_timer(MH2PRstpChardev *s)
 {
-    RstpTxChannel *channels[] = { &s->keypanel, &s->pwrman };
+    RstpTxChannel *channels[] = { &s->keypanel, &s->pwrman,
+                                   &s->persistence };
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     int64_t deadline = INT64_MAX;
 
@@ -338,6 +374,7 @@ static void rstp_tx_pump(MH2PRstpChardev *s)
 {
     rstp_tx_pump_channel(s, &s->keypanel);
     rstp_tx_pump_channel(s, &s->pwrman);
+    rstp_tx_pump_channel(s, &s->persistence);
 }
 
 static void rstp_tx_retransmit(MH2PRstpChardev *s, RstpTxChannel *c)
@@ -441,7 +478,8 @@ static void rstp_tx_nacked(MH2PRstpChardev *s, RstpTxChannel *c,
 
 static void rstp_reset_sequences(MH2PRstpChardev *s)
 {
-    RstpTxChannel *channels[] = { &s->keypanel, &s->pwrman };
+    RstpTxChannel *channels[] = { &s->keypanel, &s->pwrman,
+                                   &s->persistence };
 
     memset(s->rx_last_sqn, 0xff, sizeof(s->rx_last_sqn));
     for (unsigned i = 0; i < ARRAY_SIZE(channels); i++) {
@@ -506,7 +544,8 @@ static void rstp_watchdog_cb(void *opaque)
 static void rstp_timer_cb(void *opaque)
 {
     MH2PRstpChardev *s = opaque;
-    RstpTxChannel *channels[] = { &s->keypanel, &s->pwrman };
+    RstpTxChannel *channels[] = { &s->keypanel, &s->pwrman,
+                                   &s->persistence };
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     if (!s->link_up) {
@@ -590,12 +629,100 @@ static void rstp_handle_pwrman(MH2PRstpChardev *s, const uint8_t *data,
     }
 }
 
+/* Answer each request with PE_NO_SUCH_KEY; consume value writes silently. */
+static void rstp_handle_persistence(MH2PRstpChardev *s, const uint8_t *data,
+                                    unsigned len)
+{
+    while (len) {
+        uint8_t op = data[0] & 0x0f;
+        unsigned hl, need;
+        uint32_t ns, key;
+        uint8_t reply[10];
+
+        switch (data[0] & 0xf0) {
+        case 0x00:
+            hl = 5;
+            break;
+        case 0x80:
+            hl = 9;
+            break;
+        default:
+            trace_mh2p_rstp_drop("persistence header", data[0], len);
+            return;
+        }
+        need = hl;
+        if (op == PERS_OP_UPDATE || op == PERS_OP_UPDATE2) {
+            need += 3;
+            if (len >= need) {
+                need += ldl_le_p(data + hl) & 0xffffff;
+            }
+        } else if (op == PERS_OP_ERROR) {
+            need += 1;
+        }
+        if (len < need) {
+            trace_mh2p_rstp_drop("persistence truncated", data[0], len);
+            return;
+        }
+        if (hl == 5) {
+            ns = lduw_le_p(data + 1);
+            key = lduw_le_p(data + 3);
+        } else {
+            ns = ldl_le_p(data + 1);
+            key = ldl_le_p(data + 5);
+        }
+        trace_mh2p_rstp_persistence(op, ns, key);
+        if (op == PERS_OP_REQUEST) {
+            memcpy(reply, data, hl);
+            reply[0] = (data[0] & 0xf0) | PERS_OP_ERROR;
+            reply[hl] = PE_NO_SUCH_KEY;
+            rstp_tx_queue_channel(s, &s->persistence, reply, hl + 1);
+        }
+        data += need;
+        len -= need;
+    }
+}
+
+/*
+ * Collect a setProperty request and confirm it like the RCC: report the
+ * property back with the requested value (0x0e record, same layout).
+ */
+static void rstp_handle_kp_property(MH2PRstpChardev *s, const uint8_t *data,
+                                    unsigned len)
+{
+    if (len && data[0] == KP_SET_PROPERTY) {
+        s->kp_prop_len = 0;
+    } else if (!s->kp_prop_len) {
+        return;
+    }
+    len = MIN(len, KP_PROP_LEN - s->kp_prop_len);
+    memcpy(s->kp_prop + s->kp_prop_len, data, len);
+    s->kp_prop_len += len;
+    if (s->kp_prop_len < KP_PROP_LEN) {
+        return;
+    }
+    s->kp_prop_len = 0;
+    s->kp_prop[0] = KP_FID_PROPERTY;
+    trace_mh2p_rstp_keypanel_property(s->kp_prop[1], s->kp_prop[2],
+                                      s->kp_prop[3], s->kp_prop[4]);
+    for (unsigned off = 0; off < KP_PROP_LEN; off += RSTP_MAX_DATA) {
+        rstp_tx_queue(s, s->kp_prop + off, RSTP_MAX_DATA);
+    }
+}
+
 static void rstp_handle_payload(MH2PRstpChardev *s, uint8_t chn,
                                 const uint8_t *data, unsigned len)
 {
+    if (trace_event_get_state_backends(TRACE_MH2P_RSTP_HEX)) {
+        g_autoptr(GString) hex = qemu_hexdump_line(NULL, data, len, 1, 0);
+        trace_mh2p_rstp_hex("rx", chn, len, hex->str);
+    }
     trace_mh2p_rstp_rx_data(chn, len, len ? data[0] : 0);
     if (chn == RSTP_CHN_PWRMAN) {
         rstp_handle_pwrman(s, data, len);
+        return;
+    }
+    if (chn == RSTP_CHN_PERSISTENCE && s->persistence_enabled) {
+        rstp_handle_persistence(s, data, len);
         return;
     }
     if (chn == RSTP_CHN_WATCHDOG && len == 4) {
@@ -610,6 +737,9 @@ static void rstp_handle_payload(MH2PRstpChardev *s, uint8_t chn,
                 reply, s->watchdog_counter);
         }
         return;
+    }
+    if (chn == RSTP_CHN_KEYPANEL && s->prop_reply) {
+        rstp_handle_kp_property(s, data, len);
     }
     if (chn == RSTP_CHN_KEYPANEL && !s->panels_ready) {
         rstp_send_panels_ready(s);
@@ -675,7 +805,9 @@ static void rstp_handle_frame(MH2PRstpChardev *s, const uint8_t *f,
         for (unsigned i = 0; i + 1 < f[1]; i += 2) {
             uint8_t chn = f[2 + i], sqn = f[3 + i];
             RstpTxChannel *c = chn == RSTP_CHN_KEYPANEL ? &s->keypanel :
-                               chn == RSTP_CHN_PWRMAN ? &s->pwrman : NULL;
+                               chn == RSTP_CHN_PWRMAN ? &s->pwrman :
+                               chn == RSTP_CHN_PERSISTENCE ?
+                               &s->persistence : NULL;
 
             trace_mh2p_rstp_rx(flag, chn, sqn, len);
             if (!c) {
@@ -1081,11 +1213,14 @@ static void rstp_reset(void *opaque)
     timer_del(s->timer);
     s->rx_active = false;
     s->link_up = false;
+    s->kp_prop_len = 0;
     s->panels_ready = false;
     s->keypanel.head = 0;
     s->keypanel.count = 0;
     s->pwrman.head = 0;
     s->pwrman.count = 0;
+    s->persistence.head = 0;
+    s->persistence.count = 0;
     s->pwrman_seen = false;
     s->touch_down = false;
     s->touch_moved = false;
@@ -1115,6 +1250,17 @@ static bool rstp_chr_open(Chardev *chr, ChardevBackend *backend,
     s->watchdog_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, rstp_watchdog_cb, s);
     s->keypanel.chn = RSTP_CHN_KEYPANEL;
     s->pwrman.chn = RSTP_CHN_PWRMAN;
+    s->persistence.chn = RSTP_CHN_PERSISTENCE;
+    /*
+     * Experimental, opt-in (=1): QEMU_MH2P_RSTP_PROPREPLY confirms keypanel
+     * setProperty requests (untested); QEMU_MH2P_RSTP_PERSISTENCE answers
+     * PERSISTENCE with PE_NO_SUCH_KEY, which without real values makes
+     * hidcontroller fail.
+     */
+    s->prop_reply =
+        g_strcmp0(g_getenv("QEMU_MH2P_RSTP_PROPREPLY"), "1") == 0;
+    s->persistence_enabled =
+        g_strcmp0(g_getenv("QEMU_MH2P_RSTP_PERSISTENCE"), "1") == 0;
     rstp_reset(s);
     qemu_register_reset(rstp_reset, s);
     s->hs = qemu_input_handler_register((DeviceState *)s,
