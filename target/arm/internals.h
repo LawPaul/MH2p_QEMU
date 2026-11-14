@@ -1999,6 +1999,23 @@ uint64_t gt_direct_access_timer_offset(CPUARMState *env, int timeridx);
  * all EL1" scope; this covers stage 1 and stage 2.
  */
 int alle1_tlbmask(CPUARMState *env);
+
+/*
+ * Every mmu index except ARMMMUIdx_Phys_*. Those cache the page-table
+ * walker's own physical-address lookups, which depend only on the memory
+ * map (a memory map change flushes everything), never on the guest's
+ * translation tables, ASID or domains, so TLB maintenance for a guest
+ * translation change does not need to drop them.
+ */
+static inline uint32_t arm_tlbmask_keep_ptw(void)
+{
+    uint32_t phys = 0;
+
+    for (int i = ARMMMUIdx_Phys_S; i <= ARMMMUIdx_Phys_Realm; i++) {
+        phys |= 1u << (i & ARM_MMU_IDX_COREIDX_MASK);
+    }
+    return ((1u << NB_MMU_MODES) - 1) & ~phys;
+}
 /*
  * Return mask of ARMMMUIdxBit values corresponding to an "invalidate
  * all EL2&0" scope.

@@ -488,17 +488,17 @@ void tlb_flush(CPUState *cpu)
  * @tag is retained in a separate bank: guests must invalidate TLBs before
  * reusing an ASID, and every TLB invalidation also invalidates all banks.
  */
-void tlb_flush_asid_switch(CPUState *cpu, uint64_t tag)
+void tlb_flush_asid_switch(CPUState *cpu, MMUIdxMap idxmap, uint64_t tag)
 {
     assert_cpu_is_self(cpu);
-    tlb_flush_mmuidx_entries(cpu, ALL_MMUIDX_BITS);
+    tlb_flush_mmuidx_entries(cpu, idxmap);
     tcg_switch_jmp_cache(cpu, tag);
 }
 
-void tlb_flush_asid(CPUState *cpu, uint32_t asid)
+void tlb_flush_asid(CPUState *cpu, MMUIdxMap idxmap, uint32_t asid)
 {
     assert_cpu_is_self(cpu);
-    tlb_flush_mmuidx_entries(cpu, ALL_MMUIDX_BITS);
+    tlb_flush_mmuidx_entries(cpu, idxmap);
     tcg_flush_jmp_cache_asid(cpu, asid);
 }
 

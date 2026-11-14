@@ -129,22 +129,25 @@ void tlb_flush(CPUState *cpu);
 /**
  * tlb_flush_asid_switch:
  * @cpu: CPU whose TLB should be flushed; must be the current CPU
+ * @idxmap: bitmap of mmu indexes to flush
  * @tag: identity of the newly selected translation context
  *
- * Like tlb_flush(), but keeps the TB jump cache of the previous context
- * for reuse when @tag is selected again.
+ * Like tlb_flush_by_mmuidx(), but keeps the TB jump cache of the previous
+ * context for reuse when @tag is selected again.
  */
-void tlb_flush_asid_switch(CPUState *cpu, uint64_t tag);
+void tlb_flush_asid_switch(CPUState *cpu, MMUIdxMap idxmap, uint64_t tag);
 
 /**
  * tlb_flush_asid:
  * @cpu: CPU whose TLB should be flushed; must be the current CPU
+ * @idxmap: bitmap of mmu indexes to flush
  * @asid: the ASID being invalidated
  *
- * Like tlb_flush(), but only the TB jump cache contexts that may use
- * @asid are discarded.  Mappings of other ASIDs are unaffected by TLBIASID.
+ * Like tlb_flush_by_mmuidx(), but only the TB jump cache contexts that may
+ * use @asid are discarded.  Mappings of other ASIDs are unaffected by
+ * TLBIASID.
  */
-void tlb_flush_asid(CPUState *cpu, uint32_t asid);
+void tlb_flush_asid(CPUState *cpu, MMUIdxMap idxmap, uint32_t asid);
 
 /**
  * tlb_flush_all_cpus_synced:
@@ -256,10 +259,12 @@ static inline void tlb_flush_page_all_cpus_synced(CPUState *src, vaddr addr)
 static inline void tlb_flush(CPUState *cpu)
 {
 }
-static inline void tlb_flush_asid_switch(CPUState *cpu, uint64_t tag)
+static inline void tlb_flush_asid_switch(CPUState *cpu, MMUIdxMap idxmap,
+                                         uint64_t tag)
 {
 }
-static inline void tlb_flush_asid(CPUState *cpu, uint32_t asid)
+static inline void tlb_flush_asid(CPUState *cpu, MMUIdxMap idxmap,
+                                  uint32_t asid)
 {
 }
 static inline void tlb_flush_all_cpus_synced(CPUState *src_cpu)

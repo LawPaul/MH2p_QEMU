@@ -522,7 +522,7 @@ static void contextidr_write(CPUARMState *env, const ARMCPRegInfo *ri,
          * The tag names both security states' ASIDs.
          */
         raw_write(env, ri, value);
-        tlb_flush_asid_switch(CPU(cpu),
+        tlb_flush_asid_switch(CPU(cpu), arm_tlbmask_keep_ptw(),
                               (1ULL << 63) |
                               (env->cp15.contextidr_s & 0xff) << 8 |
                               (env->cp15.contextidr_ns & 0xff));
@@ -2987,7 +2987,7 @@ static void vmsa_ttbr_write(CPUARMState *env, const ARMCPRegInfo *ri,
 
         /* The tag names every EL1/EL3 TTBR ASID, whichever is active. */
         raw_write(env, ri, value);
-        tlb_flush_asid_switch(CPU(cpu),
+        tlb_flush_asid_switch(CPU(cpu), arm_tlbmask_keep_ptw(),
                               extract64(env->cp15.ttbr0_el[1], 48, 16) |
                               extract64(env->cp15.ttbr1_el[1], 48, 16) << 16 |
                               extract64(env->cp15.ttbr0_el[3], 48, 16) << 32 |

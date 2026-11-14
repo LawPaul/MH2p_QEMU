@@ -52,7 +52,7 @@ static void tlbiall_is_write(CPUARMState *env, const ARMCPRegInfo *ri,
 {
     CPUState *cs = env_cpu(env);
 
-    tlb_flush_all_cpus_synced(cs);
+    tlb_flush_by_mmuidx_all_cpus_synced(cs, arm_tlbmask_keep_ptw());
 }
 
 static void tlbiasid_is_write(CPUARMState *env, const ARMCPRegInfo *ri,
@@ -60,7 +60,7 @@ static void tlbiasid_is_write(CPUARMState *env, const ARMCPRegInfo *ri,
 {
     CPUState *cs = env_cpu(env);
 
-    tlb_flush_all_cpus_synced(cs);
+    tlb_flush_by_mmuidx_all_cpus_synced(cs, arm_tlbmask_keep_ptw());
 }
 
 static void tlbimva_is_write(CPUARMState *env, const ARMCPRegInfo *ri,
@@ -96,9 +96,9 @@ static void tlbiall_write(CPUARMState *env, const ARMCPRegInfo *ri,
     CPUState *cs = env_cpu(env);
 
     if (tlb_force_broadcast(env)) {
-        tlb_flush_all_cpus_synced(cs);
+        tlb_flush_by_mmuidx_all_cpus_synced(cs, arm_tlbmask_keep_ptw());
     } else {
-        tlb_flush(cs);
+        tlb_flush_by_mmuidx(cs, arm_tlbmask_keep_ptw());
     }
 }
 
@@ -123,11 +123,11 @@ static void tlbiasid_write(CPUARMState *env, const ARMCPRegInfo *ri,
     CPUState *cs = env_cpu(env);
 
     if (tlb_force_broadcast(env)) {
-        tlb_flush_all_cpus_synced(cs);
+        tlb_flush_by_mmuidx_all_cpus_synced(cs, arm_tlbmask_keep_ptw());
     } else if (!is_a64(env) && !arm_feature(env, ARM_FEATURE_PMSA)) {
-        tlb_flush_asid(cs, value & 0xff);
+        tlb_flush_asid(cs, arm_tlbmask_keep_ptw(), value & 0xff);
     } else {
-        tlb_flush(cs);
+        tlb_flush_by_mmuidx(cs, arm_tlbmask_keep_ptw());
     }
 }
 
