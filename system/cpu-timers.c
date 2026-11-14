@@ -24,6 +24,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/cutils.h"
+#include "qemu/host-utils.h"
 #include "migration/vmstate.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
@@ -71,13 +72,40 @@ int64_t cpu_get_ticks(void)
     return ticks;
 }
 
+/*
+ * Experimental, opt-in: QEMU_VM_CLOCK_PERCENT=N (1..99) runs the virtual clock
+ * at N% of host time when icount is off. A slow multi-threaded TCG guest then
+ * sees proportionally faster CPUs, so wall-clock timeouts sized for real
+ * hardware do not fire during start-up (icount gets this from instruction
+ * counting, but only with one host thread for every vCPU).
+ */
+static int64_t vm_clock_source(void)
+{
+    static int percent;
+
+    if (!percent) {
+        const char *e = getenv("QEMU_VM_CLOCK_PERCENT");
+        int p = e ? atoi(e) : 100;
+
+        if (p < 1 || p > 100) {
+            p = 100;
+        }
+        if (p != 100) {
+            warn_report("QEMU_VM_CLOCK_PERCENT=%d: guest time runs at %d%% "
+                        "of host time", p, p);
+        }
+        percent = p;
+    }
+    return percent == 100 ? get_clock() : muldiv64(get_clock(), percent, 100);
+}
+
 int64_t cpu_get_clock_locked(void)
 {
     int64_t time;
 
     time = timers_state.cpu_clock_offset;
     if (timers_state.cpu_ticks_enabled) {
-        time += get_clock();
+        time += vm_clock_source();
     }
 
     return time;
@@ -110,7 +138,7 @@ void cpu_enable_ticks(void)
                        &timers_state.vm_clock_lock);
     if (!timers_state.cpu_ticks_enabled) {
         timers_state.cpu_ticks_offset -= cpu_get_host_ticks();
-        timers_state.cpu_clock_offset -= get_clock();
+        timers_state.cpu_clock_offset -= vm_clock_source();
         timers_state.cpu_ticks_enabled = 1;
     }
     seqlock_write_unlock(&timers_state.vm_clock_seqlock,

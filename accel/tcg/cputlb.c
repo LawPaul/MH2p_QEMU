@@ -38,6 +38,7 @@
 #include "tcg/tcg.h"
 #include "qemu/error-report.h"
 #include "exec/log.h"
+#include "system/tcg.h"
 #include "exec/helper-proto-common.h"
 #include "exec/tlb-flags.h"
 #include "qemu/atomic.h"
@@ -378,6 +379,52 @@ static void flush_all_helper(CPUState *src, run_on_cpu_func fn,
     }
 }
 
+/*
+ * Round-robin TCG (one host thread for every vCPU, as with -icount) never runs
+ * another vCPU while @src executes, so a synchronised broadcast flush can be
+ * done in place on every vCPU. Queueing it as safe work instead forces @src to
+ * exit and hands the turn to each other vCPU, a full time slice per
+ * invalidate: a guest that unmaps memory page by page with TLBIMVAIS then
+ * crawls at a rate that falls with the vCPU count.
+ */
+static bool tlb_flush_synced_in_place(void)
+{
+    return !qemu_tcg_mttcg_enabled();
+}
+
+/*
+ * Experimental, opt-in (QEMU_TCG_RELAXED_TLBI=1, multi-threaded TCG only): run
+ * the source vCPU's part of a broadcast flush at once instead of as exclusive
+ * safe work. The other vCPUs are still kicked and flush at their next exit, so
+ * they may briefly use a stale translation. Each safe work item stops every
+ * vCPU thread, which a guest invalidating page by page pays thousands of times.
+ */
+static bool tlb_flush_relaxed(void)
+{
+    static int relaxed = -1;
+
+    if (relaxed < 0) {
+        const char *e = getenv("QEMU_TCG_RELAXED_TLBI");
+
+        relaxed = e && *e == '1';
+        if (relaxed) {
+            warn_report("QEMU_TCG_RELAXED_TLBI=1: broadcast TLB invalidates "
+                        "do not wait for other vCPUs");
+        }
+    }
+    return relaxed;
+}
+
+static void tlb_flush_src_cpu(CPUState *src, run_on_cpu_func fn,
+                              run_on_cpu_data d)
+{
+    if (tlb_flush_relaxed()) {
+        fn(src, d);
+    } else {
+        async_safe_run_on_cpu(src, fn, d);
+    }
+}
+
 static void tlb_flush_mmuidx_entries(CPUState *cpu, MMUIdxMap asked)
 {
     MMUIdxMap all_dirty, work, to_clean;
@@ -461,8 +508,16 @@ void tlb_flush_by_mmuidx_all_cpus_synced(CPUState *src_cpu, MMUIdxMap idxmap)
 
     tlb_debug("mmu_idx: 0x%"PRIx16"\n", idxmap);
 
+    if (tlb_flush_synced_in_place()) {
+        CPUState *cpu;
+
+        CPU_FOREACH(cpu) {
+            fn(cpu, RUN_ON_CPU_HOST_INT(idxmap));
+        }
+        return;
+    }
     flush_all_helper(src_cpu, fn, RUN_ON_CPU_HOST_INT(idxmap));
-    async_safe_run_on_cpu(src_cpu, fn, RUN_ON_CPU_HOST_INT(idxmap));
+    tlb_flush_src_cpu(src_cpu, fn, RUN_ON_CPU_HOST_INT(idxmap));
 }
 
 void tlb_flush_all_cpus_synced(CPUState *src_cpu)
@@ -679,6 +734,15 @@ void tlb_flush_page_by_mmuidx_all_cpus_synced(CPUState *src_cpu,
     /* This should already be page aligned */
     addr &= TARGET_PAGE_MASK;
 
+    if (tlb_flush_synced_in_place()) {
+        CPUState *cpu;
+
+        CPU_FOREACH(cpu) {
+            tlb_flush_page_by_mmuidx_async_0(cpu, addr, idxmap);
+        }
+        return;
+    }
+
     /*
      * Allocate memory to hold addr+idxmap only when needed.
      * See tlb_flush_page_by_mmuidx for details.
@@ -686,8 +750,8 @@ void tlb_flush_page_by_mmuidx_all_cpus_synced(CPUState *src_cpu,
     if (idxmap < TARGET_PAGE_SIZE) {
         flush_all_helper(src_cpu, tlb_flush_page_by_mmuidx_async_1,
                          RUN_ON_CPU_TARGET_PTR(addr | idxmap));
-        async_safe_run_on_cpu(src_cpu, tlb_flush_page_by_mmuidx_async_1,
-                              RUN_ON_CPU_TARGET_PTR(addr | idxmap));
+        tlb_flush_src_cpu(src_cpu, tlb_flush_page_by_mmuidx_async_1,
+                          RUN_ON_CPU_TARGET_PTR(addr | idxmap));
     } else {
         CPUState *dst_cpu;
         TLBFlushPageByMMUIdxData *d;
@@ -706,8 +770,8 @@ void tlb_flush_page_by_mmuidx_all_cpus_synced(CPUState *src_cpu,
         d = g_new(TLBFlushPageByMMUIdxData, 1);
         d->addr = addr;
         d->idxmap = idxmap;
-        async_safe_run_on_cpu(src_cpu, tlb_flush_page_by_mmuidx_async_2,
-                              RUN_ON_CPU_HOST_PTR(d));
+        tlb_flush_src_cpu(src_cpu, tlb_flush_page_by_mmuidx_async_2,
+                          RUN_ON_CPU_HOST_PTR(d));
     }
 }
 
@@ -885,6 +949,13 @@ void tlb_flush_range_by_mmuidx_all_cpus_synced(CPUState *src_cpu,
     d.idxmap = idxmap;
     d.bits = bits;
 
+    if (tlb_flush_synced_in_place()) {
+        CPU_FOREACH(dst_cpu) {
+            tlb_flush_range_by_mmuidx_async_0(dst_cpu, d);
+        }
+        return;
+    }
+
     /* Allocate a separate data block for each destination cpu.  */
     CPU_FOREACH(dst_cpu) {
         if (dst_cpu != src_cpu) {
@@ -895,8 +966,8 @@ void tlb_flush_range_by_mmuidx_all_cpus_synced(CPUState *src_cpu,
     }
 
     p = g_memdup(&d, sizeof(d));
-    async_safe_run_on_cpu(src_cpu, tlb_flush_range_by_mmuidx_async_1,
-                          RUN_ON_CPU_HOST_PTR(p));
+    tlb_flush_src_cpu(src_cpu, tlb_flush_range_by_mmuidx_async_1,
+                      RUN_ON_CPU_HOST_PTR(p));
 }
 
 void tlb_flush_page_bits_by_mmuidx_all_cpus_synced(CPUState *src_cpu,
