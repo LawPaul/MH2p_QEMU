@@ -429,6 +429,13 @@ static void serial_ioport_write(void *opaque, hwaddr addr, uint64_t val,
 
         serial_write_fcr(s, val & 0xC9);
         serial_update_irq(s);
+        /*
+         * Clearing or (re)enabling the RX FIFO, or a new trigger level, can
+         * open receive space: tell the backend, as an RBR read does.
+         */
+        if (!(s->mcr & UART_MCR_LOOP)) {
+            qemu_chr_fe_accept_input(&s->chr);
+        }
         break;
     case 3:
         {
