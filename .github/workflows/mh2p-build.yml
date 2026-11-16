@@ -49,7 +49,11 @@ jobs:
           sudo apt-get install -y ninja-build pkg-config libglib2.0-dev libpixman-1-dev zlib1g-dev python3-venv
       - name: macOS dependencies
         if: runner.os == 'macOS'
-        run: brew install ninja pkgconf glib pixman python
+        run: |
+          brew install ninja pkgconf glib pixman python
+          python3 -m venv "$RUNNER_TEMP/pyenv"
+          "$RUNNER_TEMP/pyenv/bin/pip" install setuptools
+          echo "PYTHON=$RUNNER_TEMP/pyenv/bin/python3" >> "$GITHUB_ENV"
       - name: Build MH2P boards
         run: |
           mkdir "$RUNNER_TEMP/build"
