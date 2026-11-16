@@ -51,6 +51,8 @@ struct GK20AState {
     uint32_t bus_intr_enable;
     uint32_t bar1_block;
     uint32_t gpc2clk_out;
+    /* TRIM_SYS GPCPLL (GPU core PLL): CFG, COEFF, CFG2, NDIV_SLOWDOWN, SEL_VCO */
+    uint32_t gpcpll_cfg, gpcpll_coeff, gpcpll_cfg2, gpcpll_slowdown, sel_vco;
     uint32_t mc_enable;
     uint32_t mc_enable_pb;
     uint32_t mc_elpg_enable;
@@ -750,6 +752,24 @@ static MemTxResult gk20a_read(void *opaque, hwaddr offset, uint64_t *value,
     case 0x137250: /* TRIM_SYS_GPC2CLK_OUT */
         *value = s->gpc2clk_out;
         return MEMTX_OK;
+    case 0x137000: /* TRIM_SYS_GPCPLL_CFG: locks while enabled, out of IDDQ */
+        *value = s->gpcpll_cfg & ~BIT(17);
+        if ((s->gpcpll_cfg & BIT(0)) && !(s->gpcpll_cfg & BIT(1))) {
+            *value |= BIT(17);
+        }
+        return MEMTX_OK;
+    case 0x137004: /* TRIM_SYS_GPCPLL_COEFF: M[7:0] N[15:8] PL[21:16] */
+        *value = s->gpcpll_coeff;
+        return MEMTX_OK;
+    case 0x13700c: /* TRIM_SYS_GPCPLL_CFG2 */
+        *value = s->gpcpll_cfg2;
+        return MEMTX_OK;
+    case 0x13701c: /* TRIM_SYS_GPCPLL_NDIV_SLOWDOWN */
+        *value = s->gpcpll_slowdown;
+        return MEMTX_OK;
+    case 0x137100: /* TRIM_SYS_SEL_VCO: GPC2CLK from VCO (1) or bypass */
+        *value = s->sel_vco;
+        return MEMTX_OK;
     case 0x200: /* MC_ENABLE: reset controls, not execution completion. */
         *value = s->mc_enable;
         return MEMTX_OK;
@@ -876,6 +896,21 @@ static MemTxResult gk20a_write(void *opaque, hwaddr offset, uint64_t value,
             break;
         }
         s->gpc2clk_out = value;
+        return MEMTX_OK;
+    case 0x137000:
+        s->gpcpll_cfg = value & ~BIT(17);
+        return MEMTX_OK;
+    case 0x137004:
+        s->gpcpll_coeff = value;
+        return MEMTX_OK;
+    case 0x13700c:
+        s->gpcpll_cfg2 = value;
+        return MEMTX_OK;
+    case 0x13701c:
+        s->gpcpll_slowdown = value;
+        return MEMTX_OK;
+    case 0x137100:
+        s->sel_vco = value;
         return MEMTX_OK;
     case 0x200:
         if (value & ~(s->experimental_engine_init ?
@@ -1115,6 +1150,12 @@ static void gk20a_reset(DeviceState *dev)
     s->bus_intr_enable = 0;
     s->bar1_block = 0;
     s->gpc2clk_out = 0;
+    /* Power-on: PLL in IDDQ, GPC2CLK on the bypass path. */
+    s->gpcpll_cfg = BIT(1);
+    s->gpcpll_coeff = 0;
+    s->gpcpll_cfg2 = 0;
+    s->gpcpll_slowdown = 0;
+    s->sel_vco = 0;
     s->mc_enable = 0;
     s->mc_enable_pb = 0;
     s->mc_elpg_enable = 0;
