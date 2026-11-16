@@ -293,21 +293,7 @@ static void serial_write_fcr(SerialState *s, uint8_t val)
 
     if (val & UART_FCR_FE) {
         s->iir |= UART_IIR_FE;
-        /* Set recv_fifo trigger Level */
-        switch (val & 0xC0) {
-        case UART_FCR_ITL_1:
-            s->recv_fifo_itl = 1;
-            break;
-        case UART_FCR_ITL_2:
-            s->recv_fifo_itl = 4;
-            break;
-        case UART_FCR_ITL_3:
-            s->recv_fifo_itl = 8;
-            break;
-        case UART_FCR_ITL_4:
-            s->recv_fifo_itl = 14;
-            break;
-        }
+        s->recv_fifo_itl = s->recv_fifo_triggers[val >> 6];
     } else {
         s->iir &= ~UART_IIR_FE;
     }
@@ -920,6 +906,9 @@ static int serial_be_change(void *opaque)
 static void serial_realize(DeviceState *dev, Error **errp)
 {
     SerialState *s = SERIAL(dev);
+    static const uint8_t triggers[] = { 1, 4, 8, 14 };
+
+    memcpy(s->recv_fifo_triggers, triggers, sizeof(triggers));
 
     s->modem_status_poll = timer_new_ns(QEMU_CLOCK_VIRTUAL, (QEMUTimerCB *) serial_update_msl, s);
 

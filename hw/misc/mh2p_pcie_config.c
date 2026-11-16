@@ -15,6 +15,7 @@
 #include "io/channel-socket.h"
 #include "migration/vmstate.h"
 #include "monitor/monitor.h"
+#include "trace.h"
 
 #define TYPE_MH2P_PCIE_CONFIG "mh2p-pcie-config"
 OBJECT_DECLARE_SIMPLE_TYPE(MH2PPCIeConfigState, MH2P_PCIE_CONFIG)
@@ -292,6 +293,9 @@ static MemTxResult config_rpc(MH2PPCIeConfigState *s, bool ready, unsigned op,
         return MEMTX_ERROR;
     }
     *value = ldl_le_p(reply + 28);
+    trace_mh2p_pcie_rpc(op, reg, size, *value, status,
+                        qemu_clock_get_ns(QEMU_CLOCK_REALTIME) -
+                        (deadline - RPC_TIMEOUT_NS));
     if (status == ABSENT && op >= MEMORY_READ) {
         error_report("mh2p-pcie-config: memory access to absent peer "
                      "at 0x%x size %u", reg, size);

@@ -461,6 +461,9 @@ vmlaunch_reset_enter(void) ""
 vm_launchupdate_finalize(void) ""
 restore_host_x86_igvm(void) ""
 
+# mh2p_pcie_config.c
+mh2p_pcie_rpc(unsigned op, uint32_t address, unsigned size, uint32_t value, uint32_t status, int64_t host_ns) "op=%u address=0x%x size=%u value=0x%x status=%u host_ns=%" PRId64
+
 # glbridge.c
 glbridge_surface_write(uint64_t length, uint32_t status) "length=%" PRIu64 " status=%u"
 glbridge_surface_refresh(uint64_t length, uint32_t status) "length=%" PRIu64 " status=%u"

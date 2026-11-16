@@ -68,6 +68,7 @@ struct SerialState {
     Fifo8 xmit_fifo;
     /* Interrupt trigger level for recv_fifo */
     uint8_t recv_fifo_itl;
+    uint8_t recv_fifo_triggers[4];
 
     QEMUTimer *fifo_timeout_timer;
     int timeout_ipending;           /* timeout interrupt pending state */
