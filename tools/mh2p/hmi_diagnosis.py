@@ -37,16 +37,13 @@ def listener_wait_command():
         r"[[:space:]]+[^[:space:]]+[.:]1501[[:space:]]+[^[:space:]]+"
         r"[[:space:]]+LISTEN[[:space:]]*$")
     return (
-        "DIAG_LISTENER_N=0; DIAG_LISTENER_READY=0; "
-        'while [ "$DIAG_LISTENER_N" -lt 120 ]; do '
+        'n=0; while [ "$n" -lt 120 ]; do '
         "netstat -an >/tmp/diagnosis-listeners 2>&1 || "
         "{ cat /tmp/diagnosis-listeners; exit 1; }; "
         f"if grep -E '{pattern}' /tmp/diagnosis-listeners; then "
-        "DIAG_LISTENER_READY=1; break; fi; "
-        "DIAG_LISTENER_N=$((DIAG_LISTENER_N + 1)); sleep 1 || exit 1; done; "
-        'if [ "$DIAG_LISTENER_READY" = 1 ]; then echo ORIGINAL_DIAG_LISTENER_READY; '
-        "else cat /tmp/diagnosis-listeners; echo ORIGINAL_DIAG_LISTENER_TIMEOUT; "
-        "exit 1; fi")
+        "echo ORIGINAL_DIAG_LISTENER_READY; exit 0; fi; "
+        "n=$((n+1)); sleep 1 || exit 1; done; "
+        "cat /tmp/diagnosis-listeners; echo ORIGINAL_DIAG_LISTENER_TIMEOUT; exit 1")
 
 
 def original_getter_failed(reply):

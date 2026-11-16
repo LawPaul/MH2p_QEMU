@@ -24,6 +24,18 @@ extern int close(int);
 static volatile unsigned char *bridge;
 static unsigned char *bulk;
 static unsigned bulk_size;
+#ifndef GLBRIDGE_POLL_SPINS
+#define GLBRIDGE_POLL_SPINS 0
+#endif
+#if GLBRIDGE_POLL_SPINS < 0 || GLBRIDGE_POLL_SPINS > 65536
+#error "GLBRIDGE_POLL_SPINS must be between 0 and 65536"
+#endif
+static int transport_poll(unsigned *remaining)
+{
+    if (!*remaining) return 0;
+    --*remaining;
+    return 1;
+}
 extern void *memcpy(void *,const void *,unsigned long);
 static int g_fd = -1;
 static u32 g_id;
@@ -182,8 +194,9 @@ static int recv_bytes(void *p, unsigned long n,int release)
     unsigned char *c = p;
     if (gl_conn() < 0) return -1;
     while (n) {
-        unsigned tries = 0, available;
+        unsigned tries = 0, available, spins = GLBRIDGE_POLL_SPINS;
         while (!(available=*(volatile u32 *)(bridge+(bulk?32:8)))) {
+            if (transport_poll(&spins)) continue;
             if (++tries > 10000) {
                 transport_error("reply timed out, remaining bytes=", n);
                 unlock_record(); return -1;
@@ -215,7 +228,9 @@ static int recv_all(void *p,unsigned long n){return recv_bytes(p,n,1);}
 static void commit_record(struct Record *r)
 {
     if(gl_conn()<0)return;
-    while(*(volatile u32 *)(bridge+16))usleep(1000);
+    unsigned spins = GLBRIDGE_POLL_SPINS;
+    while(*(volatile u32 *)(bridge+16))
+        if (!transport_poll(&spins)) usleep(1000);
     send_all(r->data,r->size);
     if(!r->reply)unlock_record();
 }

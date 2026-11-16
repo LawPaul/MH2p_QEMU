@@ -5,6 +5,7 @@ import json
 import socket
 import subprocess
 import re
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -16,10 +17,10 @@ from hmi_diagnosis import (
 class HmiDiagnosisTests(unittest.TestCase):
     def test_listener_wait_is_bounded_and_matches_local_tcp_listener_only(self):
         command = listener_wait_command()
-        self.assertIn('"$DIAG_LISTENER_N" -lt 120', command)
+        self.assertIn('"$n" -lt 120', command)
         self.assertIn("sleep 1 || exit 1", command)
         self.assertIn("netstat -an", command)
-        self.assertLess(len(command), 800)
+        self.assertLess(len(command), 500)
         parsed = subprocess.run(["sh", "-n"], input=command, text=True, capture_output=True)
         self.assertEqual(parsed.returncode, 0, parsed.stderr)
         pattern = re.search(r"grep -E '([^']+)'", command)[1]
@@ -35,6 +36,35 @@ class HmiDiagnosisTests(unittest.TestCase):
             result = subprocess.run(["grep", "-E", pattern], input=line + "\n",
                                     text=True, capture_output=True)
             self.assertEqual(result.returncode == 0, expected, line)
+
+    def test_listener_wait_reports_success_failures_and_timeout(self):
+        cases = (
+            ("netstat() { echo 'tcp 0 0 *.1501 *.* LISTEN'; }; ",
+             0, "ORIGINAL_DIAG_LISTENER_READY", None),
+            ("netstat() { echo 'tcp 0 0 *.1501 *.* ESTABLISHED'; }; "
+             "sleep() { :; }; ",
+             1, "ORIGINAL_DIAG_LISTENER_TIMEOUT", "ORIGINAL_DIAG_LISTENER_READY"),
+            ("netstat() { echo NETSTAT_FAILED; return 2; }; ",
+             1, "NETSTAT_FAILED", "ORIGINAL_DIAG_LISTENER_READY"),
+            ("netstat() { echo 'tcp 0 0 *.1501 *.* ESTABLISHED'; }; "
+             "sleep() { echo SLEEP_FAILED; return 1; }; ",
+             1, "SLEEP_FAILED", "ORIGINAL_DIAG_LISTENER_READY"),
+            ("netstat() { if [ \"$n\" -ge 2 ]; then "
+             "echo 'tcp 0 0 *.1501 *.* LISTEN'; fi; }; sleep() { :; }; ",
+             0, "ORIGINAL_DIAG_LISTENER_READY", None),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = temporary + "/listeners"
+            command = listener_wait_command().replace("/tmp/diagnosis-listeners", path)
+            for setup, code, present, absent in cases:
+                with self.subTest(present=present, setup=setup):
+                    result = subprocess.run(
+                        ["sh", "-c", setup + command],
+                        text=True, capture_output=True, timeout=10)
+                    self.assertEqual(result.returncode, code, result.stderr)
+                    self.assertIn(present, result.stdout)
+                    if absent:
+                        self.assertNotIn(absent, result.stdout)
 
     def test_read_only_surface_includes_bundle_inventory_but_not_commands(self):
         for command in ("getapps", "getbundles", "getcommands,101", "getkeys,32",

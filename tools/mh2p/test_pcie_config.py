@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
+import re
 import socket
 import struct
 import tempfile
@@ -81,6 +82,28 @@ class ConfigTests(unittest.TestCase):
         write(rcc, 0x51002104, 1)
         self.assertEqual(read(mmx, 0x02000000), 0xb801104c)
         write(mmx, 0x02000004, 6)
+
+    def test_opt_in_rpc_trace_records_real_value_status_and_latency(self):
+        with self.pair(outbound=True) as ((_, mmx), (rcc_vm, rcc)):
+            self.setup_outbound(mmx, rcc)
+            write(mmx, 0x90000004, 0x12345678)
+            self.assertEqual(read(rcc, 0x28000004), 0x12345678)
+            self.assertNotIn(
+                "mh2p_pcie_rpc",
+                Path(rcc_vm._qemu_log_path).read_text())
+            rcc_vm.cmd("trace-event-set-state",
+                       name="mh2p_pcie_rpc", enable=True)
+            self.assertEqual(read(rcc, 0x28000004), 0x12345678)
+            rcc_vm.cmd("trace-event-set-state",
+                       name="mh2p_pcie_rpc", enable=False)
+            self.assertEqual(read(rcc, 0x28000004), 0x12345678)
+            trace = Path(rcc_vm._qemu_log_path).read_text()
+            match = re.search(
+                r"mh2p_pcie_rpc op=3 address=0x90000004 size=4 "
+                r"value=0x12345678 status=0 host_ns=(\d+)", trace)
+            self.assertIsNotNone(match, trace)
+            self.assertGreaterEqual(int(match[1]), 0)
+            self.assertEqual(trace.count("mh2p_pcie_rpc "), 1)
 
     def test_reverse_memory_uses_live_outbound_region_and_real_mmx_ram(self):
         with self.pair(outbound=True) as ((mmx_vm, mmx), (_, rcc)):

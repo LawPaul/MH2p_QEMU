@@ -79,7 +79,10 @@ def replace_resources(source, replacements):
     return bytes(image)
 
 
-def build(source, output, compiler):
+def build(source, output, compiler, *, experimental_poll_spins=0):
+    if (type(experimental_poll_spins) is not int or
+            not 0 <= experimental_poll_spins <= 65536):
+        raise ValueError("Experimental poll spins must be an integer from 0 to 65536")
     source = Path(source).resolve()
     output = Path(output)
     original = source.read_bytes()
@@ -103,6 +106,7 @@ def build(source, output, compiler):
         ]
         if name == "lib/libmh2p-screen.so":
             command.append("-DGLBRIDGE_MH2P_SCREEN")
+            command.append(f"-DGLBRIDGE_POLL_SPINS={experimental_poll_spins}")
         command += ["-o", str(target), str(ROOT / source_name)]
         subprocess.run(command + ["-MM"], check=True)
         paths = dependencies(depfile)
@@ -131,6 +135,7 @@ def build(source, output, compiler):
         "resource_sha256": {name: digest(data) for name, data in replacements.items()},
         "all_other_resources_exact": True,
         "compiler_commands": commands,
+        "experimental_poll_spins": experimental_poll_spins,
     }
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     verify(output)
@@ -169,8 +174,13 @@ def main():
     parser.add_argument("--output", type=Path, required=True,
                         help="New build directory; existing directories are never overwritten")
     parser.add_argument("--compiler", default="arm-none-eabi-gcc")
+    parser.add_argument("--experimental-poll-spins", type=int, default=0,
+                        choices=range(65537), metavar="0..65536",
+                        help="Bounded reply/lock polling before sleeping; default 0")
     args = parser.parse_args()
-    print(json.dumps(build(args.source, args.output, args.compiler), indent=2))
+    print(json.dumps(build(args.source, args.output, args.compiler,
+                           experimental_poll_spins=args.experimental_poll_spins),
+                     indent=2))
 
 
 if __name__ == "__main__":

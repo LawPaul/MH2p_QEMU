@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""Verify original HMI display initialization, not sustained unit readiness."""
+"""Check original HMI startup evidence, not sustained unit readiness."""
 import argparse
 from pathlib import Path
 import re
@@ -15,6 +15,22 @@ DISPLAY_LOG_ERROR = b"NATIVE_HMI_DISPLAY_LOG_ERROR"
 DISPLAY_FAILURE = (
     rb"\bERROR[ \t]+<Fw\.Display>[ \t]+"
     rb"waitForDSIDisplayManagement: failed!")
+M4_WATCHDOG_FAILURE = re.compile(
+    rb"(?m)^[ \t\r]*(?P<tick>[0-9]{10})[ \t]+"
+    rb"(?P<event>\[IPC WD\][ \t]+REBOOT ! ! ![ \t]*|"
+    rb"\[M4PW\]J6 WD reset req[^\r\n]*|"
+    rb"\[MAWD\] Enter infinity loop[^\r\n]*|"
+    rb"[^\r\n]*M4 Application WatchDog Failed[^\r\n]*)\r*$")
+
+
+def verify_native_m4_watchdogs(uart):
+    """Reject recorded native reset requests; absence is not proof of health."""
+    match = M4_WATCHDOG_FAILURE.search(uart)
+    if match:
+        raise RuntimeError(
+            "Native M4 watchdog failure at tick " +
+            match["tick"].decode("ascii") + ": " +
+            match["event"].decode("ascii", errors="backslashreplace").rstrip())
 
 
 def verify_original_hmi_display(connection):
@@ -64,8 +80,12 @@ def display_wait_command(log="/tmp/hmi.log", attempts=180, *, slog=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("capture", type=Path, help="Captured guest console output")
+    parser.add_argument("--m4-uart", type=Path,
+                        help="Also reject native watchdog failures in UART7")
     args = parser.parse_args()
     try:
+        if args.m4_uart is not None:
+            verify_native_m4_watchdogs(args.m4_uart.read_bytes())
         verify_original_hmi_display(args.capture.read_bytes())
     except (OSError, RuntimeError) as error:
         parser.exit(1, f"MH2P display readiness failed: {error}\n")
