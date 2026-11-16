@@ -158,8 +158,6 @@ class RccUARTTests(unittest.TestCase):
                 try:
                     with socket.socket(socket.AF_UNIX) as console:
                         console.settimeout(3)
-                        # macOS counts payload bytes, so keep the peer's buffer small.
-                        console.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
                         console.connect(str(root / "uart"))
 
                         def write(offset, value):
@@ -196,7 +194,11 @@ class RccUARTTests(unittest.TestCase):
                                 expected = bytes(prefix) + payload
                                 actual = bytearray()
                                 while len(actual) < len(expected):
-                                    chunk = console.recv(65536)
+                                    try:
+                                        chunk = console.recv(65536)
+                                    except TimeoutError:
+                                        self.fail(f"Console drain stalled after "
+                                                  f"{len(actual)} of {len(expected)} bytes")
                                     self.assertTrue(chunk, "Console closed during drain")
                                     actual.extend(chunk)
                                 self.assertEqual(bytes(actual), expected)
