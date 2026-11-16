@@ -47,9 +47,51 @@ static void os_undo_timer_resolution(void)
     timeEndPeriod(mm_tc.wPeriodMin);
 }
 
+#ifndef PROCESS_POWER_THROTTLING_CURRENT_VERSION
+#define PROCESS_POWER_THROTTLING_CURRENT_VERSION 1
+#endif
+#ifndef PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+#define PROCESS_POWER_THROTTLING_EXECUTION_SPEED 0x1
+#endif
+#ifndef PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+#define PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION 0x4
+#endif
+
+/*
+ * Windows 10/11 put processes without a foreground window into power
+ * throttling (EcoQoS): their threads go to efficiency cores at low clock,
+ * and since Windows 11 their timeBeginPeriod() request is ignored.  An
+ * emulator started from a script or a minimised console then runs several
+ * times slower and with coarse timers.  Opt out of both; harmless where the
+ * policy does not exist (the call just fails).
+ */
+static void os_disable_power_throttling(void)
+{
+    struct {
+        ULONG Version;
+        ULONG ControlMask;
+        ULONG StateMask;
+    } state = {
+        .Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        .ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED |
+                       PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        .StateMask = 0,
+    };
+    typedef BOOL (WINAPI *SetProcessInformationFn)(HANDLE, int, LPVOID, DWORD);
+    SetProcessInformationFn set_info = (SetProcessInformationFn)
+        GetProcAddress(GetModuleHandleA("kernel32.dll"),
+                       "SetProcessInformation");
+
+    if (set_info) {
+        set_info(GetCurrentProcess(), 4 /* ProcessPowerThrottling */,
+                 &state, sizeof(state));
+    }
+}
+
 void os_setup_early_signal_handling(void)
 {
     SetConsoleCtrlHandler(qemu_ctrl_handler, TRUE);
+    os_disable_power_throttling();
     timeGetDevCaps(&mm_tc, sizeof(mm_tc));
     timeBeginPeriod(mm_tc.wPeriodMin);
     atexit(os_undo_timer_resolution);
