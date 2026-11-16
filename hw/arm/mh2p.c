@@ -304,6 +304,12 @@ struct MH2PMachineState {
     uint32_t ahb_mem;
     uint32_t pmc_control;
     uint32_t pmc_sec_disable2;
+    uint32_t pmc_usb_ao;            /* PMC_USB_AO: USB VBUS/ID wake pad control */
+    uint32_t pmc_utmip_pad;         /* PMC +0x1fc, read by usb_init */
+    uint32_t mc_latency[0x120 / 4]; /* MC_LATENCY_ALLOWANCE_* 0x2e0..0x3fc */
+    uint32_t mc_emem_arb[0x70 / 4]; /* MC_EMEM_ARB_* 0x090..0x0fc (BCT-programmed) */
+    uint32_t mc_ptsa[0xe4 / 4];     /* PTSA rates 0x41c..0x4ff */
+    uint32_t mc_ptsa_grant_dec;     /* MC_PTSA_GRANT_DECREMENT 0x960 */
     uint32_t pmc_secure_scratch[16];
     uint32_t secure_boot_csr;
     uint32_t clock_mask_arm;
@@ -988,6 +994,9 @@ static MemTxResult mh2p_boot_read_register(void *opaque, hwaddr offset,
     case 0x7000e400: /* PMC_CNTRL: external INTR polarity configuration */
         *value = s->pmc_control;
         return MEMTX_OK;
+    case 0x7000e4f0: /* PMC_USB_AO */
+        *value = s->pmc_usb_ao;
+        return MEMTX_OK;
     case 0x7000e6c4: /* SEC_DISABLE2: read/write disables for scratch 8..23 */
         *value = s->pmc_sec_disable2;
         return MEMTX_OK;
@@ -1117,6 +1126,13 @@ static MemTxResult mh2p_boot_read_register(void *opaque, hwaddr offset,
     case 0x600060a0: /* PLLP: 12 MHz * 34 */
         *value = 0x48002201;
         return MEMTX_OK;
+    case 0x60006090: /*
+                      * PLLM: the bootloader starts the DRAM PLL from the BCT
+                      * before QNX runs (EMC defaults to PLLM_OUT0): 12 MHz *
+                      * 66 = 792 MHz, enabled and locked.
+                      */
+        *value = BIT(30) | BIT(27) | (66 << 8) | 1;
+        return MEMTX_OK;
     case 0x600060e0: /* PLLX (reset: 12 MHz * 83): locks while enabled */
         *value = s->cpu_clk[MH2P_PLLX_BASE] & ~BIT(27);
         if (*value & BIT(30)) {
@@ -1235,7 +1251,6 @@ static MemTxResult mh2p_boot_read_register(void *opaque, hwaddr offset,
             *value |= (mh2p_plle_locked(s) ? 1U : 2U) << 26;
         }
         return MEMTX_OK;
-    case 0x60006090: /* PLLM */
     case 0x600060f0: /* PLLS */
     case 0x60006094:
     case 0x600060a4:
@@ -1310,10 +1325,35 @@ static MemTxResult mh2p_boot_read_register(void *opaque, hwaddr offset,
     case 0x7000f9f0: /* FUSE_USB_CALIB_0: HS current 0x2a, term adj 8, squelch 2 */
         *value = (2u << 29) | (8u << 7) | 0x2a;
         return MEMTX_OK;
+    case 0x7000e5fc:
+        *value = s->pmc_utmip_pad;
+        return MEMTX_OK;
     default:
         if (offset + 0x60000000 >= 0x7009f000 &&
             offset + 0x60000000 < 0x700a0000) {
             *value = s->xusb_padctl[(offset & 0xfff) / 4];
+            return MEMTX_OK;
+        }
+        if (offset + 0x60000000 >= 0x7001941c &&
+            offset + 0x60000000 < 0x70019500) {
+            /* PTSA bandwidth allocation rates (devg-nvmclatency) */
+            *value = s->mc_ptsa[(offset + 0x60000000 - 0x7001941c) / 4];
+            return MEMTX_OK;
+        }
+        if (offset + 0x60000000 == 0x70019960) {
+            *value = s->mc_ptsa_grant_dec;
+            return MEMTX_OK;
+        }
+        if (offset + 0x60000000 >= 0x70019090 &&
+            offset + 0x60000000 < 0x70019100) {
+            /* EMEM arbitration configuration, set from the BCT at boot */
+            *value = s->mc_emem_arb[(offset + 0x60000000 - 0x70019090) / 4];
+            return MEMTX_OK;
+        }
+        if (offset + 0x60000000 >= 0x700192e0 &&
+            offset + 0x60000000 < 0x70019400) {
+            /* memory-client latency allowances (devg-nvmclatency) */
+            *value = s->mc_latency[(offset + 0x60000000 - 0x700192e0) / 4];
             return MEMTX_OK;
         }
         qemu_log_mask(LOG_UNIMP, "mh2p: unsupported boot register read 0x%"
@@ -1644,7 +1684,8 @@ static MemTxResult mh2p_boot_write_register(void *opaque, hwaddr offset,
         s->xusb_pll_control = value & ~BIT(19);
         return MEMTX_OK;
     case 0x7009f044:
-        if (value & ~0x70U) {
+        /* IOPHY_PLL_P0_CTL2: REFCLKBUF/TXCLKREF [6:4], PLL0_CP_CNTL [19:16] */
+        if (value & ~0x000f0070U) {
             break;
         }
         s->xusb_pll_reference = value;
@@ -1849,6 +1890,9 @@ static MemTxResult mh2p_boot_write_register(void *opaque, hwaddr offset,
     case 0x7000ead8:
         s->startup_timestamp[(offset - 0x1000ead0) / 4] = value;
         return MEMTX_OK;
+    case 0x7000e4f0:
+        s->pmc_usb_ao = value;
+        return MEMTX_OK;
     case 0x600060e0:
     case 0x600060e4:
     case 0x60006514:
@@ -1861,10 +1905,32 @@ static MemTxResult mh2p_boot_write_register(void *opaque, hwaddr offset,
     case 0x6000636c:
         s->cpu_clk[mh2p_cpu_clk_index(offset + 0x60000000)] = value;
         return MEMTX_OK;
+    case 0x7000e5fc:
+        s->pmc_utmip_pad = value;
+        return MEMTX_OK;
     default:
         if (offset + 0x60000000 >= 0x7009f000 &&
             offset + 0x60000000 < 0x700a0000) {
             s->xusb_padctl[(offset & 0xfff) / 4] = value;
+            return MEMTX_OK;
+        }
+        if (offset + 0x60000000 >= 0x7001941c &&
+            offset + 0x60000000 < 0x70019500) {
+            s->mc_ptsa[(offset + 0x60000000 - 0x7001941c) / 4] = value;
+            return MEMTX_OK;
+        }
+        if (offset + 0x60000000 == 0x70019960) {
+            s->mc_ptsa_grant_dec = value;
+            return MEMTX_OK;
+        }
+        if (offset + 0x60000000 >= 0x70019090 &&
+            offset + 0x60000000 < 0x70019100) {
+            s->mc_emem_arb[(offset + 0x60000000 - 0x70019090) / 4] = value;
+            return MEMTX_OK;
+        }
+        if (offset + 0x60000000 >= 0x700192e0 &&
+            offset + 0x60000000 < 0x70019400) {
+            s->mc_latency[(offset + 0x60000000 - 0x700192e0) / 4] = value;
             return MEMTX_OK;
         }
         break;
@@ -2463,6 +2529,12 @@ static void mh2p_reset(void *opaque)
     memset(s->sd_calibration, 0, sizeof(s->sd_calibration));
     memset(s->xusb_padctl, 0, sizeof(s->xusb_padctl));
     memset(s->cpu_clk, 0, sizeof(s->cpu_clk));
+    s->pmc_usb_ao = 0;
+    s->pmc_utmip_pad = 0;
+    memset(s->mc_latency, 0, sizeof(s->mc_latency));
+    memset(s->mc_emem_arb, 0, sizeof(s->mc_emem_arb));
+    memset(s->mc_ptsa, 0, sizeof(s->mc_ptsa));
+    s->mc_ptsa_grant_dec = 0;
     s->cpu_clk[MH2P_PLLX_BASE] = 0x48005301;      /* 12 MHz * 83, enabled */
     s->cpu_clk[MH2P_CCLKG_BURST] = 0x20000000;    /* RUN on CLK_M */
     s->cpu->env.regs[0] = 0;
