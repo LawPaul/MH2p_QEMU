@@ -49,3 +49,8 @@ mh2p_rstp_watchdog_reply_ignored(uint32_t reply, uint32_t next) "reply %u next %
 mh2p_rstp_uart_blocked(int64_t guest_ns, unsigned queued) "guest-ns %" PRId64 " queued %u"
 mh2p_rstp_uart_write(int64_t guest_ns, unsigned len, unsigned queued) "guest-ns %" PRId64 " len %u queued %u"
 mh2p_rstp_encoder(uint8_t kbd, int steps) "kbd %u steps %d"
+mh2p_rstp_persistence_read(uint32_t ns, uint32_t key, int size) "ns 0x%x key 0x%x size %d"
+mh2p_rstp_persistence_write(uint32_t ns, uint32_t key, unsigned size) "ns 0x%x key 0x%x size %u"
+mh2p_rstp_persistence_error(uint32_t ns, uint32_t key, int error) "ns 0x%x key 0x%x error %d"
+mh2p_rstp_persistence_m4_key(uint32_t ns, uint32_t key) "ns 0x%x key 0x%x owned by the RCC M4 has no catalogued default"
+mh2p_rstp_persistence_invalid(uint8_t type, uint32_t ns, uint32_t key, unsigned size) "type 0x%02x ns 0x%x key 0x%x size %u"
