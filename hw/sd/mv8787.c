@@ -798,17 +798,17 @@ static void mv_runtime(MV8787State *s, unsigned f, const uint8_t *p, unsigned n)
                 ok = false;
                 break;
             }
-            unsigned tag = lduw_le_p(p + off), n = lduw_le_p(p + off + 2);
+            unsigned tag = lduw_le_p(p + off), tlv_len = lduw_le_p(p + off + 2);
             off += 4;
-            if (n > size + 4 - off) {
+            if (tlv_len > size + 4 - off) {
                 ok = false;
                 break;
             }
             if (tag == 0 &&
-                (n != strlen(s->ssid) || memcmp(p + off, s->ssid, n))) {
+                (tlv_len != strlen(s->ssid) || memcmp(p + off, s->ssid, tlv_len))) {
                 ok = false;
             }
-            off += n;
+            off += tlv_len;
         }
         memset(out + 12, 0, sizeof(out) - 12);
         stw_le_p(out + 12, 0x21);
