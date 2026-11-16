@@ -2406,6 +2406,7 @@ static MemTxResult mh2p_pcie_outbound_access(MH2PMachineState *s,
         MemTxResult result = mh2p_pcie_memory_access(
             s->pcie_transport, mh2p_pcie_root_ready(s),
             fpci, size, &data, write);
+        trace_mh2p_pcie_memory(fpci, size, write, data, result);
 
         if (!write) {
             *value = data & MAKE_64BIT_MASK(0, size * 8);

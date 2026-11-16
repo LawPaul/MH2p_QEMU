@@ -2,6 +2,7 @@
 
 # mh2p.c
 mh2p_pcie_config(uint64_t axi, uint64_t fpci, unsigned window, unsigned type, unsigned bus, unsigned devfn, unsigned reg, unsigned size, bool write) "axi=0x%" PRIx64 " fpci=0x%" PRIx64 " window=%u type=%u bus=%u devfn=0x%x reg=0x%x size=%u write=%d"
+mh2p_pcie_memory(uint64_t fpci, unsigned size, bool write, uint32_t data, int result) "fpci 0x%" PRIx64 " size %u write %d data 0x%x result %d"
 mh2p_rcc_pcie_iatu(unsigned viewport, uint64_t reg, uint64_t value) "viewport=0x%x reg=0x%" PRIx64 " value=0x%" PRIx64
 mh2p_rcc_qdma(unsigned channel, uint32_t source, uint32_t target, unsigned bytes, unsigned tcc) "channel=%u src=0x%x dst=0x%x bytes=%u tcc=%u"
 mh2p_rcc_uart3_state(const char *operation, uint64_t value, bool clock, unsigned mode, unsigned ier, unsigned lcr, unsigned lsr, unsigned iir, unsigned rx, bool core_irq) "op=%s value=0x%" PRIx64 " clock=%d mode=%u ier=0x%x lcr=0x%x lsr=0x%x iir=0x%x rx=%u core_irq=%d"
