@@ -239,6 +239,12 @@ struct MH2PMachineState {
     uint32_t cpu_reset_control;
     uint32_t cpu_clock_stop;
     /*
+     * CPU clock path reprogrammed by DVFS: PLLX base/misc/misc2/misc3,
+     * CCLKG burst policy and super divider, RST_DFLL_DVCO.  The emulated CPU
+     * speed does not depend on them.
+     */
+    uint32_t cpu_clk[8];
+    /*
      * AVP (COP) facing registers.  The AVP core itself is not emulated, so
      * these only hold what the CPU writes; the COP never runs.
      */
@@ -324,10 +330,11 @@ struct MH2PMachineState {
     uint32_t smmu_translation_enable[4];
     uint32_t smmu_group[ARRAY_SIZE(mh2p_smmu_groups)];
     uint32_t smmu_flush_hi;
-    uint32_t sd_clock[2];
-    uint32_t sd_misc[2];
-    uint32_t sd_pad[2];
-    uint32_t sd_calibration[2];
+    uint32_t sd_clock[3];
+    uint32_t sd_misc[3];
+    uint32_t sd_pad[3];
+    uint32_t sd_calibration[3];
+    uint32_t xusb_padctl[0x1000 / 4]; /* unmodelled padctl config storage */
     qemu_irq i2c_reset[ARRAY_SIZE(mh2p_i2c)];
     qemu_irq spi_reset[ARRAY_SIZE(mh2p_spi)];
     qemu_irq host1x_reset;
@@ -816,8 +823,43 @@ static MemTxResult mh2p_security_write(MH2PMachineState *s, hwaddr address,
     return MEMTX_OK;
 }
 
-static MemTxResult mh2p_boot_read(void *opaque, hwaddr offset, uint64_t *value,
-                                 unsigned size, MemTxAttrs attrs)
+enum {
+    MH2P_PLLX_BASE, MH2P_PLLX_MISC, MH2P_PLLX_MISC2, MH2P_PLLX_MISC3,
+    MH2P_PLLX_HW_CTRL, MH2P_CCLKG_BURST, MH2P_CCLKG_DIVIDER, MH2P_DFLL_DVCO,
+};
+
+static unsigned mh2p_cpu_clk_index(hwaddr address)
+{
+    switch (address) {
+    case 0x600060e0: return MH2P_PLLX_BASE;
+    case 0x600060e4: return MH2P_PLLX_MISC;
+    case 0x60006514: return MH2P_PLLX_MISC2;
+    case 0x60006518: return MH2P_PLLX_MISC3;
+    case 0x60006548: return MH2P_PLLX_HW_CTRL;
+    case 0x60006020:
+    case 0x60006368: return MH2P_CCLKG_BURST;
+    case 0x60006024:
+    case 0x6000636c: return MH2P_CCLKG_DIVIDER;
+    default:         return MH2P_DFLL_DVCO;
+    }
+}
+
+/* SDMMC4 (0x700b0600), SDMMC3 (0x700b0400), SDMMC1 (0x700b0000) vendor regs */
+static unsigned mh2p_sd_index(hwaddr offset)
+{
+    switch (offset & 0x600) {
+    case 0x600:
+        return 0;
+    case 0x400:
+        return 1;
+    default:
+        return 2;
+    }
+}
+
+static MemTxResult mh2p_boot_read_register(void *opaque, hwaddr offset,
+                                           uint64_t *value, unsigned size,
+                                           MemTxAttrs attrs)
 {
     MH2PMachineState *s = opaque;
 
@@ -892,33 +934,45 @@ static MemTxResult mh2p_boot_read(void *opaque, hwaddr offset, uint64_t *value,
     case 0x6000605c:
         *value = s->osc_detect_status;
         return MEMTX_OK;
+    case 0x700b01e0:
     case 0x700b05e0:
     case 0x700b07e0:
-        *value = s->sd_pad[(offset & 0x200) ? 0 : 1];
+        *value = s->sd_pad[mh2p_sd_index(offset)];
         return MEMTX_OK;
+    case 0x700b01e4:
     case 0x700b05e4:
     case 0x700b07e4:
-        *value = s->sd_calibration[(offset & 0x200) ? 0 : 1];
+        *value = s->sd_calibration[mh2p_sd_index(offset)];
         return MEMTX_OK;
+    case 0x700b01ec:
     case 0x700b05ec:
     case 0x700b07ec: /* Pad calibration completes synchronously. */
         *value = 0;
         return MEMTX_OK;
+    case 0x700b0100:
     case 0x700b0500:
     case 0x700b0700:
-        *value = s->sd_clock[(offset & 0x200) ? 0 : 1];
+        *value = s->sd_clock[mh2p_sd_index(offset)];
         return MEMTX_OK;
+    case 0x700b0120:
     case 0x700b0520:
     case 0x700b0720:
-        *value = s->sd_misc[(offset & 0x200) ? 0 : 1];
+        *value = s->sd_misc[mh2p_sd_index(offset)];
         return MEMTX_OK;
     case 0x60006020:
-    case 0x60006368: /* CCLKG burst policy: RUN on CLK_M */
-        *value = 0x20000000;
+    case 0x60006368: /* CCLKG burst policy (reset: RUN on CLK_M) */
+        *value = s->cpu_clk[MH2P_CCLKG_BURST];
         return MEMTX_OK;
     case 0x60006024:
-    case 0x6000636c:
-        *value = 0;
+    case 0x6000636c: /* CCLKG super divider */
+        *value = s->cpu_clk[MH2P_CCLKG_DIVIDER];
+        return MEMTX_OK;
+    case 0x600060e4: /* PLLX_MISC */
+    case 0x60006514: /* PLLX_MISC_2 */
+    case 0x60006518: /* PLLX_MISC_3 */
+    case 0x60006548: /* PLLX_HW_CTRL_CFG */
+    case 0x600062f4: /* RST_DFLL_DVCO */
+        *value = s->cpu_clk[mh2p_cpu_clk_index(offset + 0x60000000)];
         return MEMTX_OK;
     case 0x6000604c:
         *value = s->cpu_clock_stop;
@@ -1063,8 +1117,11 @@ static MemTxResult mh2p_boot_read(void *opaque, hwaddr offset, uint64_t *value,
     case 0x600060a0: /* PLLP: 12 MHz * 34 */
         *value = 0x48002201;
         return MEMTX_OK;
-    case 0x600060e0: /* PLLX: 12 MHz * 83 */
-        *value = 0x48005301;
+    case 0x600060e0: /* PLLX (reset: 12 MHz * 83): locks while enabled */
+        *value = s->cpu_clk[MH2P_PLLX_BASE] & ~BIT(27);
+        if (*value & BIT(30)) {
+            *value |= BIT(27);
+        }
         return MEMTX_OK;
     case 0x60006080: /* PLLC: lock requires an enabled, valid divider. */
         *value = s->pll_c[0] & ~BIT(27);
@@ -1212,7 +1269,53 @@ static MemTxResult mh2p_boot_read(void *opaque, hwaddr offset, uint64_t *value,
     case 0x7000ead8:
         *value = s->startup_timestamp[(offset - 0x1000ead0) / 4];
         return MEMTX_OK;
+    /*
+     * T124 fuses (read through the 0x7000f900 window).  No real-car dump is
+     * available: these are mid-bin production values, enough for the
+     * NVIDIA DVFS and USB calibration code to pick a normal table.
+     */
+    case 0x7000f914: /* FUSE_CPU_SPEEDO_0 */
+    case 0x7000f92c: /* FUSE_CPU_SPEEDO_1 */
+    case 0x7000f930: /* FUSE_CPU_SPEEDO_2 */
+        *value = 2100;
+        return MEMTX_OK;
+    case 0x7000f934: /* FUSE_SOC_SPEEDO_0 */
+    case 0x7000f938: /* FUSE_SOC_SPEEDO_1 */
+    case 0x7000f93c: /* FUSE_SOC_SPEEDO_2 */
+        *value = 1950;
+        return MEMTX_OK;
+    case 0x7000f918: /* FUSE_CPU_IDDQ */
+    case 0x7000f940: /* FUSE_SOC_IDDQ */
+    case 0x7000fa28: /* FUSE_GPU_IDDQ */
+        *value = 0x200;
+        return MEMTX_OK;
+    case 0x7000f928: /* FUSE_FT_REV */
+    case 0x7000f990: /* FUSE_CP_REV */
+        *value = 0x24;
+        return MEMTX_OK;
+    case 0x7000fa80: /* FUSE_TSENSOR_COMMON: base_cp 0x200, base_ft 0x5dc */
+        *value = (0x5dcu << 10) | 0x200;
+        return MEMTX_OK;
+    case 0x7000fafc: /* FUSE_SPARE_REALIGNMENT: no CP shift */
+    case 0x7000f998: /* FUSE_TSENSOR CPU0..3, MEM0/1, GPU, PLLX calibration: */
+    case 0x7000f984: /* zero per-sensor offsets from the common base */
+    case 0x7000f988:
+    case 0x7000fa2c:
+    case 0x7000fa58:
+    case 0x7000fa5c:
+    case 0x7000fa54:
+    case 0x7000fa60:
+        *value = 0;
+        return MEMTX_OK;
+    case 0x7000f9f0: /* FUSE_USB_CALIB_0: HS current 0x2a, term adj 8, squelch 2 */
+        *value = (2u << 29) | (8u << 7) | 0x2a;
+        return MEMTX_OK;
     default:
+        if (offset + 0x60000000 >= 0x7009f000 &&
+            offset + 0x60000000 < 0x700a0000) {
+            *value = s->xusb_padctl[(offset & 0xfff) / 4];
+            return MEMTX_OK;
+        }
         qemu_log_mask(LOG_UNIMP, "mh2p: unsupported boot register read 0x%"
                       HWADDR_PRIx "\n", offset + 0x60000000);
         return MEMTX_DECODE_ERROR;
@@ -1696,21 +1799,25 @@ static MemTxResult mh2p_boot_write_register(void *opaque, hwaddr offset,
                       DIV_ROUND_UP(2 * NANOSECONDS_PER_SECOND, 32768));
         }
         return MEMTX_OK;
+    case 0x700b01e0:
     case 0x700b05e0:
     case 0x700b07e0:
-        s->sd_pad[(offset & 0x200) ? 0 : 1] = value;
+        s->sd_pad[mh2p_sd_index(offset)] = value;
         return MEMTX_OK;
+    case 0x700b01e4:
     case 0x700b05e4:
     case 0x700b07e4:
-        s->sd_calibration[(offset & 0x200) ? 0 : 1] = value & ~BIT(31);
+        s->sd_calibration[mh2p_sd_index(offset)] = value & ~BIT(31);
         return MEMTX_OK;
+    case 0x700b0100:
     case 0x700b0500:
     case 0x700b0700:
-        s->sd_clock[(offset & 0x200) ? 0 : 1] = value;
+        s->sd_clock[mh2p_sd_index(offset)] = value;
         return MEMTX_OK;
+    case 0x700b0120:
     case 0x700b0520:
     case 0x700b0720:
-        s->sd_misc[(offset & 0x200) ? 0 : 1] = value;
+        s->sd_misc[mh2p_sd_index(offset)] = value;
         return MEMTX_OK;
     case 0x7000e400:
         if (value & ~BIT(17)) {
@@ -1742,7 +1849,24 @@ static MemTxResult mh2p_boot_write_register(void *opaque, hwaddr offset,
     case 0x7000ead8:
         s->startup_timestamp[(offset - 0x1000ead0) / 4] = value;
         return MEMTX_OK;
+    case 0x600060e0:
+    case 0x600060e4:
+    case 0x60006514:
+    case 0x60006518:
+    case 0x60006548:
+    case 0x600062f4:
+    case 0x60006020:
+    case 0x60006368:
+    case 0x60006024:
+    case 0x6000636c:
+        s->cpu_clk[mh2p_cpu_clk_index(offset + 0x60000000)] = value;
+        return MEMTX_OK;
     default:
+        if (offset + 0x60000000 >= 0x7009f000 &&
+            offset + 0x60000000 < 0x700a0000) {
+            s->xusb_padctl[(offset & 0xfff) / 4] = value;
+            return MEMTX_OK;
+        }
         break;
     }
     qemu_log_mask(LOG_UNIMP, "mh2p: unsupported boot register write 0x%"
@@ -1865,11 +1989,60 @@ static void mh2p_update_pcie_sideband(MH2PMachineState *s)
     mh2p_pcie_update_msi(s);
 }
 
+/*
+ * Diagnostic survey mode (QEMU_MH2P_PERMISSIVE=1): unmodelled registers act
+ * as plain storage (reads return the last value written, else zero) instead
+ * of raising an external abort, and every such access is logged under
+ * -d unimp.  Lets one boot list all registers a driver needs; never the
+ * default and not a model of the hardware.
+ */
+static GHashTable *mh2p_permissive_regs(void)
+{
+    static int permissive = -1;
+    static GHashTable *regs;
+
+    if (permissive < 0) {
+        const char *env = getenv("QEMU_MH2P_PERMISSIVE");
+
+        permissive = env && atoi(env) > 0;
+        if (permissive) {
+            regs = g_hash_table_new(g_direct_hash, g_direct_equal);
+        }
+    }
+    return regs;
+}
+
+static MemTxResult mh2p_boot_read(void *opaque, hwaddr offset, uint64_t *value,
+                                 unsigned size, MemTxAttrs attrs)
+{
+    MemTxResult result = mh2p_boot_read_register(opaque, offset, value,
+                                                size, attrs);
+    GHashTable *regs;
+
+    if (result == MEMTX_DECODE_ERROR && (regs = mh2p_permissive_regs())) {
+        *value = GPOINTER_TO_UINT(g_hash_table_lookup(regs,
+                                                      GUINT_TO_POINTER(offset)));
+        qemu_log_mask(LOG_UNIMP, "mh2p: permissive read 0x%" HWADDR_PRIx
+                      " = 0x%" PRIx64 "\n", offset + 0x60000000, *value);
+        return MEMTX_OK;
+    }
+    return result;
+}
+
 static MemTxResult mh2p_boot_write(void *opaque, hwaddr offset, uint64_t value,
                                   unsigned size, MemTxAttrs attrs)
 {
     MemTxResult result = mh2p_boot_write_register(opaque, offset, value,
                                                  size, attrs);
+    GHashTable *regs;
+
+    if (result == MEMTX_DECODE_ERROR && (regs = mh2p_permissive_regs())) {
+        qemu_log_mask(LOG_UNIMP, "mh2p: permissive write 0x%" HWADDR_PRIx
+                      " = 0x%" PRIx64 " stored\n", offset + 0x60000000, value);
+        g_hash_table_insert(regs, GUINT_TO_POINTER(offset),
+                            GUINT_TO_POINTER((uint32_t)value));
+        return MEMTX_OK;
+    }
 
     if (result == MEMTX_OK) {
         mh2p_update_pcie_sideband(opaque);
@@ -2288,6 +2461,10 @@ static void mh2p_reset(void *opaque)
     memset(s->sd_misc, 0, sizeof(s->sd_misc));
     memset(s->sd_pad, 0, sizeof(s->sd_pad));
     memset(s->sd_calibration, 0, sizeof(s->sd_calibration));
+    memset(s->xusb_padctl, 0, sizeof(s->xusb_padctl));
+    memset(s->cpu_clk, 0, sizeof(s->cpu_clk));
+    s->cpu_clk[MH2P_PLLX_BASE] = 0x48005301;      /* 12 MHz * 83, enabled */
+    s->cpu_clk[MH2P_CCLKG_BURST] = 0x20000000;    /* RUN on CLK_M */
     s->cpu->env.regs[0] = 0;
     s->cpu->env.regs[1] = 0;
     s->cpu->env.regs[2] = ms->dtb ? MH2P_DTB : MH2P_ATAGS;
@@ -2331,8 +2508,10 @@ static void mh2p_init(MachineState *ms)
     static const unsigned uart_irq[] = { 36, 37, 46, 90 };
     static const unsigned timer_irq[] = { 0, 1, 41, 42, 121, 122 };
     static const unsigned gpio_irq[] = { 32, 33, 34, 35, 55, 87, 89, 125 };
-    static const hwaddr sd_base[] = { 0x700b0600, 0x700b0400 };
-    static const unsigned sd_irq[] = { 31, 19 };
+    /* SDMMC4 (mNAND), SDMMC3, SDMMC1 (empty SD card slot, devb-sdmmc /dev/sda) */
+    static const hwaddr sd_base[] = { 0x700b0600, 0x700b0400, 0x700b0000 };
+    static const unsigned sd_irq[] = { 31, 19, 14 };
+    static const char *const sd_name[] = { "sdmmc4", "sdmmc3", "sdmmc1" };
     g_autofree char *cmdline = NULL;
     g_autofree uint32_t *tags = NULL;
     size_t cmdline_words, tag_words;
@@ -2552,6 +2731,10 @@ static void mh2p_init(MachineState *ms)
     sysbus_connect_irq(SYS_BUS_DEVICE(gpu), 0, s->legacy_irq[157]);
     sysbus_connect_irq(SYS_BUS_DEVICE(gpu), 1, s->legacy_irq[158]);
     glbridge_create(OBJECT(ms));
+    /* Memory controller timing registers and on-die thermal sensors. */
+    sysbus_create_simple("tegra124-emc", 0x7001b000, NULL);
+    sysbus_create_simple("tegra124-soctherm", 0x700e2000, NULL);
+    sysbus_create_simple("tegra124-dfll", 0x70110000, NULL);
     s->gpu_reset = qdev_get_gpio_in_named(gpu, "reset", 0);
 
     for (unsigned i = 0; i < ARRAY_SIZE(mh2p_i2c); i++) {
@@ -2564,6 +2747,13 @@ static void mh2p_init(MachineState *ms)
         sysbus_connect_irq(SYS_BUS_DEVICE(i2c), 0,
                            s->legacy_irq[mh2p_i2c[i].irq]);
         s->i2c_reset[i] = qdev_get_gpio_in_named(i2c, "reset", 0);
+        if (i == 1) {
+            /*
+             * Board thermal sensor (TMP451 class, 7-bit 0x4c) read by
+             * devg-nvtmon on /dev/i2c1; /dev/nvdvfs depends on it.
+             */
+            i2c_slave_create_simple(TEGRA30_I2C(i2c)->bus, "tmp451", 0x4c);
+        }
     }
 
     for (unsigned i = 0; i < ARRAY_SIZE(mh2p_spi); i++) {
@@ -2582,7 +2772,7 @@ static void mh2p_init(MachineState *ms)
         DeviceState *host = qdev_new(TYPE_SYSBUS_SDHCI);
         DriveInfo *drive = drive_get(IF_SD, 0, i);
 
-        object_property_add_child(OBJECT(ms), i ? "sdmmc3" : "sdmmc4",
+        object_property_add_child(OBJECT(ms), sd_name[i],
                                   OBJECT(host));
         qdev_prop_set_uint8(host, "sd-spec-version", 3);
         qdev_prop_set_uint32(host, "capareg", 0x05780a8a);

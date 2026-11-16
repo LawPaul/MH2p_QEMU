@@ -760,6 +760,7 @@ config MH2P
     select TEGRA30_SNOR
     select TEGRA30_TIMER
     select TEGRA124_SPI
+    select TMP451
 
 config MH2P_RCC
     bool

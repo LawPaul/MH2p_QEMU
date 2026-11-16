@@ -184,6 +184,7 @@ specific_ss.add(when: 'CONFIG_TEGRA30_FLOW', if_true: files('tegra30_flow.c'))
 system_ss.add(when: 'CONFIG_TEGRA30_ARB_SEMA', if_true: files('tegra30_arb_sema.c'))
 system_ss.add(when: 'CONFIG_TEGRA30_SNOR', if_true: files('tegra30_snor.c'))
 system_ss.add(when: 'CONFIG_MH2P', if_true: files('tegra124_host1x.c'))
+system_ss.add(when: 'CONFIG_MH2P', if_true: files('tegra124_regblocks.c'))
 system_ss.add(when: 'CONFIG_MH2P_PCIE_SIDEBAND',
               if_true: files('mh2p_pcie_sideband.c', 'mh2p_pcie_config.c'))
 system_ss.add(when: 'CONFIG_MH2P', if_true: files('gk20a.c'))

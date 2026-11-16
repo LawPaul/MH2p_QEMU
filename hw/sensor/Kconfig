@@ -17,6 +17,11 @@ config DPS310
     depends on I2C
     default y if I2C_DEVICES
 
+config TMP451
+    bool
+    depends on I2C
+    default y if I2C_DEVICES
+
 config EMC141X
     bool
     depends on I2C
