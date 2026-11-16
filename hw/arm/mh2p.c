@@ -341,6 +341,13 @@ struct MH2PMachineState {
     uint32_t sd_pad[3];
     uint32_t sd_calibration[3];
     uint32_t xusb_padctl[0x1000 / 4]; /* unmodelled padctl config storage */
+    /*
+     * Root port at 0x0000 (guest "port 1"): the Broadcom BCM4359 Wi-Fi function.
+     * Only its PCIe link and type-0 configuration space are modelled; its BARs
+     * read as zero (a powered chip without firmware), so the Wi-Fi driver fails
+     * on its own instead of pcie_init retrying the link for minutes.
+     */
+    uint32_t wifi_cfg[64];
     qemu_irq i2c_reset[ARRAY_SIZE(mh2p_i2c)];
     qemu_irq spi_reset[ARRAY_SIZE(mh2p_spi)];
     qemu_irq host1x_reset;
@@ -1968,8 +1975,13 @@ static bool mh2p_pcie_reference(MH2PMachineState *s)
                 ((s->pll_e_base >> 24) & 0xf) == 13 &&
                 12000000ULL * ((s->pll_e_base >> 8) & 0xff) ==
                     100000000ULL * (s->pll_e_base & 0xff) * 24 &&
-                s->xusb_pll_reference == 0x70 &&
-                (s->xusb_pcie_mux & 0x03ff003e) == 0x38 &&
+                /* REFCLKBUF/TXCLKREF enabled; PLL0_CP_CNTL does not matter */
+                (s->xusb_pll_reference & 0x70) == 0x70 &&
+                /*
+                 * Lanes 2-4 carry the PCIe ports: PCIe-owned and out of IDDQ.
+                 * Lanes 0/1 may belong to USB3 (lanemux_pad_init sets lane 0).
+                 */
+                (s->xusb_pcie_mux & 0x03f00038) == 0x38 &&
                 !(s->xusb_elpg & 0x07000000) &&
                 !(s->pex_dpd_status & 0x30) &&
                 (mh2p_pcie_value(s, 0x3960) & 0x202) == 2 &&
@@ -2123,6 +2135,89 @@ static const MemoryRegionOps mh2p_boot_ops = {
     .valid = { .min_access_size = 4, .max_access_size = 4 },
 };
 
+#define MH2P_WIFI_BAR0_SIZE   0x8000      /* 32 KiB register window */
+#define MH2P_WIFI_BAR2_SIZE   0x400000    /* 4 MiB TCM window */
+
+static bool mh2p_wifi_link_up(MH2PMachineState *s)
+{
+    /* Same PLL/lane qualification as the RCC port, with PEX1 (AFI 0x118). */
+    return mh2p_pcie_reference(s) && mh2p_pcie_accessible(s, 0) &&
+           (mh2p_pcie_value(s, 0x3918) & BIT(0)) &&
+           (mh2p_pcie_value(s, 0x38ac) & 1);
+}
+
+static void mh2p_wifi_reset(MH2PMachineState *s)
+{
+    memset(s->wifi_cfg, 0, sizeof(s->wifi_cfg));
+    s->wifi_cfg[0] = 0x43ef14e4;          /* Broadcom BCM4359 */
+    s->wifi_cfg[2] = 0x02800001;          /* network controller, other; rev 1 */
+    s->wifi_cfg[4] = 0x4;                 /* BAR0: 64-bit memory */
+    s->wifi_cfg[6] = 0x4;                 /* BAR2: 64-bit memory */
+    s->wifi_cfg[11] = 0x43ef14e4;         /* subsystem */
+    s->wifi_cfg[15] = 0x00000100;         /* INTA */
+}
+
+static uint64_t mh2p_wifi_bar(MH2PMachineState *s, unsigned index)
+{
+    return ((uint64_t)s->wifi_cfg[index + 1] << 32) |
+           (s->wifi_cfg[index] & ~0xfULL);
+}
+
+static bool mh2p_wifi_bar_hit(MH2PMachineState *s, uint64_t address)
+{
+    uint64_t bar0 = mh2p_wifi_bar(s, 4), bar2 = mh2p_wifi_bar(s, 6);
+
+    if (!(s->wifi_cfg[1] & BIT(1)) || !mh2p_wifi_link_up(s)) {
+        return false;
+    }
+    return (bar0 && address - bar0 < MH2P_WIFI_BAR0_SIZE) ||
+           (bar2 && address - bar2 < MH2P_WIFI_BAR2_SIZE);
+}
+
+static void mh2p_wifi_config(MH2PMachineState *s, unsigned reg, unsigned size,
+                             uint64_t *value, bool write)
+{
+    unsigned index = reg / 4, shift = (reg & 3) * 8;
+    uint32_t mask = (uint32_t)MAKE_64BIT_MASK(shift, size * 8);
+    uint32_t old, merged;
+
+    if (index >= ARRAY_SIZE(s->wifi_cfg)) {
+        if (!write) {
+            *value = 0;                   /* no extended capabilities */
+        }
+        return;
+    }
+    if (!write) {
+        *value = (s->wifi_cfg[index] & mask) >> shift;
+        return;
+    }
+    old = s->wifi_cfg[index];
+    merged = (old & ~mask) | (((uint32_t)*value << shift) & mask);
+    switch (index) {
+    case 1:                               /* command (status bits read-only) */
+        s->wifi_cfg[1] = merged & 0x0000ffff & 0x547;
+        break;
+    case 3:                               /* cache line / latency */
+        s->wifi_cfg[3] = merged & 0x0000ffff;
+        break;
+    case 4:                               /* BAR0 low: size-aligned */
+        s->wifi_cfg[4] = (merged & ~(MH2P_WIFI_BAR0_SIZE - 1)) | 0x4;
+        break;
+    case 6:                               /* BAR2 low */
+        s->wifi_cfg[6] = (merged & ~(MH2P_WIFI_BAR2_SIZE - 1)) | 0x4;
+        break;
+    case 5:
+    case 7:                               /* BAR high halves */
+        s->wifi_cfg[index] = merged;
+        break;
+    case 15:                              /* interrupt line */
+        s->wifi_cfg[15] = (old & ~0xffU) | (merged & 0xff);
+        break;
+    default:                              /* IDs, class, unused BARs: RO */
+        break;
+    }
+}
+
 static MemTxResult mh2p_pcie_read(void *opaque, hwaddr offset, uint64_t *value,
                                  unsigned size, MemTxAttrs attrs)
 {
@@ -2133,6 +2228,9 @@ static MemTxResult mh2p_pcie_read(void *opaque, hwaddr offset, uint64_t *value,
     }
     if (offset == 0xf00 || offset == 0x1f00) {
         *value = mh2p_pcie_value(s, offset);
+        if (offset == 0xf00 && mh2p_wifi_link_up(s)) {
+            *value |= BIT(30);
+        }
         if (offset == 0x1f00 &&
             mh2p_pcie_config_link(s->pcie_transport,
                                   mh2p_pcie_root_ready(s))) {
@@ -2146,6 +2244,9 @@ static MemTxResult mh2p_pcie_read(void *opaque, hwaddr offset, uint64_t *value,
             if (offset == 0x1090 &&
                 mh2p_pcie_config_link(s->pcie_transport,
                                       mh2p_pcie_root_ready(s))) {
+                *value |= BIT(29) | BIT(20) | BIT(16); /* Gen1 x1. */
+            }
+            if (offset == 0x0090 && mh2p_wifi_link_up(s)) {
                 *value |= BIT(29) | BIT(20) | BIT(16); /* Gen1 x1. */
             }
             return MEMTX_OK;
@@ -2294,6 +2395,12 @@ static MemTxResult mh2p_pcie_outbound_access(MH2PMachineState *s,
         }
         return MEMTX_DECODE_ERROR;
     }
+    if (type == 2 && mh2p_wifi_bar_hit(s, fpci)) {
+        if (!write) {
+            *value = 0;
+        }
+        return MEMTX_OK;
+    }
     if (type == 2) {
         uint32_t data = write ? *value : 0;
         MemTxResult result = mh2p_pcie_memory_access(
@@ -2307,6 +2414,17 @@ static MemTxResult mh2p_pcie_outbound_access(MH2PMachineState *s,
     }
     trace_mh2p_pcie_config(address, fpci, window, type, bus, devfn, reg,
                            size, write);
+    if (!devfn) {
+        uint32_t buses = mh2p_pcie_value(s, 0x0018);
+        unsigned secondary = (buses >> 8) & 0xff;
+        unsigned subordinate = (buses >> 16) & 0xff;
+
+        if (secondary && bus == secondary && bus <= subordinate &&
+            mh2p_wifi_link_up(s)) {
+            mh2p_wifi_config(s, reg, size, value, write);
+            return MEMTX_OK;
+        }
+    }
     if (s->pcie_transport && !devfn) {
         uint32_t buses = mh2p_pcie_value(s, 0x1018);
         unsigned secondary = (buses >> 8) & 0xff;
@@ -2528,6 +2646,7 @@ static void mh2p_reset(void *opaque)
     memset(s->sd_pad, 0, sizeof(s->sd_pad));
     memset(s->sd_calibration, 0, sizeof(s->sd_calibration));
     memset(s->xusb_padctl, 0, sizeof(s->xusb_padctl));
+    mh2p_wifi_reset(s);
     memset(s->cpu_clk, 0, sizeof(s->cpu_clk));
     s->pmc_usb_ao = 0;
     s->pmc_utmip_pad = 0;
