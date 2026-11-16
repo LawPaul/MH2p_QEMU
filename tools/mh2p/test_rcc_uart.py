@@ -158,6 +158,8 @@ class RccUARTTests(unittest.TestCase):
                 try:
                     with socket.socket(socket.AF_UNIX) as console:
                         console.settimeout(3)
+                        # macOS counts payload bytes, so keep the peer's buffer small.
+                        console.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
                         console.connect(str(root / "uart"))
 
                         def write(offset, value):
@@ -175,7 +177,7 @@ class RccUARTTests(unittest.TestCase):
                                 write(0x0c, 3)
                                 write(0x08, 7)
                                 prefix = bytearray()
-                                for _ in range(4096):
+                                for _ in range(65536):
                                     write(0, 0x55)
                                     prefix.append(0x55)
                                     if not read(0x14) & 0x20:

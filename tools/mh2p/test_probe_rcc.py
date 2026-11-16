@@ -67,7 +67,7 @@ class RCCProbeTests(unittest.TestCase):
                              ["cont", "stop", "human-monitor-command"])
             vm.__exit__.assert_called_once()
             args = factory.call_args.kwargs["args"]
-            self.assertEqual(args[:4], ["-M", "mh2p-rcc", "-kernel", str(image)])
+            self.assertEqual(args[:4], ["-M", "mh2p-rcc", "-kernel", str(image.resolve())])
             self.assertIn("shift=0,align=off,sleep=on", args)
             self.assertIn("in_asm,unimp,guest_errors", args)
             self.assertEqual(report["serial_bytes"], {"0": 0, "1": 1, "2": 2})
