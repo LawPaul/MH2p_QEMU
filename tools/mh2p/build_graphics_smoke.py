@@ -17,7 +17,7 @@ def build(compiler, output, native_display_probe=False):
     if not native_display_probe:
         subprocess.run(flags + ["-fPIC", "-shared", "-Wl,--hash-style=sysv",
                        "-Wl,-soname,libmh2p-egl-smoke.so", "-o", str(shim),
-                       str(ROOT / "tools/mhi2/glforward/guest/gl_shim.c")], check=True)
+                       str(ROOT / "tools/mh2p/glforward/guest/gl_shim.c")], check=True)
     with tempfile.TemporaryDirectory(prefix="mh2p-smoke-link-") as temporary:
         work = Path(temporary)
         # Link-only symbols; the guest resolves its original libc.so.3.

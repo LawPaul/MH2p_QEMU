@@ -1,7 +1,7 @@
 #include <assert.h>
 #include <string.h>
 
-#include "../mhi2/glforward/guest/bridge_transport.h"
+#include "glforward/guest/bridge_transport.h"
 
 static u32 registers[12288 / sizeof(u32)];
 static unsigned char shared_bulk[2 * 1024 * 1024];

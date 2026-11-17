@@ -9,7 +9,7 @@ import sys
 
 from prepare import LOAD_ADDRESS, MAX_IMAGE_SIZE, STARTUP_MAGIC
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "mhi2/glforward"))
+sys.path.insert(0, str(Path(__file__).resolve().parent / "glforward"))
 from ifs_resource import add_file
 
 

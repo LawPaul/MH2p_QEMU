@@ -15,7 +15,7 @@ from prepare_graphics_smoke import add_resources, file_entries
 ROOT = Path(__file__).resolve().parents[2]
 MODULES = {
     "lib/screen-mh2p-cpu.so": "tools/mh2p/screen_cpu_fill.c",
-    "lib/libmh2p-screen.so": "tools/mhi2/glforward/guest/gl_shim.c",
+    "lib/libmh2p-screen.so": "tools/mh2p/glforward/guest/gl_shim.c",
 }
 
 

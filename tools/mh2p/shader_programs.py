@@ -6,20 +6,34 @@ import json
 from pathlib import Path
 import re
 import struct
-import sys
 
 from compositor_programs import (
     ANIMATION_SHA256, DISPLAYMANAGER_SHA256, animation_programs, compositor_programs,
 )
 from eal_programs import PROGRAMS as EAL_PROGRAMS, eal_program
 
-sys.path.append(str(Path(__file__).resolve().parents[1] / "mhi2"))
-from extract_kanzi_shaders import blend_mode, shader_hash
-
 MAGIC = b"MH2PGLSL"
 MAX_BINARY = 4 * 1024 * 1024
 MAX_SOURCE = 1024 * 1024
 EAL_SHA256 = "b6e8cb109e58fcd09a4b09eff95ab852cc06cfe15f78f0a31e72946950a16ef2"
+
+
+def shader_hash(data):
+    value = 14695981039346656037
+    for byte in data:
+        value = ((value ^ byte) * 1099511628211) & ((1 << 64) - 1)
+    return value
+
+
+def blend_mode(source):
+    match = re.search(rb'#pragma profilepragma blendoperation\(gl_FragColor,\s*(\w+),\s*(\w+),\s*(\w+)\)', source)
+    if not match:
+        return 0
+    modes = {(b'GL_FUNC_ADD', b'GL_ONE', b'GL_ONE_MINUS_SRC_ALPHA'): 1,
+             (b'GL_FUNC_ADD', b'GL_SRC_ALPHA', b'GL_ONE_MINUS_SRC_ALPHA'): 3,
+             (b'GL_FUNC_ADD', b'GL_ONE', b'GL_ZERO'): 4,
+             (b'GL_FUNC_ADD', b'GL_ZERO', b'GL_ZERO'): 5}
+    return modes[match.groups()]
 
 
 def elf_sources(data):

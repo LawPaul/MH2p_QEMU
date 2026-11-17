@@ -97,8 +97,6 @@ arm_common_ss.add(when: 'CONFIG_XEN', if_true: files(
   'xen-stubs.c',
   'xen-pvh.c',
 ))
-arm_common_ss.add(when: 'CONFIG_TEGRA30', if_true: files('tegra30.c'))
-arm_common_ss.add(when: 'CONFIG_MHI2_HARMAN', if_true: files('mhi2_harman.c'))
 arm_common_ss.add(when: 'CONFIG_MH2P', if_true: files('mh2p.c'))
 arm_common_ss.add(when: 'CONFIG_MH2P_RCC',
                  if_true: files('mh2p_rcc.c', 'mh2p_rcc_ipu.c',

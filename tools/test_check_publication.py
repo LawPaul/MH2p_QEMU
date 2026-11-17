@@ -35,7 +35,7 @@ class PublicationTests(unittest.TestCase):
         self.assertIn((1, "head-unit-payload-candidate"),
                       publication.findings("tools/mh2p/startup.bin", b"payload"))
         self.assertIn((1, "binary-in-head-unit-tools"),
-                      publication.findings("tools/mhi2/innocent.txt", b"ELF\0"))
+                      publication.findings("tools/mh2p/innocent.txt", b"ELF\0"))
         self.assertEqual(publication.findings("pc-bios/firmware.bin", b"\0"), [])
 
     def test_public_qemu_test_keys_are_not_global_exemptions(self):
@@ -48,7 +48,7 @@ class PublicationTests(unittest.TestCase):
                          [(1, "github-token")])
 
     def test_private_configuration_names_are_rejected(self):
-        self.assertEqual(publication.findings("tools/mhi2/.env", b""),
+        self.assertEqual(publication.findings("tools/mh2p/.env", b""),
                          [(1, "private-config-file")])
 
     def test_real_git_inventory_includes_untracked_but_not_ignored_files(self):

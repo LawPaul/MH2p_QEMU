@@ -4,7 +4,7 @@
 #ifndef MH2P_SCREEN_TEXTURE_H
 #define MH2P_SCREEN_TEXTURE_H
 
-#include "../mhi2/glforward/astc_format.h"
+#include "glforward/astc_format.h"
 
 static int screen_astc_supported(void)
 {

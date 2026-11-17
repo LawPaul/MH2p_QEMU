@@ -6,12 +6,10 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
-import sys
 
 from prepare_carplay_country_policy import patch_country_policy
 from prepare_carplay_wireless_policy import patch_wireless_policy
 
-sys.path.append(str(Path(__file__).resolve().parents[1] / "mhi2"))
 from qnx6_read import Qnx6
 
 

@@ -177,11 +177,6 @@ system_ss.add(when: 'CONFIG_SBSA_REF', if_true: files('sbsa_ec.c'))
 # HPPA devices
 system_ss.add(when: 'CONFIG_LASI', if_true: files('lasi.c'))
 
-system_ss.add(when: 'CONFIG_TEGRA30_APB_MISC', if_true: files('tegra30_apb_misc.c'))
-system_ss.add(when: 'CONFIG_TEGRA30_CLK', if_true: files('tegra30_clk.c'))
-system_ss.add(when: 'CONFIG_TEGRA30_PMC', if_true: files('tegra30_pmc.c'))
-specific_ss.add(when: 'CONFIG_TEGRA30_FLOW', if_true: files('tegra30_flow.c'))
-system_ss.add(when: 'CONFIG_TEGRA30_ARB_SEMA', if_true: files('tegra30_arb_sema.c'))
 system_ss.add(when: 'CONFIG_TEGRA30_SNOR', if_true: files('tegra30_snor.c'))
 system_ss.add(when: 'CONFIG_MH2P', if_true: files('tegra124_host1x.c'))
 system_ss.add(when: 'CONFIG_MH2P_PCIE_SIDEBAND',
@@ -193,10 +188,5 @@ system_ss.add(when: 'CONFIG_MH2P', if_true: files('tegra124_sor.c'))
 system_ss.add(when: 'CONFIG_MH2P', if_true: files('tegra124_vic.c'))
 system_ss.add(when: 'CONFIG_MH2P', if_true: files('tegra124_se.c'))
 system_ss.add(when: 'CONFIG_GLBRIDGE', if_true: files('glbridge.c'))
-system_ss.add(when: 'CONFIG_MMX_IOC', if_true: files('mmx_ioc.c'))
 
 system_ss.add(when: 'CONFIG_AXIADO_CLK', if_true: files('axiado_clk.c'))
-
-system_ss.add(when: 'CONFIG_TEGRA30_DC', if_true: files('tegra30_host1x.c', 'tegra30_mc.c', 'tegra30_pcie.c'))
-
-system_ss.add(when: 'CONFIG_TEGRA30_DC', if_true: files('tegra30_apbdma.c'))

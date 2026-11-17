@@ -1,5 +1,7 @@
-/* Local MHI2 Linux bring-up model. Tegra3 TRM chapter 7: six 1 MHz
- * countdown timers; PTV uses n+1 periods and PCR[30] is interrupt W1C. */
+/*
+ * Tegra timer model shared with T124. Tegra3 TRM chapter 7: six 1 MHz
+ * countdown timers; PTV uses n+1 periods and PCR[30] is interrupt W1C.
+ */
 #include "qemu/osdep.h"
 #include "qemu/module.h"
 #include "hw/core/irq.h"

@@ -21,6 +21,13 @@ M4_WATCHDOG_FAILURE = re.compile(
     rb"\[M4PW\]J6 WD reset req[^\r\n]*|"
     rb"\[MAWD\] Enter infinity loop[^\r\n]*|"
     rb"[^\r\n]*M4 Application WatchDog Failed[^\r\n]*)\r*$")
+DSP_WATCHDOG_RESET = re.compile(
+    rb"(?m)^[ \t\r]*(?:#[ \t]+)?\[SLK_CYC\][ \t]+"
+    rb"(?P<seconds>[0-9]+\.[0-9]+)"
+    rb"[ \t]+\[SL_DSP_Watchdog\]Reset:[ \t]+DSP WD Detection[ \t]*\r*$")
+RCC_PROCESS_SHUTDOWN = re.compile(
+    rb"(?m)^[ \t\r]*(?:#[ \t]+)?\[PMR_RBT\][ \t]+(?P<tick>[0-9]+)"
+    rb"[ \t]+-[ \t]+Process shutdown is done\.\.\.[ \t]*\r*$")
 
 
 def verify_native_m4_watchdogs(uart):
@@ -31,6 +38,25 @@ def verify_native_m4_watchdogs(uart):
             "Native M4 watchdog failure at tick " +
             match["tick"].decode("ascii") + ": " +
             match["event"].decode("ascii", errors="backslashreplace").rstrip())
+
+
+def verify_native_dsp_watchdogs(console):
+    """Reject recorded resets; replies or absent reset logs do not prove health."""
+    match = DSP_WATCHDOG_RESET.search(console)
+    if match:
+        raise RuntimeError(
+            "Native DSP watchdog reset at " +
+            match["seconds"].decode("ascii") + " seconds")
+
+
+def verify_native_rcc_audio(console):
+    """Reject native DSP resets or completed application shutdowns."""
+    verify_native_dsp_watchdogs(console)
+    match = RCC_PROCESS_SHUTDOWN.search(console)
+    if match:
+        raise RuntimeError(
+            "Native RCC ProcessManager shutdown at tick " +
+            match["tick"].decode("ascii"))
 
 
 def verify_original_hmi_display(connection):
@@ -82,10 +108,15 @@ def main():
     parser.add_argument("capture", type=Path, help="Captured guest console output")
     parser.add_argument("--m4-uart", type=Path,
                         help="Also reject native watchdog failures in UART7")
+    parser.add_argument("--rcc-audio-log", type=Path,
+                        help="Also reject native DSP resets and application "
+                             "shutdowns in RCC output")
     args = parser.parse_args()
     try:
         if args.m4_uart is not None:
             verify_native_m4_watchdogs(args.m4_uart.read_bytes())
+        if args.rcc_audio_log is not None:
+            verify_native_rcc_audio(args.rcc_audio_log.read_bytes())
         verify_original_hmi_display(args.capture.read_bytes())
     except (OSError, RuntimeError) as error:
         parser.exit(1, f"MH2P display readiness failed: {error}\n")

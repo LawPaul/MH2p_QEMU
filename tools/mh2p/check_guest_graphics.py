@@ -69,9 +69,9 @@ def check(qemu, media, renderer, output):
                         captured = bytearray()
                         for boot in range(2):
                             frame = output / f"frame-{boot}.ppm"
-                            env = dict(os.environ, MHI2_GL_FRAME=str(frame),
+                            env = dict(os.environ, MH2P_GL_FRAME=str(frame),
                                        EGL_PLATFORM="surfaceless", LIBGL_ALWAYS_SOFTWARE="1")
-                            for key in ("MHI2_GL_DUMP_CLIENTS", "MHI2_GL_CAPTURE", "MHI2_GL_TRACE"):
+                            for key in ("MH2P_GL_DUMP_CLIENTS", "MH2P_GL_CAPTURE", "MH2P_GL_TRACE"):
                                 env.pop(key, None)
                             with (output / f"renderer-{boot}.log").open("wb") as errors:
                                 host = subprocess.Popen([str(renderer)], stdin=tx,
@@ -127,7 +127,7 @@ def check(qemu, media, renderer, output):
         "guest_readback_pixels_per_boot": 2048, "frame_sha256": hashes,
         "startup_sha256": manifest["startup_sha256"],
         "graphics_libraries_replaced": False,
-        "note": "Private QNX pbuffer client with MHI2 shim; no native window or HMI verified",
+        "note": "Private QNX pbuffer client with diagnostic shim; no native window or HMI verified",
     }
     (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     return result

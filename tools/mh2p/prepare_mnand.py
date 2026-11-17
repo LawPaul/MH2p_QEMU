@@ -6,9 +6,7 @@ import json
 from pathlib import Path
 import shutil
 import struct
-import sys
 
-sys.path.append(str(Path(__file__).resolve().parents[1] / "mhi2"))
 from sparse_copy import copy_sparse
 
 

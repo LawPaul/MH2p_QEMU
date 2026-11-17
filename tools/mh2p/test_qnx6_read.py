@@ -1,16 +1,13 @@
 """Exercise the shared read-only reader with MH2P-sized blocks and old sizes."""
 from pathlib import Path
 import struct
-import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 
-with patch.object(sys, "path", [
-        str(Path(__file__).resolve().parents[1] / "mhi2"), *sys.path]):
-    from qnx6_read import Qnx6
-    from qnx6_image import build
-    import qnx6_image
+from qnx6_read import Qnx6
+from qnx6_image import build
+import qnx6_image
 
 
 def fixture(block_size, base=0):

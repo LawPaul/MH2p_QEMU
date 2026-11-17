@@ -6,7 +6,8 @@ import unittest
 from unittest.mock import patch
 
 from shader_programs import (
-    builtin_programs, cache_record, elf_sources, extract, programs, resources,
+    blend_mode, builtin_programs, cache_record, elf_sources, extract, programs,
+    resources, shader_hash,
 )
 from compositor_programs import (
     ANIMATION_PROGRAMS, ANIMATION_SHA256, PROGRAMS as COMPOSITOR_PROGRAMS,
@@ -63,6 +64,24 @@ def elf_fixture():
 
 
 class ProgramTests(unittest.TestCase):
+    def test_shader_hash_identity(self):
+        self.assertEqual(shader_hash(b""), 0xcbf29ce484222325)
+        self.assertEqual(shader_hash(b"hello"), 0xa430d84680aabd0b)
+
+    def test_baked_blending_modes(self):
+        self.assertEqual(blend_mode(FRAGMENT), 0)
+        for src, dst, expected in (
+                ("GL_ONE", "GL_ONE_MINUS_SRC_ALPHA", 1),
+                ("GL_SRC_ALPHA", "GL_ONE_MINUS_SRC_ALPHA", 3),
+                ("GL_ONE", "GL_ZERO", 4), ("GL_ZERO", "GL_ZERO", 5)):
+            pragma = ("#pragma profilepragma blendoperation(gl_FragColor, "
+                      f"GL_FUNC_ADD, {src}, {dst})\n").encode()
+            with self.subTest(source=src, destination=dst):
+                self.assertEqual(blend_mode(pragma), expected)
+        with self.assertRaises(KeyError):
+            blend_mode(b"#pragma profilepragma blendoperation(gl_FragColor, "
+                       b"GL_FUNC_SUBTRACT, GL_ONE, GL_ONE)")
+
     def test_unverified_eal_transcription_rejected(self):
         with self.assertRaisesRegex(ValueError, "Unverified EAL material"):
             eal_program("unknown", BINARY)
