@@ -10,6 +10,7 @@
 #include "qemu/timer.h"
 #include "qemu/units.h"
 #include "hw/arm/boot.h"
+#include "hw/arm/mh2p_bcm4359.h"
 #include "hw/block/flash.h"
 #include "hw/char/serial-mm.h"
 #include "hw/core/boards.h"
@@ -343,11 +344,12 @@ struct MH2PMachineState {
     uint32_t xusb_padctl[0x1000 / 4]; /* unmodelled padctl config storage */
     /*
      * Root port at 0x0000 (guest "port 1"): the Broadcom BCM4359 Wi-Fi function.
-     * Only its PCIe link and type-0 configuration space are modelled; its BARs
-     * read as zero (a powered chip without firmware), so the Wi-Fi driver fails
-     * on its own instead of pcie_init retrying the link for minutes.
+     * Its PCIe link and type-0 configuration space are modelled here; the
+     * backplane behind BAR0/BAR2 (cores, enumeration ROM, TCM) is in
+     * mh2p_bcm4359.c.  The dongle firmware itself is not run.
      */
     uint32_t wifi_cfg[64];
+    MH2PBCM4359 *wifi;
     qemu_irq i2c_reset[ARRAY_SIZE(mh2p_i2c)];
     qemu_irq spi_reset[ARRAY_SIZE(mh2p_spi)];
     qemu_irq host1x_reset;
@@ -2002,14 +2004,27 @@ static bool mh2p_pcie_memory_ready(void *opaque)
 
 static void mh2p_pcie_update_msi(MH2PMachineState *s)
 {
-    bool pending = false;
+    static int last_level = -1;
+    bool pending = false, level;
 
     for (unsigned bank = 0; bank < 8; bank++) {
         pending |= (mh2p_pcie_value(s, 0x386c + bank * 4) &
                     mh2p_pcie_value(s, 0x388c + bank * 4)) != 0;
     }
-    qemu_set_irq(s->pcie_msi_irq, pending && mh2p_pcie_root_ready(s) &&
-                 (mh2p_pcie_value(s, 0x38b4) & BIT(8)));
+    level = pending && mh2p_pcie_root_ready(s) &&
+            (mh2p_pcie_value(s, 0x38b4) & BIT(8));
+    if (level != last_level) {
+        trace_mh2p_pcie_msi_level(level, mh2p_pcie_value(s, 0x386c),
+                                  mh2p_pcie_value(s, 0x388c),
+                                  mh2p_pcie_value(s, 0x38b4),
+                                  mh2p_pcie_root_ready(s));
+        /* 0x300 | level: pending0, mask0, control */
+        mh2p_pcie_log_event(0x300 | level, mh2p_pcie_value(s, 0x386c),
+                            mh2p_pcie_value(s, 0x388c),
+                            mh2p_pcie_value(s, 0x38b4));
+        last_level = level;
+    }
+    qemu_set_irq(s->pcie_msi_irq, level);
 }
 
 static MemTxResult mh2p_pcie_inbound_memory(void *opaque, unsigned address,
@@ -2027,6 +2042,10 @@ static MemTxResult mh2p_pcie_inbound_memory(void *opaque, unsigned address,
         unsigned vector = *value & 0xff;
         unsigned offset = 0x386c + (vector / 32) * 4;
 
+        trace_mh2p_pcie_msi(address, vector, mh2p_pcie_value(s, 0x386c));
+        /* 0x200: MSI received: address, vector, pending0 before */
+        mh2p_pcie_log_event(0x200, address, vector,
+                            mh2p_pcie_value(s, 0x386c));
         for (unsigned i = 0; i < ARRAY_SIZE(mh2p_pcie_registers); i++) {
             if (mh2p_pcie_registers[i].offset == offset) {
                 s->pcie_registers[i] |= BIT(vector % 32);
@@ -2135,8 +2154,8 @@ static const MemoryRegionOps mh2p_boot_ops = {
     .valid = { .min_access_size = 4, .max_access_size = 4 },
 };
 
-#define MH2P_WIFI_BAR0_SIZE   0x8000      /* 32 KiB register window */
-#define MH2P_WIFI_BAR2_SIZE   0x400000    /* 4 MiB TCM window */
+#define MH2P_WIFI_BAR0_SIZE   MH2P_BCM4359_BAR0_SIZE
+#define MH2P_WIFI_BAR2_SIZE   MH2P_BCM4359_BAR2_SIZE
 
 static bool mh2p_wifi_link_up(MH2PMachineState *s)
 {
@@ -2144,6 +2163,43 @@ static bool mh2p_wifi_link_up(MH2PMachineState *s)
     return mh2p_pcie_reference(s) && mh2p_pcie_accessible(s, 0) &&
            (mh2p_pcie_value(s, 0x3918) & BIT(0)) &&
            (mh2p_pcie_value(s, 0x38ac) & 1);
+}
+
+/* Wi-Fi bus-master DMA: identity mapping into DRAM, as for the RCC. */
+static MemTxResult mh2p_wifi_dma(void *opaque, uint64_t address, void *buf,
+                                 unsigned len, bool write)
+{
+    MH2PMachineState *s = opaque;
+
+    /*
+     * The AFI decodes 32-bit inbound addresses (as for the RCC); drivers
+     * may hand out sign-extended 64-bit forms of the same address.
+     */
+    address = (uint32_t)address;
+    if (!(s->wifi_cfg[1] & BIT(2)) || address < 0x80000000 ||
+        address + len > 0x80000000ULL + MACHINE(s)->ram_size) {
+        return MEMTX_ERROR;
+    }
+    return address_space_rw(&address_space_memory, address,
+                            MEMTXATTRS_UNSPECIFIED, buf, len, write);
+}
+
+/* INTA of root port 0's device: Tegra124 routes legacy INTx to SPI 98. */
+static void mh2p_wifi_irq(void *opaque, bool level)
+{
+    MH2PMachineState *s = opaque;
+
+    qemu_set_irq(s->legacy_irq[98], level && !(s->wifi_cfg[1] & BIT(10)));
+}
+
+/* MSI from the Wi-Fi function: an inbound posted write, as AFI sees it. */
+static void mh2p_wifi_msi(void *opaque, uint64_t address, uint32_t data)
+{
+    MH2PMachineState *s = opaque;
+
+    if (s->wifi_cfg[1] & BIT(2)) {             /* bus master enable */
+        mh2p_pcie_inbound_memory(s, (uint32_t)address, 4, &data, true);
+    }
 }
 
 static void mh2p_wifi_reset(MH2PMachineState *s)
@@ -2154,7 +2210,17 @@ static void mh2p_wifi_reset(MH2PMachineState *s)
     s->wifi_cfg[4] = 0x4;                 /* BAR0: 64-bit memory */
     s->wifi_cfg[6] = 0x4;                 /* BAR2: 64-bit memory */
     s->wifi_cfg[11] = 0x43ef14e4;         /* subsystem */
+    s->wifi_cfg[13] = 0x48;               /* capabilities: PM, MSI, PCIe */
     s->wifi_cfg[15] = 0x00000100;         /* INTA */
+    if (!s->wifi) {
+        MH2PBCM4359Host host = {
+            .opaque = s, .dma = mh2p_wifi_dma, .irq = mh2p_wifi_irq,
+            .msi = mh2p_wifi_msi,
+        };
+
+        s->wifi = mh2p_bcm4359_new(&host);
+    }
+    mh2p_bcm4359_reset(s->wifi);
 }
 
 static uint64_t mh2p_wifi_bar(MH2PMachineState *s, unsigned index)
@@ -2170,8 +2236,9 @@ static bool mh2p_wifi_bar_hit(MH2PMachineState *s, uint64_t address)
     if (!(s->wifi_cfg[1] & BIT(1)) || !mh2p_wifi_link_up(s)) {
         return false;
     }
-    return (bar0 && address - bar0 < MH2P_WIFI_BAR0_SIZE) ||
-           (bar2 && address - bar2 < MH2P_WIFI_BAR2_SIZE);
+    /* Bus address 0 is a valid assignment; memory decode gates the BARs. */
+    return address - bar0 < MH2P_WIFI_BAR0_SIZE ||
+           address - bar2 < MH2P_WIFI_BAR2_SIZE;
 }
 
 static void mh2p_wifi_config(MH2PMachineState *s, unsigned reg, unsigned size,
@@ -2187,8 +2254,25 @@ static void mh2p_wifi_config(MH2PMachineState *s, unsigned reg, unsigned size,
         }
         return;
     }
+    if (reg >= 0x40) {                    /* vendor registers: the chip's */
+        uint32_t word;
+
+        mh2p_bcm4359_config(s->wifi, reg & ~3u, &word, false);
+        if (write) {
+            word = (word & ~mask) | (((uint32_t)*value << shift) & mask);
+            mh2p_bcm4359_config(s->wifi, reg & ~3u, &word, true);
+        } else {
+            *value = (word & mask) >> shift;
+        }
+        return;
+    }
     if (!write) {
-        *value = (s->wifi_cfg[index] & mask) >> shift;
+        uint32_t word = s->wifi_cfg[index];
+
+        if (index == 1) {
+            word |= BIT(20);              /* status: capabilities list */
+        }
+        *value = (word & mask) >> shift;
         return;
     }
     old = s->wifi_cfg[index];
@@ -2396,9 +2480,19 @@ static MemTxResult mh2p_pcie_outbound_access(MH2PMachineState *s,
         return MEMTX_DECODE_ERROR;
     }
     if (type == 2 && mh2p_wifi_bar_hit(s, fpci)) {
-        if (!write) {
-            *value = 0;
+        uint64_t bar0 = mh2p_wifi_bar(s, 4);
+        bool in_bar0 = fpci - bar0 < MH2P_WIFI_BAR0_SIZE;
+        uint32_t bar_offset = fpci - (in_bar0 ? bar0 : mh2p_wifi_bar(s, 6));
+
+        if (in_bar0) {
+            mh2p_bcm4359_bar0(s->wifi, bar_offset, size, value, write);
+        } else {
+            mh2p_bcm4359_bar2(s->wifi, bar_offset, size, value, write);
         }
+        /* Diagnostic: Wi-Fi BAR access (0x400 | write, BAR 0/2 in bit 31). */
+        mh2p_pcie_log_event(0x400 | write,
+                            bar_offset | (in_bar0 ? 0 : 0x80000000u),
+                            size, (uint32_t)*value);
         return MEMTX_OK;
     }
     if (type == 2) {
@@ -2423,6 +2517,8 @@ static MemTxResult mh2p_pcie_outbound_access(MH2PMachineState *s,
         if (secondary && bus == secondary && bus <= subordinate &&
             mh2p_wifi_link_up(s)) {
             mh2p_wifi_config(s, reg, size, value, write);
+            /* Diagnostic: Wi-Fi config access (0x500 | write). */
+            mh2p_pcie_log_event(0x500 | write, reg, size, (uint32_t)*value);
             return MEMTX_OK;
         }
     }
@@ -2467,7 +2563,8 @@ static const MemoryRegionOps mh2p_pcie_outbound_ops = {
     .read_with_attrs = mh2p_pcie_outbound_read,
     .write_with_attrs = mh2p_pcie_outbound_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    /* AFI splits 64-bit CPU accesses (LDRD/STRD, NEON) into 32-bit TLPs. */
+    .valid = { .min_access_size = 1, .max_access_size = 8 },
     .impl = { .min_access_size = 1, .max_access_size = 4 },
 };
 
