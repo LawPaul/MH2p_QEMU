@@ -63,12 +63,15 @@ class ScreenWindowTests(unittest.TestCase):
     def test_bridge_connection_diagnostics(self):
         with tempfile.TemporaryDirectory(prefix="mh2p-transport-test-") as temporary:
             executable = Path(temporary) / "transport-test"
-            subprocess.run([
-                "cc", "-std=gnu11", "-O2", "-Wall", "-Wextra", "-Werror",
-                "-Wno-unused-function", "-o", str(executable),
-                str(Path(__file__).with_name("test_bridge_transport.c")),
-            ], check=True)
-            subprocess.run([str(executable)], check=True)
+            for spins in (0, 4096, 65536):
+                with self.subTest(poll_spins=spins):
+                    subprocess.run([
+                        "cc", "-std=gnu11", "-O2", "-Wall", "-Wextra", "-Werror",
+                        "-Wno-unused-function", f"-DGLBRIDGE_POLL_SPINS={spins}",
+                        "-o", str(executable),
+                        str(Path(__file__).with_name("test_bridge_transport.c")),
+                    ], check=True)
+                    subprocess.run([str(executable)], check=True)
 
     def test_surface_layout_transfers(self):
         with tempfile.TemporaryDirectory(prefix="mh2p-surface-test-") as temporary:

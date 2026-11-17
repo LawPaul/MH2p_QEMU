@@ -32,6 +32,7 @@
 #include "qemu/notify.h"
 #include "qemu/guest-random.h"
 #include "qemu/error-report.h"
+#include "qemu/cutils.h"
 #include "exec/cpu-common.h"
 #include "accel/tcg/cpu-loop.h"
 #include "tcg/startup.h"
@@ -223,7 +224,7 @@ static void rr_force_rcu(Notifier *notify, void *data)
  * The CPU count is cached based on the CPU list generation ID to avoid
  * iterating the list every time.
  */
-static int rr_cpu_count(void)
+static int rr_cpu_count(unsigned first_cpu_weight)
 {
     static unsigned int last_gen_id = ~0;
     static int cpu_count;
@@ -236,6 +237,7 @@ static int rr_cpu_count(void)
         CPU_FOREACH(cpu) {
             ++cpu_count;
         }
+        cpu_count += first_cpu_weight - 1;
         last_gen_id = cpu_list_generation_id_get();
     }
 
@@ -254,6 +256,20 @@ static void *rr_cpu_thread_fn(void *arg)
 {
     Notifier force_rcu;
     CPUState *cpu = arg;
+    unsigned first_cpu_weight = 1;
+    const char *weight_option = g_getenv("TCG_RR_FIRST_CPU_WEIGHT");
+    if (weight_option) {
+        long weight;
+
+        if (!icount_enabled() ||
+            qemu_strtol(weight_option, NULL, 10, &weight) < 0 ||
+            weight < 1 || weight > 16) {
+            error_report("TCG_RR_FIRST_CPU_WEIGHT requires icount and an "
+                         "integer from 1 through 16");
+            exit(EXIT_FAILURE);
+        }
+        first_cpu_weight = weight;
+    }
     RRProfile profile = {
         .enabled = g_strcmp0(g_getenv("TCG_RR_PROFILE"), "1") == 0,
     };
@@ -325,7 +341,7 @@ static void *rr_cpu_thread_fn(void *arg)
         bql_lock();
 
         if (icount_enabled()) {
-            int cpu_count = rr_cpu_count();
+            int cpu_count = rr_cpu_count(first_cpu_weight);
 
             /* Account partial waits to QEMU_CLOCK_VIRTUAL.  */
             icount_account_warp_timer();
@@ -365,7 +381,9 @@ static void *rr_cpu_thread_fn(void *arg)
 
                 bql_unlock();
                 if (icount_enabled()) {
-                    icount_prepare_for_run(cpu, cpu_budget);
+                    icount_prepare_for_run(
+                        cpu, cpu_budget * (cpu == first_cpu ?
+                                           first_cpu_weight : 1));
                 }
                 rr_profile_phase(&profile, RR_PROFILE_EXEC);
                 excp = tcg_cpu_exec(cpu);

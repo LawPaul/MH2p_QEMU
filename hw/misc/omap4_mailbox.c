@@ -118,6 +118,10 @@ static MemTxResult mailbox_read(void *opaque, hwaddr offset,
             return MEMTX_OK;
         }
     }
+    if (offset == 0x140) {
+        *value = 0;
+        return MEMTX_OK;
+    }
 
     qemu_log_mask(LOG_UNIMP, "omap4-mailbox: unsupported read 0x%"
                   HWADDR_PRIx "\n", offset);
@@ -170,6 +174,12 @@ static MemTxResult mailbox_write(void *opaque, hwaddr offset,
         default:
             goto unsupported;
         }
+    } else if (offset == 0x140 && value < mailbox_users(s)) {
+        /*
+         * EOI rearms the pulse interface, not the FIFO conditions or latches.
+         * This device exports level IRQs, which must remain asserted until
+         * the source is serviced or masked.
+         */
     } else {
         goto unsupported;
     }

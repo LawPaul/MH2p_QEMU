@@ -430,8 +430,18 @@ static bool dc_pixels_map(DCPixels *p, hwaddr addr, size_t bytes)
         hwaddr start = MAX(page, addr);
         hwaddr length = MIN(page + 4096, addr + bytes) - start;
         hwaddr mapped = length;
-        uint8_t *host = address_space_map(p->as, start, &mapped, false,
-                                          MEMTXATTRS_UNSPECIFIED);
+        hwaddr translated, available = length;
+        MemoryRegion *mr = address_space_translate(p->as, start, &translated,
+                                                    &available, false,
+                                                    MEMTXATTRS_UNSPECIFIED);
+        uint8_t *host;
+
+        if (!memory_region_is_ram(mr) || available < length) {
+            dc_pixels_release(p);
+            return false;
+        }
+        host = address_space_map(p->as, start, &mapped, false,
+                                 MEMTXATTRS_UNSPECIFIED);
 
         /* Bounce buffers are single and partial; use the copy instead. */
         if (host && (mapped != length ||
@@ -488,10 +498,22 @@ static bool dc_draw_window(Tegra124DCState *s, unsigned window,
     }
     if (!dc_pixels_map(&pixels, w[0x200], bytes)) {
         copy = g_malloc(bytes);
-        if (address_space_read(&s->dma_as[window], w[0x200],
-                               MEMTXATTRS_UNSPECIFIED, copy,
-                               bytes) != MEMTX_OK) {
-            goto fault;
+        for (size_t offset = 0; offset < bytes;) {
+            hwaddr address = (hwaddr)w[0x200] + offset;
+            size_t page_bytes = MIN(bytes - offset, 4096 - (address & 4095));
+            size_t first = MIN(page_bytes, 4);
+
+            if (address_space_read(&s->dma_as[window], address,
+                                   MEMTXATTRS_UNSPECIFIED, copy + offset,
+                                   first) != MEMTX_OK ||
+                (page_bytes > first &&
+                 address_space_read(&s->dma_as[window], address + first,
+                                    MEMTXATTRS_UNSPECIFIED,
+                                    copy + offset + first,
+                                    page_bytes - first) != MEMTX_OK)) {
+                goto fault;
+            }
+            offset += page_bytes;
         }
         pixels.linear = copy;
     }

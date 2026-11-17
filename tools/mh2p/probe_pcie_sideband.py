@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Verify native MMX/RCC clock/reset, PCIe, networking and optional ASI."""
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -13,6 +14,7 @@ import time
 from check_guest_graphics import wait_console
 from prepare_mnand import digest
 from native_persistence import verify_qdb_ready
+from hmi_readiness import verify_native_m4_watchdogs
 from probe_mmx_pcie import (
     BANNER, LINK_RETRY, PREREQUISITES, execute, read_registers,
     SERVER_COMMAND, verify_media, verify_native_setup, verify_native_server,
@@ -55,12 +57,17 @@ HID_STARTUP_JOBS = [
 ]
 
 
-def connect_native_uart(mmx, rcc, directory, output, input_peer=False):
+def connect_native_uart(mmx, rcc, directory, output, input_peer=False,
+                        persistence_store=None, persistence_catalog=None):
     """Replace unused UART0 backends while both original CPUs are stopped.
 
     With input_peer, the MMX UARTA is served by QEMU's mh2p-rstp chardev
     (RCC side of RSTP carrying host pointer/keyboard keypanel input), and
-    the RCC UART0 stays disconnected.
+    the RCC UART0 transmit stream is only captured to a file.  A
+    persistence_store file backs the peer's emulated RCC persistence
+    service across boots; without it that service only keeps values in
+    memory.  A persistence_catalog (rcc_persistence_catalog.py output) makes
+    the service answer missing values like the RCC PERSISTENCE application.
     """
     path = str(directory / "native-uart.sock")
     for name, vm in (("mmx", mmx), ("rcc", rcc)):
@@ -72,7 +79,19 @@ def connect_native_uart(mmx, rcc, directory, output, input_peer=False):
         mmx.cmd("chardev-change", id="serial0", backend={
             "type": "mh2p-rstp",
             "data": {"logfile": str(output / "mmx-uart-wire.bin")}})
+        if persistence_store is not None:
+            mmx.cmd("qom-set", path="/chardevs/serial0",
+                    property="persistence-file",
+                    value=str(Path(persistence_store).resolve()))
+        if persistence_catalog is not None:
+            mmx.cmd("qom-set", path="/chardevs/serial0",
+                    property="persistence-catalog",
+                    value=str(Path(persistence_catalog).resolve()))
+        # Write-only capture: like null, it discards RCC transmit bytes.
         (output / "rcc-uart-wire.bin").touch()
+        rcc.cmd("chardev-change", id="serial0", backend={
+            "type": "file",
+            "data": {"out": str(output / "rcc-uart-wire.bin")}})
         if not any(device["label"] == "serial0" and device["frontend-open"]
                    for device in mmx.cmd("query-chardev")):
             raise RuntimeError("Cannot connect MMX UART0 RSTP input peer")
@@ -322,6 +341,33 @@ def stage_native_ipu_nor(nor, firmware, destination):
     raw[offset:offset * 2] = elf
     with destination.open("xb") as stream:
         stream.write(raw)
+
+
+RCC_PERSISTENCE_OFFSET = 62 * 1024 * 1024
+RCC_PERSISTENCE_SIZE = 2 * 1024 * 1024
+
+
+def prepare_rcc_nor_state(base, state):
+    """Create or reuse a writable NOR whose only mutable area is Per1/Per2."""
+    raw = base.read_bytes()
+    end = RCC_PERSISTENCE_OFFSET + RCC_PERSISTENCE_SIZE
+    if len(raw) != end:
+        raise ValueError("Expected a 64 MiB RCC NOR ending with Per1/Per2")
+    if state.exists():
+        current = state.read_bytes()
+        if (len(current) != end or
+                current[:RCC_PERSISTENCE_OFFSET] !=
+                raw[:RCC_PERSISTENCE_OFFSET]):
+            raise ValueError(
+                "RCC NOR state differs from the staged image outside Per1/Per2")
+        created = False
+    else:
+        with state.open("xb") as stream:
+            stream.write(raw)
+        created = True
+    persistence = state.read_bytes()[RCC_PERSISTENCE_OFFSET:end]
+    return {"path": str(state.resolve()), "created": created,
+            "persistence_sha256": hashlib.sha256(persistence).hexdigest()}
 
 
 def start_native_ipu1(rcc, captured, log, timeout):
@@ -776,7 +822,9 @@ def probe(qemu, media, nor, mnand, image, output, timeout=30, *,
           experimental_native_rstp=False, experimental_native_hid=False,
           rcc_input_peer=False,
           experimental_rcc_manual_startup_isolation=False,
-          experimental_rcc_icount_shift=0, mnand_overlay=None):
+          experimental_rcc_icount_shift=0, mnand_overlay=None,
+          experimental_concurrent_startup=False, rcc_nor_state=None,
+          rcc_persistence_store=None, rcc_persistence_catalog=None):
     if not 0 < timeout <= 60:
         raise ValueError("Console timeout must be between 0 and 60 seconds")
     if (type(experimental_rcc_icount_shift) is not int or
@@ -791,10 +839,14 @@ def probe(qemu, media, nor, mnand, image, output, timeout=30, *,
         raise ValueError("Crossboard check requires the PCI server check")
     if network and not crossboard_init:
         raise ValueError("Network check requires native crossboard setup")
+    if experimental_concurrent_startup and not network:
+        raise ValueError("Concurrent startup requires native networking")
     if asi and (not network or rcc_nor is None):
         raise ValueError("ASI check requires native networking and --rcc-nor")
     if rcc_nor is not None and not asi:
         raise ValueError("RCC App NOR option requires the ASI check")
+    if rcc_nor_state is not None and rcc_nor is None:
+        raise ValueError("RCC NOR state requires --rcc-nor")
     if experimental_rcc_manual_startup_isolation and not asi:
         raise ValueError("Manual RCC startup isolation requires --asi")
     if experimental_rcc_ipu1_fixture is not None and not asi:
@@ -814,6 +866,11 @@ def probe(qemu, media, nor, mnand, image, output, timeout=30, *,
             "Native HID observation requires native RSTP observation")
     if rcc_input_peer and not experimental_native_rstp:
         raise ValueError("The RSTP input peer replaces the native UART link")
+    if rcc_persistence_store is not None and not rcc_input_peer:
+        raise ValueError("RCC persistence store requires the RSTP input peer")
+    if rcc_persistence_catalog is not None and not rcc_input_peer:
+        raise ValueError(
+            "RCC persistence catalog requires the RSTP input peer")
     ipu_firmware = (experimental_rcc_ipu1_native
                     if experimental_rcc_ipu1_native is not None else
                     experimental_rcc_ipu1_fixture)
@@ -847,6 +904,12 @@ def probe(qemu, media, nor, mnand, image, output, timeout=30, *,
         if experimental_rcc_ipu1_native is not None:
             flash = directory / "native-ipu-transport-nor.bin"
             stage_native_ipu_nor(rcc_nor, ipu_firmware, flash)
+        rcc_state = None
+        if rcc_nor_state is not None:
+            rcc_state = prepare_rcc_nor_state(flash, Path(rcc_nor_state))
+            (output / "rcc-nor-state.json").write_text(
+                json.dumps(rcc_state, indent=2) + "\n")
+            flash = Path(rcc_nor_state)
         sideband = directory / "wire.sock"
         tests = {
             name: QEMUQtestProtocol(str(directory / f"{name}.sock"),
@@ -878,7 +941,8 @@ def probe(qemu, media, nor, mnand, image, output, timeout=30, *,
             f"shift={experimental_rcc_icount_shift},align=off,sleep=on")
         if flash is not None:
             rcc_args += [
-                "-drive", "if=pflash,format=raw,snapshot=on,file=" +
+                "-drive", "if=pflash,format=raw,snapshot=" +
+                ("off" if rcc_state is not None else "on") + ",file=" +
                 str(flash.resolve()).replace(",", ",,")]
         transport = (
             socket.socketpair() + socket.socketpair()
@@ -938,7 +1002,11 @@ def probe(qemu, media, nor, mnand, image, output, timeout=30, *,
                 rcc.launch()
                 if experimental_native_rstp:
                     connect_native_uart(mmx, rcc, directory, output,
-                                        input_peer=rcc_input_peer)
+                                        input_peer=rcc_input_peer,
+                                        persistence_store=
+                                        rcc_persistence_store,
+                                        persistence_catalog=
+                                        rcc_persistence_catalog)
                 if transport:
                     transport[1].close()
                     transport[3].close()
@@ -1060,6 +1128,8 @@ def probe(qemu, media, nor, mnand, image, output, timeout=30, *,
                                 boots[-1][
                                     "mmx_original_initializer_exited_ok"
                                 ] = True
+                                if experimental_concurrent_startup:
+                                    rcc.cmd("cont")
                             elif config_transport:
                                 boots[-1]["live_configuration"] = (
                                     verify_configuration(
@@ -1286,6 +1356,7 @@ def probe(qemu, media, nor, mnand, image, output, timeout=30, *,
             f"Unsupported operations in paired probe: {unsupported!r}")
     if experimental_rcc_ipu1_native is not None:
         uart = (output / "rcc-m4-uart7.log").read_bytes()
+        verify_native_m4_watchdogs(uart)
         if (b"M4 Application WatchDog Failed" in uart or
                 b"[MAWD] Enter infinity loop" in uart):
             raise RuntimeError(
@@ -1321,6 +1392,7 @@ def probe(qemu, media, nor, mnand, image, output, timeout=30, *,
         "endpoint_enumeration_verified": pci_server,
         "native_crossboard_configuration_verified": crossboard_init,
         "native_bidirectional_network_verified": network,
+        "experimental_concurrent_startup": experimental_concurrent_startup,
         "native_rcc_agent_registration_verified": asi,
         "full_rcc_services_verified": False,
         "icount": {
@@ -1487,6 +1559,9 @@ def main():
                         help="Experimental RCC-only virtual nanoseconds per "
                              "instruction (2**shift); MMX stays at shift zero. "
                              "Not a CPU-frequency or real-time guarantee")
+    parser.add_argument("--experimental-concurrent-startup", action="store_true",
+                        help="Keep RCC running after verified native link-up "
+                             "during MMX PCI server startup; requires --network")
     parser.add_argument("--config-transport", action="store_true",
                         help="Also check live configuration using an explicit "
                              "temporary diagnostic MMX window")
@@ -1566,6 +1641,8 @@ def main():
                            args.experimental_rcc_manual_startup_isolation,
                            experimental_rcc_icount_shift=
                            args.experimental_rcc_icount_shift,
+                           experimental_concurrent_startup=
+                           args.experimental_concurrent_startup,
                            mnand_overlay=args.mnand_overlay),
                      indent=2))
 

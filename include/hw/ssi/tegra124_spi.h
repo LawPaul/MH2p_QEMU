@@ -1,3 +1,6 @@
+/*
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
 #ifndef HW_SSI_TEGRA124_SPI_H
 #define HW_SSI_TEGRA124_SPI_H
 

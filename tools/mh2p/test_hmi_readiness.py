@@ -9,13 +9,62 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from hmi_readiness import display_wait_command, main, verify_original_hmi_display
+from hmi_readiness import (display_wait_command, main,
+                           verify_native_m4_watchdogs,
+                           verify_original_hmi_display)
 
 
 VALID = (
     b"Jan 01 00:04:28    5 10203     1 [268210] 00:04:28.210 "
     b"DEBUG <Fw.Display>         waitForDSIDisplayManagement: succeeded!\r\n")
 TIMEOUT = b"NATIVE_HMI_DISPLAY_WAIT_TIMEOUT\r\n"
+
+
+class M4WatchdogTests(unittest.TestCase):
+    def test_native_fatal_records_and_console_newlines(self):
+        events = (
+            b"[IPC WD] REBOOT ! ! ! ",
+            b"[M4PW]J6 WD reset req,ID:7 1-4:0 0 238 82 5-8:0 0 0 0",
+            b"[M4PW]J6 WD reset req Id:0x12.Audio Control",
+            b"[MAWD] Enter infinity loop",
+            b"[MAWD] M4 Application WatchDog Failed",
+        )
+        for event in events:
+            for newline in (b"\n", b"\r\n", b"\r\r\n"):
+                with self.subTest(event=event, newline=newline), \
+                        self.assertRaisesRegex(RuntimeError, "tick 0000061010"):
+                    verify_native_m4_watchdogs(
+                        b"\r0000061010  " + event + newline)
+
+    def test_normal_watchdog_setup_and_echoes_are_not_failures(self):
+        verify_native_m4_watchdogs(
+            b"\r0000000014  [MAWD] START_APP_WATCHDOG: 00 80595ae8\n"
+            b"\r0000021978  [UARTP_C]UartP receive watchdog status, 1.\n"
+            b"\r0000021978  [UARTP_C]Rcv watchdog status from M4 Power. "
+            b"WatchdogStatus: 01\n"
+            b"# grep '[IPC WD] REBOOT ! ! !' /tmp/log\n")
+        verify_native_m4_watchdogs(b"")
+
+    def test_first_native_failure_is_reported(self):
+        with self.assertRaisesRegex(RuntimeError, r"tick 0000061010: \[IPC WD\]"):
+            verify_native_m4_watchdogs(
+                b"\r0000061010  [IPC WD] REBOOT ! ! ! \n"
+                b"\r0000061063  [M4PW]J6 WD reset req,ID:14\n")
+
+    def test_cli_m4_failure_overrides_display_success(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            display = root / "display.log"
+            uart = root / "uart.log"
+            display.write_bytes(VALID)
+            uart.write_bytes(b"\r0000061010  [IPC WD] REBOOT ! ! ! \n")
+            with patch.object(sys, "argv", [
+                    "hmi_readiness", str(display), "--m4-uart", str(uart)]), \
+                    redirect_stderr(io.StringIO()) as stderr, \
+                    self.assertRaises(SystemExit) as error:
+                main()
+            self.assertEqual(error.exception.code, 1)
+            self.assertIn("Native M4 watchdog failure", stderr.getvalue())
 
 
 class DisplayReadinessTests(unittest.TestCase):

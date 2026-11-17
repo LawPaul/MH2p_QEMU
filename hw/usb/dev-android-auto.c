@@ -74,7 +74,8 @@ static void aa_control(USBDevice *dev,USBPacket *p,int request,int value,
     if(usb_desc_handle_control(dev,p,request,value,index,length,data)>=0)return;
     switch(request){
     case VendorDeviceRequest|51: /* ACCESSORY_GET_PROTOCOL */
-        if(length<2)break;data[0]=2;data[1]=0;p->actual_length=2;return;
+        if(length<2)break;
+        data[0]=2;data[1]=0;p->actual_length=2;return;
     case VendorDeviceOutRequest|52: /* ACCESSORY_SEND_STRING */
         if(index<0||index>=6||length<1||length>256||data[length-1]!=0)break;
         memcpy(s->accessory_strings[index],data,length);return;

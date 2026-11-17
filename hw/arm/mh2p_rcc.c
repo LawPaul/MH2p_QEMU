@@ -4,6 +4,7 @@
  */
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qapi/visitor.h"
 #include "qemu/bswap.h"
 #include "qemu/error-report.h"
 #include "qemu/log.h"
@@ -19,6 +20,7 @@
 #include "hw/cpu/a15mpcore.h"
 #include "hw/arm/mh2p_rcc_ipu.h"
 #include "hw/arm/mh2p_rcc_mmu.h"
+#include "hw/arm/mh2p_rcc_dsp.h"
 #include "hw/gpio/dra7_gpio.h"
 #include "hw/i2c/dra7_i2c.h"
 #include "hw/ssi/dra7_mcspi.h"
@@ -83,6 +85,47 @@ static const hwaddr rcc_usb_phy_ana_config1[] = { 0x4a08404c, 0x4a08504c };
 static const hwaddr rcc_mcasp_gblctl[] = {
     0x48460044, 0x48464044, 0x48468044, 0x4846c044,
     0x48470044, 0x48474044, 0x48478044, 0x4847c044,
+};
+
+static const struct {
+    hwaddr base, size;
+} rcc_mcasp_data[] = {
+    { 0x45800000, 4 * MiB }, { 0x45c00000, 4 * MiB },
+    { 0x46000000, 4 * MiB }, { 0x48436000, 4 * KiB },
+    { 0x4843a000, 4 * KiB }, { 0x4844c000, 4 * KiB },
+    { 0x48450000, 4 * KiB }, { 0x48454000, 4 * KiB },
+};
+
+static const struct {
+    uint16_t offset;
+    uint32_t writable, reset;
+} rcc_mcasp_config[] = {
+    { 0x004, 0x3f, 2 },                  /* PWRIDLESYSCONFIG */
+    { 0x010, UINT32_MAX, 0 },            /* PFUNC */
+    { 0x014, UINT32_MAX, 0 },            /* PDIR */
+    { 0x048, UINT32_MAX, 0 },            /* AMUTE: reserved on DRA7 */
+    { 0x04c, UINT32_MAX, 0 },            /* LBCTL */
+    { 0x050, UINT32_MAX, 0 },            /* TXDITCTL */
+    { 0x064, UINT32_MAX, 0 },            /* RXMASK */
+    { 0x068, UINT32_MAX, 0 },            /* RXFMT */
+    { 0x06c, UINT32_MAX, 0 },            /* RXFMCTL */
+    { 0x070, 0xffe0ffff, 0x20 },         /* ACLKRCTL */
+    { 0x074, 0xffe0ffff, 0x8000 },       /* AHCLKRCTL */
+    { 0x078, UINT32_MAX, 0 },            /* RXTDM */
+    { 0x07c, UINT32_MAX, 0 },            /* EVTCTLR */
+    { 0x088, 0x00ffffff, 0 },            /* RXCLKCHK */
+    { 0x08c, UINT32_MAX, 0 },            /* REVTCTL */
+    { 0x0a4, UINT32_MAX, 0 },            /* TXMASK */
+    { 0x0a8, UINT32_MAX, 0 },            /* TXFMT */
+    { 0x0ac, UINT32_MAX, 0 },            /* TXFMCTL */
+    { 0x0b0, 0xffe0ffff, 0x20 },         /* ACLKXCTL */
+    { 0x0b4, 0xffe0ffff, 0x8000 },       /* AHCLKXCTL */
+    { 0x0b8, UINT32_MAX, 0 },            /* TXTDM */
+    { 0x0bc, UINT32_MAX, 0 },            /* EVTCTLX */
+    { 0x0c8, 0x00ffffff, 0 },            /* TXCLKCHK */
+    { 0x0cc, UINT32_MAX, 0 },            /* XEVTCTL */
+    { 0x1000, 0x1ffff, 0x1004 },         /* WFIFOCTL, disabled */
+    { 0x1008, 0x1ffff, 0x1004 },         /* RFIFOCTL, disabled */
 };
 
 static const struct {
@@ -171,6 +214,7 @@ static const struct {
     { 0x48822000, 0x4a005560, 37, 6 },
     { 0x48824000, 0x4a005568, 38, 7 },
     { 0x48826000, 0x4a005570, 39, 8 },
+    { 0x48086000, 0x4a009728, 41, 10 },
 };
 
 static const hwaddr rcc_gpio_clocks[] = {
@@ -543,8 +587,9 @@ typedef struct RCCUART {
     hwaddr base;
     uint8_t mdr1;
     uint8_t sysconfig;
+    uint8_t efr;
     qemu_irq irq;
-    bool clock_enabled, irq_level;
+    bool clock_enabled, irq_level, banked_efr;
 } RCCUART;
 
 typedef struct RCCCrossbar {
@@ -678,7 +723,7 @@ typedef struct MH2PRCCMachineState {
     MemoryRegion iodelay;
     uint32_t iodelay_lock;
     uint32_t pad_delay[(0xd1c - 0x30) / 4 + 1];
-    MemoryRegion edma;
+    MemoryRegion edma, dsp_edma;
     MemoryRegion gmac_reset[ARRAY_SIZE(rcc_gmac_resets)];
     MemoryRegion gmac_cppi_ram;
     MemoryRegion gmac_dma;
@@ -703,6 +748,15 @@ typedef struct MH2PRCCMachineState {
     uint32_t edma_ipr[9][2];
     uint32_t edma_epoch;
     uint32_t edma_queue[9];
+    uint32_t dsp_edma_registers[0x8000 / sizeof(uint32_t)];
+    uint32_t dsp_dma_route[10];
+    uint32_t dsp_edma_param[512][8];
+    uint64_t dsp_edma_event, dsp_edma_enable, dsp_edma_missed;
+    uint64_t dsp_edma_region_event[8], dsp_edma_region_enable[8];
+    uint64_t dsp_edma_region_missed[8];
+    uint64_t dsp_edma_drae[8];
+    uint64_t dsp_edma_ier, dsp_edma_ipr;
+    uint32_t dsp_edma_qrae[8], dsp_edma_qeer[8];
     uint32_t usb_clkctrl[4];
     uint32_t usb_phy_clkctrl[2];
     uint32_t usb_phy_ana_config1[2];
@@ -716,11 +770,17 @@ typedef struct MH2PRCCMachineState {
     uint32_t mlb_io_ctrl[2];
     uint32_t mlb_dll;
     uint32_t mlb_clock;
+    uint32_t mlb_mcasp_clkselect;
     uint32_t mlb_mdat[4], mlb_mdwe[4];
     uint32_t mlb_mctl, mlb_madr;
     uint32_t mlb_channel_table[256][4];
     uint32_t mlb_regs[ARRAY_SIZE(rcc_mlb_registers)];
     uint32_t ipu1_clkctrl, ipu1_clkstctrl;
+    uint32_t dsp1_clkctrl, dsp1_clkstctrl;
+    uint32_t dsp1_reset_control, dsp1_reset_status, dsp1_reset_asserted;
+    uint32_t dsp1_vector;
+    DeviceState *dsp1;
+    char *dsp1_backend;
     uint32_t ipu1_reset_control, ipu1_reset_status, ipu1_reset_asserted;
     MH2PIPU1 *ipu1;
     bool ipu1_native, ipu1_clock_running;
@@ -747,8 +807,37 @@ typedef struct MH2PRCCMachineState {
     int64_t mpu_wdt_epoch;
     bool mpu_wdt_warned, mpu_wdt_expired, mpu_wdt_reset_requested;
     bool power_clocks;
+    bool mlb_clock_peer;
+    bool mlb_peer_reset_released;
+    QEMUTimer *mcasp_sync_timer;
+    QEMUTimer *mcasp_dma_timer;
+    QEMUTimer *mcasp_tx_timer;
+    bool mcasp_dma_blocked[8];
+    struct {
+        bool pending;
+        unsigned channel, words;
+        uint32_t source;
+        int16_t source_step;
+    } mcasp_dma_request[8];
+    bool uart_efr;
     uint32_t bypass_dpll_mode[ARRAY_SIZE(rcc_bypass_dplls)];
     uint32_t disabled_clkctrl[ARRAY_SIZE(rcc_disabled_clkctrl)];
+    struct {
+        uint32_t config[ARRAY_SIZE(rcc_mcasp_config)];
+        uint32_t serializer[16];
+        uint32_t tx_buffer[16];
+        uint32_t tx_shift[16];
+        bool tx_underrun, tx_frame_started;
+        uint32_t tx_hz, tx_slot_bits, tx_slots, tx_slot;
+        uint64_t tx_phase;
+        int64_t tx_deadline;
+        uint32_t tx_status;
+        uint32_t tx_fifo[64];
+        unsigned tx_fifo_head, tx_fifo_level;
+        uint32_t reset_request;
+        uint32_t reset_latched;
+        int64_t sync_deadline[2];
+    } mcasp[ARRAY_SIZE(rcc_mcasp_gblctl)];
     uint32_t pcie_apll_mode, pcie_acs_control;
     MemoryRegion pcie_rx;
     uint32_t pcie_rx_regs[ARRAY_SIZE(rcc_pcie_rx_registers)];
@@ -969,6 +1058,18 @@ static bool rcc_ipu1_clock_active(MH2PRCCMachineState *s)
     return s->ipu1_clock_running;
 }
 
+static void rcc_dsp1_control(MH2PRCCMachineState *s)
+{
+    uint32_t old = s->dsp1_reset_asserted;
+    bool clock = s->dsp1_clkctrl && s->dsp1_clkstctrl != 1;
+
+    if (s->dsp1) {
+        s->dsp1_reset_asserted = mh2p_rcc_dsp_control(
+            s->dsp1, s->dsp1_reset_control, clock, s->dsp1_vector & 0x3fffff);
+        s->dsp1_reset_status |= old & ~s->dsp1_reset_asserted;
+    }
+}
+
 static void rcc_ipu1_control(MH2PRCCMachineState *s)
 {
     bool clock = (s->ipu1_clkctrl & 1) &&
@@ -1049,9 +1150,6 @@ static unsigned rcc_crossbar_destination(unsigned selector)
 
 static void rcc_crossbar_update(RCCCrossbar *s)
 {
-    if (!s->mpu && !s->defaults) {
-        return;
-    }
     for (unsigned i = 0; i < s->selector_count; i++) {
         qemu_set_irq(s->outputs[i],
                      s->selection[i] && s->levels[s->selection[i]]);
@@ -1510,13 +1608,22 @@ static const MemoryRegionOps rcc_gmac_ale_ops = {
 
 static void rcc_crossbar_input(void *opaque, int irq, int level)
 {
-    RCCCrossbar *s = opaque;
+    bool asserted = level != 0;
 
-    s->levels[irq] = level != 0;
-    rcc_crossbar_update(s);
-    for (RCCCrossbar *peer = s->peer; peer; peer = peer->peer) {
-        peer->levels[irq] = level != 0;
-        rcc_crossbar_update(peer);
+    for (RCCCrossbar *s = opaque; s; s = s->peer) {
+        if (s->levels[irq] == asserted) {
+            continue;
+        }
+        s->levels[irq] = asserted;
+        if (!irq) {
+            continue;
+        }
+        for (unsigned i = 0; i < s->selector_count; i++) {
+            if (s->selection[i] == irq) {
+                qemu_set_irq(s->outputs[i], asserted);
+                qemu_set_irq(s->secondary_outputs[i], asserted);
+            }
+        }
     }
 }
 
@@ -1964,6 +2071,330 @@ static const MemoryRegionOps rcc_edma_ops = {
     .impl = { .min_access_size = 4, .max_access_size = 4 },
 };
 
+static void rcc_mcasp_dma_schedule(MH2PRCCMachineState *s)
+{
+    if (s->mlb_clock_peer && s->power_clocks &&
+        !timer_pending(s->mcasp_dma_timer)) {
+        timer_mod(s->mcasp_dma_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1);
+    }
+}
+
+static bool rcc_dsp_edma_decode(hwaddr *offset, unsigned *region,
+                                bool *shadow)
+{
+    if (*offset < 0x2000 || *offset >= 0x3000) {
+        *region = 0;
+        *shadow = false;
+        return true;
+    }
+
+    *region = (*offset - 0x2000) / 0x200;
+    *shadow = true;
+    *offset = 0x1000 + ((*offset - 0x2000) % 0x200);
+    return *region < 8 && *offset < 0x1098;
+}
+
+static uint64_t *rcc_dsp_edma_status(MH2PRCCMachineState *s,
+                                     unsigned region, bool shadow,
+                                     hwaddr offset)
+{
+    if (!shadow) {
+        switch (offset) {
+        case 0x1000:
+        case 0x1004:
+            return &s->dsp_edma_event;
+        case 0x1020:
+        case 0x1024:
+            return &s->dsp_edma_enable;
+        case 0x0300:
+        case 0x0304:
+            return &s->dsp_edma_missed;
+        default:
+            return NULL;
+        }
+    }
+
+    if (region >= ARRAY_SIZE(s->dsp_edma_region_event)) {
+        return NULL;
+    }
+    switch (offset) {
+    case 0x1000:
+    case 0x1004:
+        return &s->dsp_edma_region_event[region];
+    case 0x1020:
+    case 0x1024:
+        return &s->dsp_edma_region_enable[region];
+    case 0x0300:
+    case 0x0304:
+        return &s->dsp_edma_region_missed[region];
+    default:
+        return NULL;
+    }
+}
+
+static uint32_t rcc_dsp_edma_read_status(uint64_t status, hwaddr offset)
+{
+    return offset == 0x1004 || offset == 0x1024 ||
+           offset == 0x0304 ? status >> 32 : status;
+}
+
+static void rcc_dsp_edma_interrupt_pulse(MH2PRCCMachineState *s,
+                                         bool shadow, unsigned region)
+{
+    static const unsigned crossbar[] = { 319, 320, 321, 322, 323, 324, 375, 376 };
+    unsigned source = shadow ? crossbar[region] : 318;
+
+    qemu_irq_pulse(s->crossbar.inputs[source]);
+    if (s->dsp1 && (!shadow || region < 4)) {
+        qemu_irq_pulse(qdev_get_gpio_in_named(s->dsp1, "events",
+                                             shadow ? 17 + region : 16));
+    }
+}
+
+static void rcc_dsp_edma_interrupt_update(MH2PRCCMachineState *s,
+                                          uint64_t previous_ier,
+                                          uint64_t previous_ipr,
+                                          const uint64_t *previous_drae)
+{
+    uint64_t before = previous_ier & previous_ipr;
+    uint64_t after = s->dsp_edma_ier & s->dsp_edma_ipr;
+
+    if (!before && after) {
+        rcc_dsp_edma_interrupt_pulse(s, false, 0);
+    }
+    for (unsigned i = 0; i < ARRAY_SIZE(s->dsp_edma_drae); i++) {
+        if (!(before & previous_drae[i]) && (after & s->dsp_edma_drae[i])) {
+            rcc_dsp_edma_interrupt_pulse(s, true, i);
+        }
+    }
+}
+
+static MemTxResult rcc_dsp_edma_read(void *opaque, hwaddr offset,
+                                     uint64_t *value, unsigned size,
+                                     MemTxAttrs attrs)
+{
+    MH2PRCCMachineState *s = opaque;
+    uint64_t *status;
+    unsigned region;
+    bool shadow;
+    hwaddr reg = offset;
+
+    if (size != 4 || (offset & 3) ||
+        !rcc_dsp_edma_decode(&reg, &region, &shadow)) {
+        goto unsupported;
+    }
+    if ((status = rcc_dsp_edma_status(s, region, shadow, reg))) {
+        *value = rcc_dsp_edma_read_status(*status, reg);
+        return MEMTX_OK;
+    }
+    if (reg >= 0x340 && reg < 0x380) {
+        unsigned index = (reg - 0x340) / 8;
+
+        *value = s->dsp_edma_drae[index] >> (((reg - 0x340) & 4) * 8);
+        return MEMTX_OK;
+    }
+    if (reg >= 0x380 && reg < 0x3a0) {
+        *value = s->dsp_edma_qrae[(reg - 0x380) / 4];
+        return MEMTX_OK;
+    }
+    if (reg == 0x1080) {
+        *value = 0;
+        return MEMTX_OK;
+    }
+    if (reg == 0x1084) {
+        *value = s->dsp_edma_qeer[region];
+        return MEMTX_OK;
+    }
+    if (reg == 0x1050 || reg == 0x1054 ||
+        reg == 0x1068 || reg == 0x106c) {
+        uint64_t status_value = reg == 0x1050 || reg == 0x1054 ?
+            s->dsp_edma_ier : s->dsp_edma_ipr;
+
+        if (shadow) {
+            status_value &= s->dsp_edma_drae[region];
+        }
+        *value = (reg == 0x1054 || reg == 0x106c) ?
+                 status_value >> 32 : status_value;
+        return MEMTX_OK;
+    }
+    if (reg == 0x1090 || reg == 0x1094) {
+        *value = 0;
+        return MEMTX_OK;
+    }
+    if (reg < 0x1000 || (reg >= 0x4000 && reg < 0x8000)) {
+        *value = s->dsp_edma_registers[reg / 4];
+        return MEMTX_OK;
+    }
+    if (reg == 0x1038 || reg == 0x103c) {
+        *value = 0;
+        return MEMTX_OK;
+    }
+
+unsupported:
+    qemu_log_mask(LOG_UNIMP, "mh2p-rcc: unsupported DSP1 EDMA read 0x%"
+                  HWADDR_PRIx "\n", offset);
+    *value = 0;
+    return MEMTX_ERROR;
+}
+
+static MemTxResult rcc_dsp_edma_write(void *opaque, hwaddr offset,
+                                      uint64_t value, unsigned size,
+                                      MemTxAttrs attrs)
+{
+    MH2PRCCMachineState *s = opaque;
+    uint64_t *status;
+    unsigned region;
+    bool shadow;
+    hwaddr reg = offset;
+
+    if (size != 4 || (offset & 3) ||
+        !rcc_dsp_edma_decode(&reg, &region, &shadow)) {
+        goto unsupported;
+    }
+    if (reg == 0x1010 || reg == 0x1014) {
+        uint64_t *event = shadow ? &s->dsp_edma_region_event[region] :
+                                   &s->dsp_edma_event;
+        uint64_t set = reg == 0x1014 ? (uint64_t)value << 32 : value;
+
+        *event |= shadow ? set & s->dsp_edma_drae[region] : set;
+        return MEMTX_OK;
+    }
+    if (reg == 0x1030 || reg == 0x1034 ||
+        reg == 0x1028 || reg == 0x102c) {
+        uint64_t *enable = shadow ? &s->dsp_edma_region_enable[region] :
+                                    &s->dsp_edma_enable;
+        uint64_t bits = (reg == 0x1034 || reg == 0x102c) ?
+                        (uint64_t)value << 32 : value;
+
+        if (shadow) {
+            bits &= s->dsp_edma_drae[region];
+        }
+        if (reg == 0x1030 || reg == 0x1034) {
+            *enable |= bits;
+            rcc_mcasp_dma_schedule(s);
+            if (*enable & (shadow ? s->dsp_edma_region_event[region] :
+                                    s->dsp_edma_event)) {
+                qemu_log_mask(LOG_UNIMP,
+                              "mh2p-rcc: DSP1 EDMA enabled event without transfer support\n");
+            }
+        } else {
+            *enable &= ~bits;
+        }
+        return MEMTX_OK;
+    }
+    if (reg == 0x1008 || reg == 0x100c ||
+        reg == 0x0308 || reg == 0x030c) {
+        uint64_t *status_register =
+            reg == 0x1008 || reg == 0x100c ?
+            (shadow ? &s->dsp_edma_region_event[region] :
+                      &s->dsp_edma_event) :
+            (shadow ? &s->dsp_edma_region_missed[region] :
+                      &s->dsp_edma_missed);
+        uint64_t bits = reg == 0x100c || reg == 0x030c ?
+                        (uint64_t)value << 32 : value;
+
+        *status_register &=
+            ~(shadow ? bits & s->dsp_edma_drae[region] : bits);
+        return MEMTX_OK;
+    }
+    if (reg == 0x1040 || reg == 0x1044) {
+        return MEMTX_OK;
+    }
+    if (reg == 0x1088) {
+        s->dsp_edma_qeer[region] &= ~value;
+        return MEMTX_OK;
+    }
+    if (reg == 0x108c && !(value & ~0xffU)) {
+        s->dsp_edma_qeer[region] |= value;
+        return MEMTX_OK;
+    }
+    if (reg == 0x1058 || reg == 0x105c ||
+        reg == 0x1060 || reg == 0x1064 ||
+        reg == 0x1070 || reg == 0x1074) {
+        bool high = reg == 0x105c || reg == 0x1064 || reg == 0x1074;
+        bool clear_enable = reg == 0x1058 || reg == 0x105c;
+        uint64_t bits = high ? (uint64_t)value << 32 : value;
+        uint64_t old_ier = s->dsp_edma_ier, old_ipr = s->dsp_edma_ipr;
+        uint64_t *status_register = clear_enable ?
+            &s->dsp_edma_ier :
+            (reg == 0x1060 || reg == 0x1064 ?
+             &s->dsp_edma_ier : &s->dsp_edma_ipr);
+
+        if (shadow) {
+            bits &= s->dsp_edma_drae[region];
+        }
+        if (reg == 0x1058 || reg == 0x105c ||
+            reg == 0x1070 || reg == 0x1074) {
+            *status_register &= ~bits;
+        } else {
+            *status_register |= bits;
+        }
+        rcc_dsp_edma_interrupt_update(s, old_ier, old_ipr, s->dsp_edma_drae);
+        return MEMTX_OK;
+    }
+    if (reg == 0x1078) {
+        uint64_t pending = s->dsp_edma_ier & s->dsp_edma_ipr;
+
+        if (shadow) {
+            pending &= s->dsp_edma_drae[region];
+        }
+        if ((value & BIT(1)) || ((value & BIT(0)) && pending)) {
+            rcc_dsp_edma_interrupt_pulse(s, shadow, region);
+        }
+        return MEMTX_OK;
+    }
+    if (reg == 0x1094) {
+        return MEMTX_OK;
+    }
+    if ((status = rcc_dsp_edma_status(s, region, shadow, reg))) {
+        if (reg == 0x1020 || reg == 0x1024 ||
+            reg == 0x1000 || reg == 0x1004 ||
+            reg == 0x0300 || reg == 0x0304) {
+            return MEMTX_OK;
+        }
+    }
+    if (reg >= 0x340 && reg < 0x380) {
+        unsigned index = (reg - 0x340) / 8;
+        unsigned shift = ((reg - 0x340) & 4) * 8;
+        uint64_t mask = UINT64_C(0xffffffff) << shift;
+        uint64_t previous_drae[8];
+
+        memcpy(previous_drae, s->dsp_edma_drae, sizeof(previous_drae));
+        s->dsp_edma_drae[index] =
+            (s->dsp_edma_drae[index] & ~mask) | ((uint64_t)value << shift);
+        rcc_dsp_edma_interrupt_update(s, s->dsp_edma_ier, s->dsp_edma_ipr,
+                                      previous_drae);
+        return MEMTX_OK;
+    }
+    if (reg >= 0x380 && reg < 0x3a0) {
+        s->dsp_edma_qrae[(reg - 0x380) / 4] = value;
+        return MEMTX_OK;
+    }
+    if ((reg >= 0x100 && reg < 0x300) ||
+        (reg >= 0x4000 && reg < 0x8000)) {
+        s->dsp_edma_registers[reg / 4] = value;
+        if (s->mlb_clock_peer) {
+            memset(s->mcasp_dma_blocked, 0, sizeof(s->mcasp_dma_blocked));
+            rcc_mcasp_dma_schedule(s);
+        }
+        return MEMTX_OK;
+    }
+
+unsupported:
+    qemu_log_mask(LOG_UNIMP, "mh2p-rcc: unsupported DSP1 EDMA write 0x%"
+                  HWADDR_PRIx " = 0x%" PRIx64 "\n", offset, value);
+    return MEMTX_ERROR;
+}
+
+static const MemoryRegionOps rcc_dsp_edma_ops = {
+    .read_with_attrs = rcc_dsp_edma_read,
+    .write_with_attrs = rcc_dsp_edma_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 4, .max_access_size = 4 },
+    .impl = { .min_access_size = 4, .max_access_size = 4 },
+};
+
 static MemTxResult rcc_dma_read(void *opaque, hwaddr offset,
                                uint64_t *value, unsigned size, MemTxAttrs attrs)
 {
@@ -2152,6 +2583,12 @@ static MemTxResult rcc_uart_read(void *opaque, hwaddr offset,
 {
     RCCUART *s = opaque;
 
+    if (s->banked_efr && offset == 8 && (size == 1 || size == 4) &&
+        s->core->serial.lcr == 0xbf) {
+        *value = s->efr;
+        rcc_uart_trace_console(s, "efr-read", *value);
+        return MEMTX_OK;
+    }
     if (offset == 0x54 && (size == 1 || size == 4)) {
         *value = s->sysconfig;
         return MEMTX_OK;
@@ -2211,12 +2648,24 @@ static MemTxResult rcc_uart_write(void *opaque, hwaddr offset,
 {
     RCCUART *s = opaque;
 
+    if (s->banked_efr && offset == 8 && (size == 1 || size == 4) &&
+        s->core->serial.lcr == 0xbf) {
+        s->efr = value & 0xff;
+        if (s->efr & ~BIT(4)) {
+            qemu_log_mask(LOG_UNIMP,
+                          "mh2p-rcc: UART enhanced flow control not modeled "
+                          "at 0x%" HWADDR_PRIx " EFR=0x%x\n", s->base, s->efr);
+        }
+        rcc_uart_trace_console(s, "efr-write", s->efr);
+        return MEMTX_OK;
+    }
     if (offset == 0x54 && (size == 1 || size == 4) &&
         !(value & ~0x1b)) {
         if (value & 2) {
             device_cold_reset(DEVICE(s->core));
             s->mdr1 = 7;
             s->sysconfig = 0;
+            s->efr = 0;
         } else {
             s->sysconfig = value;
         }
@@ -2239,6 +2688,10 @@ static MemTxResult rcc_uart_write(void *opaque, hwaddr offset,
         rcc_uart_update_irq(s);
         if (offset == 4 && !(s->core->serial.lcr & 0x80)) {
             rcc_uart_trace_console(s, "ier", value);
+        } else if (offset == 8) {
+            rcc_uart_trace_console(s, "fcr", value);
+        } else if (offset == 0x0c) {
+            rcc_uart_trace_console(s, "lcr", value);
         }
         return MEMTX_OK;
     }
@@ -3053,6 +3506,8 @@ static MemTxResult rcc_gp_timer_write(void *opaque, hwaddr offset,
         goto unsupported;
     }
     rcc_gp_timer_sync(s);
+    trace_mh2p_rcc_gp_timer_write(s->number, offset, value, size,
+                                  s->status, s->enabled, s->control, s->count);
     if (offset == 0x10 && !(value & ~0xf)) {
         if (value & 1) {
             rcc_gp_timer_reset(s);
@@ -4000,12 +4455,816 @@ static const MemoryRegionOps rcc_pcie_controller_ops = {
     .impl = { .min_access_size = 4, .max_access_size = 4 },
 };
 
+static uint32_t rcc_mcasp_serial_hz(MH2PRCCMachineState *s, unsigned instance,
+                                   bool transmit)
+{
+    uint32_t clock = s->disabled_clkctrl[instance];
+    uint32_t bitclock = 0, highclock = 0, txclock = 0;
+
+    if (!s->power_clocks || !s->mlb_clock_peer ||
+        !s->mlb_peer_reset_released ||
+        (clock & 3) != 2) {
+        return 0;
+    }
+    for (unsigned i = 0; i < ARRAY_SIZE(rcc_mcasp_config); i++) {
+        if (rcc_mcasp_config[i].offset == 0xb0) {
+            txclock = s->mcasp[instance].config[i];
+        }
+        if (rcc_mcasp_config[i].offset == (transmit ? 0xb0 : 0x70)) {
+            bitclock = s->mcasp[instance].config[i];
+        }
+        if (rcc_mcasp_config[i].offset == (transmit ? 0xb4 : 0x74)) {
+            highclock = s->mcasp[instance].config[i];
+        }
+    }
+    if (!transmit && !(txclock & BIT(6))) {
+        return rcc_mcasp_serial_hz(s, instance, true);
+    }
+    /* This peer supplies only PRCM's external MLBP high-clock route. */
+    if (!(bitclock & BIT(5)) || (highclock & BIT(15)) ||
+        ((clock >> (transmit ? 24 : 28)) & 15) != 0xd) {
+        return 0;
+    }
+    uint32_t frequency = 98304000U >> s->mlb_mcasp_clkselect;
+    uint32_t reset = transmit ? BIT(8) : BIT(0);
+
+    if (s->mcasp[instance].reset_latched & reset) {
+        frequency /= (bitclock & 31) + 1;
+    }
+    return frequency;
+}
+
+static bool rcc_mcasp_tx_ready(MH2PRCCMachineState *s, unsigned instance)
+{
+    for (unsigned n = 0; n < ARRAY_SIZE(s->mcasp[instance].serializer); n++) {
+        if (s->mcasp[instance].serializer[n] & BIT(4)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void rcc_mcasp_tx_service(MH2PRCCMachineState *s, unsigned instance)
+{
+    uint32_t fifo = s->mcasp[instance].config[
+        ARRAY_SIZE(rcc_mcasp_config) - 2];
+    unsigned serializers = 0;
+    uint32_t event = 0, format = 0;
+
+    if (!(fifo & BIT(16)) || !rcc_mcasp_tx_ready(s, instance)) {
+        return;
+    }
+    for (unsigned n = 0; n < ARRAY_SIZE(rcc_mcasp_config); n++) {
+        if (rcc_mcasp_config[n].offset == 0xcc) {
+            event = s->mcasp[instance].config[n];
+        }
+        if (rcc_mcasp_config[n].offset == 0xa8) {
+            format = s->mcasp[instance].config[n];
+        }
+    }
+    if ((event & BIT(0)) || (format & BIT(3))) {
+        return;
+    }
+    for (unsigned n = 0; n < ARRAY_SIZE(s->mcasp[instance].serializer); n++) {
+        if ((s->mcasp[instance].serializer[n] & 3) == 1) {
+            serializers++;
+        }
+    }
+    if (serializers != (fifo & 0xff)) {
+        qemu_log_mask(LOG_UNIMP, "mh2p-rcc: McASP%u WFIFO word count "
+                      "does not match active transmit serializers\n",
+                      instance + 1);
+        return;
+    }
+    if (s->mcasp[instance].tx_fifo_level < serializers) {
+        return;
+    }
+    for (unsigned n = 0; n < ARRAY_SIZE(s->mcasp[instance].serializer); n++) {
+        if ((s->mcasp[instance].serializer[n] & 3) != 1) {
+            continue;
+        }
+        s->mcasp[instance].tx_buffer[n] =
+            s->mcasp[instance].tx_fifo[s->mcasp[instance].tx_fifo_head];
+        s->mcasp[instance].tx_fifo_head =
+            (s->mcasp[instance].tx_fifo_head + 1) % 64;
+        s->mcasp[instance].tx_fifo_level--;
+        s->mcasp[instance].serializer[n] &= ~BIT(4);
+    }
+}
+
+static void rcc_mcasp_tx_update(MH2PRCCMachineState *s, unsigned instance)
+{
+    uint32_t enable = 0;
+    unsigned irq = instance ? 147 + instance * 2 : 104;
+
+    rcc_mcasp_tx_service(s, instance);
+    for (unsigned n = 0; n < ARRAY_SIZE(rcc_mcasp_config); n++) {
+        if (rcc_mcasp_config[n].offset == 0xbc) {
+            enable = s->mcasp[instance].config[n];
+        }
+    }
+    if (!rcc_mcasp_tx_ready(s, instance)) {
+        s->mcasp[instance].tx_status &= ~BIT(5);
+    }
+    qemu_set_irq(s->crossbar.inputs[irq],
+                 (s->mcasp[instance].tx_status & enable &
+                  (BIT(0) | BIT(5))) != 0);
+    rcc_mcasp_dma_schedule(s);
+}
+
+static bool rcc_mcasp_fifo_write(MH2PRCCMachineState *s, unsigned instance,
+                                 uint32_t value)
+{
+    uint32_t fifo = s->mcasp[instance].config[
+        ARRAY_SIZE(rcc_mcasp_config) - 2];
+    unsigned tail;
+
+    if (!(fifo & BIT(16)) || s->mcasp[instance].tx_fifo_level == 64) {
+        return false;
+    }
+    tail = (s->mcasp[instance].tx_fifo_head +
+            s->mcasp[instance].tx_fifo_level) % 64;
+    s->mcasp[instance].tx_fifo[tail] = value;
+    s->mcasp[instance].tx_fifo_level++;
+    if (s->mlb_clock_peer) {
+        rcc_mcasp_tx_update(s, instance);
+    }
+    return true;
+}
+
+static void rcc_mcasp_dma_update_param(MH2PRCCMachineState *s, uint32_t *p,
+                                       unsigned link)
+{
+    uint32_t options = p[0];
+    bool final = p[7] == 1;
+    uint64_t old_ipr = s->dsp_edma_ipr;
+
+    if (!(options & BIT(3))) {
+        if (!final) {
+            p[1] += (int16_t)p[6];
+            p[3] += (int16_t)(p[6] >> 16);
+            p[7]--;
+        } else if (link == 0xffff) {
+            memset(p, 0, 32);
+            p[5] = 0xffff;
+        } else {
+            memmove(p, &s->dsp_edma_registers[link / 4], 32);
+        }
+    }
+    if (options & (final ? BIT(20) : BIT(21))) {
+        s->dsp_edma_ipr |= BIT_ULL((options >> 12) & 63);
+        rcc_dsp_edma_interrupt_update(s, s->dsp_edma_ier, old_ipr,
+                                      s->dsp_edma_drae);
+    }
+}
+
+static bool rcc_mcasp_dma_transfer(MH2PRCCMachineState *s, unsigned instance,
+                                   unsigned channel)
+{
+    uint32_t map = s->dsp_edma_registers[(0x100 + channel * 4) / 4];
+    uint32_t *p = &s->dsp_edma_registers[
+        (0x4000 + (map & 0x3fe0)) / 4];
+    uint32_t fifo = s->mcasp[instance].config[
+        ARRAY_SIZE(rcc_mcasp_config) - 2];
+    unsigned words = p[2] >> 16;
+    unsigned link = p[5] & 0xffff;
+    int16_t source_step = p[4], target_step = p[4] >> 16;
+    uint32_t source = p[1], target = p[3];
+    uint8_t bytes[64][4];
+
+    /* AB-synchronized frames into a paced WFIFO. */
+    if ((map & ~0x3fe0U) || (p[0] & ~0x0033f80cU) ||
+        !(p[0] & BIT(2)) || (p[2] & 0xffff) != 4 ||
+        !p[7] || p[7] > 0xffff || ((p[0] & BIT(3)) && p[7] != 1) ||
+        !words || words > 64 ||
+        words != ((fifo >> 8) & 0xff) ||
+        words > 64 - s->mcasp[instance].tx_fifo_level ||
+        (!(p[0] & BIT(3)) && link != 0xffff &&
+         (link < 0x4000 || link >= 0x8000 || (link & 31)))) {
+        goto unsupported;
+    }
+    for (unsigned n = 0; n < words; n++) {
+        uint64_t source_end = (uint64_t)source + 4;
+        hwaddr destination = (hwaddr)target - rcc_mcasp_data[instance].base;
+
+        if (source_end > UINT64_C(0x100000000) ||
+            (!s->dsp1 && (source < RCC_RAM_BASE ||
+             source_end > RCC_RAM_BASE + MACHINE(s)->ram_size)) ||
+            (target & 3) || destination >= rcc_mcasp_data[instance].size) {
+            goto unsupported;
+        }
+        source += source_step;
+        target += target_step;
+    }
+    if ((p[0] & BIT(11)) && (p[0] & (BIT(20) | BIT(21)))) {
+        s->mcasp_dma_request[instance].pending = true;
+        s->mcasp_dma_request[instance].channel = channel;
+        s->mcasp_dma_request[instance].words = words;
+        s->mcasp_dma_request[instance].source = p[1];
+        s->mcasp_dma_request[instance].source_step = source_step;
+        rcc_mcasp_dma_update_param(s, p, link);
+        return true;
+    }
+    source = p[1];
+    for (unsigned n = 0; n < words; n++) {
+        MemTxResult result = s->dsp1 ?
+            mh2p_rcc_dsp_dma_read(s->dsp1, source, bytes[n], 4) :
+            address_space_read(&address_space_memory, source,
+                               MEMTXATTRS_UNSPECIFIED, bytes[n], 4);
+
+        if (result != MEMTX_OK) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "mh2p-rcc: DSP1 EDMA channel%u source fault "
+                          "at 0x%x result=%u\n", channel, source, result);
+            return false;
+        }
+        source += source_step;
+    }
+    for (unsigned n = 0; n < words; n++) {
+        if (!rcc_mcasp_fifo_write(s, instance, ldl_le_p(bytes[n]))) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "mh2p-rcc: DSP1 EDMA channel%u WFIFO "
+                          "space changed during transfer\n", channel);
+            return false;
+        }
+    }
+    rcc_mcasp_dma_update_param(s, p, link);
+    return true;
+
+unsupported:
+    qemu_log_mask(LOG_UNIMP, "mh2p-rcc: unsupported DSP1 EDMA channel%u "
+                  "McASP%u transfer opt=%x source=%x count=%x target=%x "
+                  "index=%x link=%x cidx=%x ccnt=%x\n", channel, instance + 1,
+                  p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+    return false;
+}
+
+static void rcc_mcasp_dma_finish_early(MH2PRCCMachineState *s,
+                                      unsigned instance)
+{
+    unsigned channel = s->mcasp_dma_request[instance].channel;
+    unsigned words = s->mcasp_dma_request[instance].words;
+    uint32_t source = s->mcasp_dma_request[instance].source;
+    int16_t step = s->mcasp_dma_request[instance].source_step;
+    uint8_t bytes[64][4];
+    uint32_t fifo = s->mcasp[instance].config[
+        ARRAY_SIZE(rcc_mcasp_config) - 2];
+
+    if (!(fifo & BIT(16))) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "mh2p-rcc: DSP1 EDMA channel%u submitted transfer "
+                      "lost its WFIFO before delivery\n", channel);
+        goto failed;
+    }
+    if (words > 64 - s->mcasp[instance].tx_fifo_level) {
+        return;
+    }
+    for (unsigned n = 0; n < words; n++) {
+        MemTxResult result = s->dsp1 ?
+            mh2p_rcc_dsp_dma_read(s->dsp1, source, bytes[n], 4) :
+            address_space_read(&address_space_memory, source,
+                               MEMTXATTRS_UNSPECIFIED, bytes[n], 4);
+
+        if (result != MEMTX_OK) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "mh2p-rcc: DSP1 EDMA channel%u submitted transfer "
+                          "source fault at 0x%x result=%u\n",
+                          channel, source, result);
+            goto failed;
+        }
+        source += step;
+    }
+    for (unsigned n = 0; n < words; n++) {
+        if (!rcc_mcasp_fifo_write(s, instance, ldl_le_p(bytes[n]))) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "mh2p-rcc: DSP1 EDMA channel%u submitted transfer "
+                          "WFIFO space changed during delivery\n", channel);
+            goto failed;
+        }
+    }
+    s->mcasp_dma_request[instance].pending = false;
+    rcc_mcasp_dma_schedule(s);
+    return;
+
+failed:
+    s->mcasp_dma_request[instance].pending = false;
+    s->mcasp_dma_blocked[instance] = true;
+}
+
+static void rcc_mcasp_dma(void *opaque)
+{
+    MH2PRCCMachineState *s = opaque;
+
+    for (unsigned i = 0; i < ARRAY_SIZE(s->mcasp); i++) {
+        uint32_t fifo = s->mcasp[i].config[
+            ARRAY_SIZE(rcc_mcasp_config) - 2];
+        unsigned words = (fifo >> 8) & 0xff;
+        uint32_t format = 0;
+
+        if (s->mcasp_dma_request[i].pending) {
+            rcc_mcasp_dma_finish_early(s, i);
+            continue;
+        }
+        for (unsigned n = 0; n < ARRAY_SIZE(rcc_mcasp_config); n++) {
+            if (rcc_mcasp_config[n].offset == 0xa8) {
+                format = s->mcasp[i].config[n];
+            }
+        }
+        if (!(fifo & BIT(16)) || !words || (format & BIT(3)) ||
+            words > 64 - s->mcasp[i].tx_fifo_level ||
+            s->mcasp_dma_blocked[i]) {
+            continue;
+        }
+        for (unsigned channel = 0; channel < 20; channel++) {
+            unsigned route = (s->dsp_dma_route[channel / 2] >>
+                              ((channel % 2) * 16)) & 0xff;
+            uint64_t enabled = s->dsp_edma_enable;
+
+            for (unsigned region = 0; region < 8; region++) {
+                enabled |= s->dsp_edma_region_enable[region] &
+                           s->dsp_edma_drae[region];
+            }
+            if (route != 129 + i * 2 || !(enabled & BIT_ULL(channel))) {
+                continue;
+            }
+            if (!rcc_mcasp_dma_transfer(s, i, channel)) {
+                s->mcasp_dma_blocked[i] = true;
+                s->dsp_edma_missed |= BIT_ULL(channel);
+            } else {
+                rcc_mcasp_dma_schedule(s);
+            }
+            break;
+        }
+    }
+}
+
+static void rcc_mcasp_serializer_reset(MH2PRCCMachineState *s, unsigned instance,
+                                       uint32_t old, uint32_t value)
+{
+    if (!((old ^ value) & BIT(10))) {
+        return;
+    }
+    memset(s->mcasp[instance].tx_buffer, 0,
+           sizeof(s->mcasp[instance].tx_buffer));
+    for (unsigned n = 0; n < ARRAY_SIZE(s->mcasp[instance].serializer); n++) {
+        uint32_t *serializer = &s->mcasp[instance].serializer[n];
+
+        *serializer &= ~BIT(4);
+        if ((value & BIT(10)) && (*serializer & 3) == 1) {
+            *serializer |= BIT(4);
+        }
+    }
+    if (rcc_mcasp_tx_ready(s, instance)) {
+        s->mcasp[instance].tx_status |= BIT(5);
+    }
+    rcc_mcasp_tx_update(s, instance);
+}
+
+static void rcc_mcasp_tx_load(MH2PRCCMachineState *s, unsigned instance)
+{
+    for (unsigned n = 0; n < ARRAY_SIZE(s->mcasp[instance].serializer); n++) {
+        uint32_t *serializer = &s->mcasp[instance].serializer[n];
+
+        if ((*serializer & 3) != 1) {
+            continue;
+        }
+        if (*serializer & BIT(4)) {
+            s->mcasp[instance].tx_status |= BIT(0);
+            s->mcasp[instance].tx_underrun = true;
+        } else {
+            s->mcasp[instance].tx_shift[n] =
+                s->mcasp[instance].tx_buffer[n];
+        }
+        *serializer |= BIT(4);
+        s->mcasp[instance].tx_status |= BIT(5);
+    }
+    if (s->mcasp[instance].tx_underrun) {
+        memset(s->mcasp[instance].tx_shift, 0,
+               sizeof(s->mcasp[instance].tx_shift));
+    }
+    rcc_mcasp_tx_update(s, instance);
+}
+
+static void rcc_mcasp_tx_start(MH2PRCCMachineState *s, unsigned instance,
+                                uint32_t old, uint32_t value)
+{
+    if (!(value & BIT(11))) {
+        memset(s->mcasp[instance].tx_shift, 0,
+               sizeof(s->mcasp[instance].tx_shift));
+        s->mcasp[instance].tx_underrun = false;
+        s->mcasp[instance].tx_slot = 0;
+        s->mcasp[instance].tx_frame_started = false;
+    } else if (!(old & BIT(11))) {
+        rcc_mcasp_tx_load(s, instance);
+    }
+}
+
+static bool rcc_mcasp_tx_frame_config(MH2PRCCMachineState *s, unsigned i,
+                                      uint32_t *bits, uint32_t *slots)
+{
+    uint32_t format = 0, frame = 0, dit = 0;
+
+    for (unsigned n = 0; n < ARRAY_SIZE(rcc_mcasp_config); n++) {
+        switch (rcc_mcasp_config[n].offset) {
+        case 0x50:
+            dit = s->mcasp[i].config[n];
+            break;
+        case 0xa8:
+            format = s->mcasp[i].config[n];
+            break;
+        case 0xac:
+            frame = s->mcasp[i].config[n];
+            break;
+        }
+    }
+    *bits = (((format >> 4) & 15) + 1) * 2;
+    *slots = (frame >> 7) & 0x1ff;
+    return !dit && (frame & BIT(1)) && *slots >= 2 && *slots <= 32 &&
+           *bits >= 8 && !(*bits & 3);
+}
+
+static void rcc_mcasp_tx_schedule(MH2PRCCMachineState *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t next = INT64_MAX;
+
+    for (unsigned i = 0; i < ARRAY_SIZE(s->mcasp); i++) {
+        uint32_t bits, slots;
+        uint32_t hz = rcc_mcasp_serial_hz(s, i, true);
+
+        if ((s->mcasp[i].reset_latched & 0x1f00) != 0x1f00 ||
+            !hz || !rcc_mcasp_tx_frame_config(s, i, &bits, &slots)) {
+            s->mcasp[i].tx_deadline = 0;
+            if (!(s->mcasp[i].reset_latched & BIT(12))) {
+                s->mcasp[i].tx_frame_started = false;
+                s->mcasp[i].tx_slot = 0;
+            }
+            continue;
+        }
+        if (!s->mcasp[i].tx_deadline || s->mcasp[i].tx_hz != hz ||
+            s->mcasp[i].tx_slot_bits != bits ||
+            s->mcasp[i].tx_slots != slots) {
+            if (s->mcasp[i].tx_hz != hz ||
+                s->mcasp[i].tx_slot_bits != bits ||
+                s->mcasp[i].tx_slots != slots) {
+                s->mcasp[i].tx_slot = 0;
+                s->mcasp[i].tx_frame_started = false;
+            }
+            s->mcasp[i].tx_hz = hz;
+            s->mcasp[i].tx_slot_bits = bits;
+            s->mcasp[i].tx_slots = slots;
+            s->mcasp[i].tx_phase = hz - 1 +
+                (uint64_t)bits * NANOSECONDS_PER_SECOND;
+            s->mcasp[i].tx_deadline = now + s->mcasp[i].tx_phase / hz;
+            s->mcasp[i].tx_phase %= hz;
+            if (!s->mcasp[i].tx_frame_started && !s->mcasp[i].tx_slot) {
+                for (unsigned n = 0; n < ARRAY_SIZE(rcc_mcasp_config); n++) {
+                    if (rcc_mcasp_config[n].offset == 0xb8) {
+                        s->mcasp[i].tx_frame_started =
+                            s->mcasp[i].config[n] & BIT(0);
+                    }
+                }
+            }
+        }
+        next = MIN(next, s->mcasp[i].tx_deadline);
+    }
+    if (next != INT64_MAX) {
+        timer_mod(s->mcasp_tx_timer, next);
+    } else {
+        timer_del(s->mcasp_tx_timer);
+    }
+}
+
+static void rcc_mcasp_tx_tick(void *opaque)
+{
+    MH2PRCCMachineState *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    for (unsigned i = 0; i < ARRAY_SIZE(s->mcasp); i++) {
+        uint32_t active = 0;
+
+        if (!s->mcasp[i].tx_deadline || s->mcasp[i].tx_deadline > now) {
+            continue;
+        }
+        s->mcasp[i].tx_slot =
+            (s->mcasp[i].tx_slot + 1) % s->mcasp[i].tx_slots;
+        for (unsigned n = 0; n < ARRAY_SIZE(rcc_mcasp_config); n++) {
+            if (rcc_mcasp_config[n].offset == 0xb8) {
+                active = s->mcasp[i].config[n];
+            }
+        }
+        if ((active & BIT(s->mcasp[i].tx_slot)) &&
+            !s->mcasp[i].tx_underrun) {
+            /* Each active slot consumes one word per transmit serializer. */
+            if (s->mcasp[i].tx_frame_started) {
+                rcc_mcasp_tx_load(s, i);
+            } else {
+                s->mcasp[i].tx_frame_started = true;
+            }
+        }
+        s->mcasp[i].tx_phase +=
+            (uint64_t)s->mcasp[i].tx_slot_bits * NANOSECONDS_PER_SECOND;
+        s->mcasp[i].tx_deadline +=
+            s->mcasp[i].tx_phase / s->mcasp[i].tx_hz;
+        s->mcasp[i].tx_phase %= s->mcasp[i].tx_hz;
+    }
+    rcc_mcasp_tx_schedule(s);
+}
+
+static void rcc_mcasp_sync(void *opaque)
+{
+    MH2PRCCMachineState *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t next = INT64_MAX;
+
+    for (unsigned i = 0; i < ARRAY_SIZE(s->mcasp); i++) {
+        for (unsigned direction = 0; direction < 2; direction++) {
+            uint32_t mask = direction ? 0x1f00 : 0x7;
+            uint32_t pending = s->mcasp[i].reset_request & mask;
+            uint32_t frequency = rcc_mcasp_serial_hz(s, i, direction);
+            int64_t *deadline = &s->mcasp[i].sync_deadline[direction];
+
+            if (direction && (pending & 0x700) != 0x700) {
+                pending &= ~BIT(11);
+            }
+            if (direction) {
+                uint32_t bits, slots;
+
+                if ((pending & 0xf00) != 0xf00 ||
+                    !rcc_mcasp_tx_frame_config(s, i, &bits, &slots)) {
+                    pending &= ~BIT(12);
+                }
+            }
+            if (!frequency ||
+                pending == (s->mcasp[i].reset_latched & mask)) {
+                *deadline = 0;
+                continue;
+            }
+            if (!*deadline) {
+                *deadline = now + DIV_ROUND_UP(NANOSECONDS_PER_SECOND,
+                                               frequency);
+            }
+            if (*deadline <= now) {
+                uint32_t old = s->mcasp[i].reset_latched;
+
+                s->mcasp[i].reset_latched =
+                    (s->mcasp[i].reset_latched & ~mask) | pending;
+                rcc_mcasp_serializer_reset(s, i, old,
+                                           s->mcasp[i].reset_latched);
+                rcc_mcasp_tx_start(s, i, old,
+                                   s->mcasp[i].reset_latched);
+                *deadline = 0;
+            } else {
+                next = MIN(next, *deadline);
+            }
+        }
+    }
+    if (next != INT64_MAX) {
+        timer_mod(s->mcasp_sync_timer, next);
+    } else {
+        timer_del(s->mcasp_sync_timer);
+    }
+    rcc_mcasp_tx_schedule(s);
+}
+
+static void rcc_mlb_peer_reset(void *opaque, int line, int level)
+{
+    MH2PRCCMachineState *s = opaque;
+
+    s->mlb_peer_reset_released = level;
+    for (unsigned i = 0; i < ARRAY_SIZE(s->mcasp); i++) {
+        memset(s->mcasp[i].sync_deadline, 0,
+               sizeof(s->mcasp[i].sync_deadline));
+    }
+    rcc_mcasp_sync(s);
+}
+
+static MemTxResult rcc_mcasp_read(MH2PRCCMachineState *s, unsigned instance,
+                                 hwaddr reg, uint64_t *value)
+{
+    for (unsigned i = 0; i < ARRAY_SIZE(rcc_mcasp_config); i++) {
+        if (reg == rcc_mcasp_config[i].offset) {
+            *value = s->mcasp[instance].config[i];
+            return MEMTX_OK;
+        }
+    }
+    if (reg >= 0x180 && reg < 0x180 + (instance < 2 ? 16 : 4) * 4 &&
+        !(reg & 3)) {
+        *value = s->mcasp[instance].serializer[(reg - 0x180) / 4];
+        return MEMTX_OK;
+    }
+    if (s->mlb_clock_peer &&
+        reg >= 0x200 && reg < 0x200 + (instance < 2 ? 16 : 4) * 4 &&
+        !(reg & 3)) {
+        *value = s->mcasp[instance].tx_buffer[(reg - 0x200) / 4];
+        return MEMTX_OK;
+    }
+    switch (reg) {
+    case 0:
+        *value = 0x44300800;
+        return MEMTX_OK;
+    case 0x44: case 0x60: case 0xa0:
+        *value = s->mcasp[instance].reset_latched &
+                 (reg == 0x60 ? 0x1f : reg == 0xa0 ? 0x1f00 : 0x1f1f);
+        return MEMTX_OK;
+    case 0xc0:
+        *value = s->mcasp[instance].tx_status |
+                 ((s->mcasp[instance].tx_status & 0x87) ? BIT(8) : 0);
+        return MEMTX_OK;
+    case 0xc4:
+        *value = s->mlb_clock_peer ?
+                 ((s->mcasp[instance].reset_latched & BIT(11)) ?
+                  s->mcasp[instance].tx_slot : 0x17f) : 0;
+        return MEMTX_OK;
+    case 0x80: /* No receive samples or clock-check counter are modeled. */
+    case 0x84:
+    case 0xd0: /* Unsupported clock-adjustment hardware remains disabled. */
+        *value = 0;
+        return MEMTX_OK;
+    case 0x1004:
+        *value = s->mcasp[instance].tx_fifo_level;
+        return MEMTX_OK;
+    case 0x100c:
+        /* No receive samples enter while the receiver is held in reset. */
+        *value = 0;
+        return MEMTX_OK;
+    }
+    qemu_log_mask(LOG_UNIMP, "mh2p-rcc: unsupported McASP%u read at "
+                  "0x%" HWADDR_PRIx "\n", instance + 1,
+                  reg + rcc_mcasp_gblctl[instance] - 0x44);
+    *value = 0;
+    return MEMTX_ERROR;
+}
+
+static MemTxResult rcc_mcasp_write(MH2PRCCMachineState *s, unsigned instance,
+                                  hwaddr reg, uint32_t value)
+{
+    for (unsigned i = 0; i < ARRAY_SIZE(rcc_mcasp_config); i++) {
+        if (reg != rcc_mcasp_config[i].offset) {
+            continue;
+        }
+        if ((reg == 4 && (value & 3) == 3) ||
+            ((reg == 0x70 || reg == 0x74 ||
+              reg == 0xb0 || reg == 0xb4) && (value & 0x1f0000)) ||
+            (reg == 0x1000 &&
+             ((value & ~0x1ffffU) || (value & 0xff) > 16 ||
+              ((value >> 8) & 0xff) > 64 ||
+              ((value & 0x10000) &&
+               (!(value & 0xff) || !((value >> 8) & 0xff))))) ||
+            (reg == 0x1008 &&
+             ((value & ~0x1ffffU) || (value & 0xff) > 16 ||
+              ((value >> 8) & 0xff) > 64 ||
+              ((value & 0x10000) &&
+               (!s->mlb_clock_peer || (s->mcasp[instance].reset_request & 0x1f) ||
+                !(value & 0xff) || !((value >> 8) & 0xff) ||
+                (!(s->mcasp[instance].config[i] & 0x10000) &&
+                 ((value ^ s->mcasp[instance].config[i]) & 0xffff))))))) {
+            goto unsupported;
+        }
+        if (reg == 0x1000) {
+            uint32_t old = s->mcasp[instance].config[i];
+
+            if ((old & 0x10000) &&
+                ((value ^ old) & 0xffff)) {
+                goto unsupported;
+            }
+            if (!(value & 0x10000)) {
+                s->mcasp[instance].tx_fifo_head = 0;
+                s->mcasp[instance].tx_fifo_level = 0;
+            }
+        }
+        if (reg == 0x1008 &&
+            (s->mcasp[instance].config[i] & 0x10000) &&
+            ((value ^ s->mcasp[instance].config[i]) & 0xffff)) {
+            goto unsupported;
+        }
+        /* Reserved RW fields retain state; counters and WO fields do not. */
+        s->mcasp[instance].config[i] = value & rcc_mcasp_config[i].writable;
+        memset(s->mcasp[instance].sync_deadline, 0,
+               sizeof(s->mcasp[instance].sync_deadline));
+        rcc_mcasp_sync(s);
+        if (s->mlb_clock_peer &&
+            (reg == 0xa8 || reg == 0xbc || reg == 0xcc || reg == 0x1000)) {
+            rcc_mcasp_tx_update(s, instance);
+        }
+        return MEMTX_OK;
+    }
+    if (reg >= 0x200 && reg < 0x200 + (instance < 2 ? 16 : 4) * 4 &&
+        !(reg & 3)) {
+        uint32_t format = 0;
+
+        for (unsigned n = 0; n < ARRAY_SIZE(rcc_mcasp_config); n++) {
+            if (rcc_mcasp_config[n].offset == 0xa8) {
+                format = s->mcasp[instance].config[n];
+            }
+        }
+        if (s->mlb_clock_peer) {
+            unsigned n = (reg - 0x200) / 4;
+
+            if (!(format & BIT(3))) {
+                goto unsupported;
+            }
+            s->mcasp[instance].tx_buffer[n] = value;
+            s->mcasp[instance].serializer[n] &= ~BIT(4);
+            rcc_mcasp_tx_update(s, instance);
+            return MEMTX_OK;
+        }
+        if (!rcc_mcasp_fifo_write(s, instance, value)) {
+            goto unsupported;
+        }
+        return MEMTX_OK;
+    }
+    if (reg >= 0x180 && reg < 0x180 + (instance < 2 ? 16 : 4) * 4 &&
+        !(reg & 3)) {
+        if ((value & 3) == 3 || ((value >> 2) & 3) == 1) {
+            goto unsupported;
+        }
+        unsigned n = (reg - 0x180) / 4;
+        uint32_t ready = (value & 3) == 1 ?
+                          s->mcasp[instance].serializer[n] & BIT(4) : 0;
+
+        s->mcasp[instance].serializer[n] = (value & ~0x30U) | ready;
+        if (s->mlb_clock_peer) {
+            rcc_mcasp_tx_update(s, instance);
+        }
+        return MEMTX_OK;
+    }
+    switch (reg) {
+    case 0x44: case 0x60: case 0xa0:
+        if (!(value & ~0x1f1fU)) {
+            uint32_t mask = reg == 0x60 ? 0x1f :
+                            reg == 0xa0 ? 0x1f00 : 0x1f1f;
+            uint32_t request = (s->mcasp[instance].reset_request & ~mask) |
+                               (value & mask);
+
+            if (!s->mlb_clock_peer &&
+                request && request != s->mcasp[instance].reset_request) {
+                qemu_log_mask(LOG_UNIMP, "mh2p-rcc: McASP%u reset request "
+                              "0x%x cannot synchronize: serial clocks "
+                              "are not connected\n", instance + 1, request);
+            }
+            uint32_t bits, slots;
+            bool frame_supported =
+                rcc_mcasp_tx_frame_config(s, instance, &bits, &slots);
+            uint32_t unsupported_request = (request & ~0x1f07U) |
+                (!frame_supported ? request & BIT(12) : 0);
+
+            if (s->mlb_clock_peer && unsupported_request) {
+                qemu_log_mask(LOG_UNIMP, "mh2p-rcc: McASP%u "
+                              "state-machine/frame reset request 0x%x is not "
+                              "implemented by the clock peer\n",
+                              instance + 1, unsupported_request);
+            }
+            /* GBLCTL readback is clock-synchronized, not the pending write. */
+            s->mcasp[instance].reset_request = request;
+            memset(s->mcasp[instance].sync_deadline, 0,
+                   sizeof(s->mcasp[instance].sync_deadline));
+            rcc_mcasp_sync(s);
+            return MEMTX_OK;
+        }
+        break;
+    case 0xd0:
+        if (!value) {
+            return MEMTX_OK;
+        }
+        break;
+    case 0xc0:
+        s->mcasp[instance].tx_status &= ~(value & (BIT(0) | BIT(5)));
+        if (s->mlb_clock_peer) {
+            rcc_mcasp_tx_update(s, instance);
+        }
+        return MEMTX_OK;
+    case 0x80:
+        /* W1C cannot create a receive/transmit event while held in reset. */
+        return MEMTX_OK;
+    }
+unsupported:
+    qemu_log_mask(LOG_UNIMP, "mh2p-rcc: unsupported McASP%u write at "
+                  "0x%" HWADDR_PRIx " value=0x%x\n", instance + 1,
+                  reg + rcc_mcasp_gblctl[instance] - 0x44, value);
+    return MEMTX_ERROR;
+}
+
 static MemTxResult rcc_unknown_read(void *opaque, hwaddr offset,
                                    uint64_t *value, unsigned size,
                                    MemTxAttrs attrs)
 {
     MH2PRCCMachineState *s = opaque;
 
+    if (s->power_clocks && s->mlb_clock_peer &&
+        offset + 0x40000000 >= 0x4a002cf8 &&
+        offset + 0x40000000 < 0x4a002d20 &&
+        size == 4 && !(offset & 3)) {
+        *value = s->dsp_dma_route[(offset + 0x40000000 - 0x4a002cf8) / 4];
+        return MEMTX_OK;
+    }
+    for (unsigned i = 0; s->power_clocks && i < ARRAY_SIZE(s->mcasp); i++) {
+        hwaddr reg = offset + 0x40000000 - (rcc_mcasp_gblctl[i] - 0x44);
+
+        if (size == 4 && !(reg & 3) && reg < 0x1010) {
+            return rcc_mcasp_read(s, i, reg, value);
+        }
+    }
     for (unsigned i = 0;
          s->power_clocks && i < ARRAY_SIZE(rcc_bypass_dplls); i++) {
         hwaddr reg = offset + 0x40000000 - rcc_bypass_dplls[i].base;
@@ -4212,6 +5471,9 @@ static MemTxResult rcc_unknown_read(void *opaque, hwaddr offset,
     case 0x4a00279c:
         *value = s->mlb_clock;
         return MEMTX_OK;
+    case 0x4ae06130:
+        *value = s->mlb_mcasp_clkselect;
+        return MEMTX_OK;
     case 0x4842c4c0:
     case 0x4842c4c4:
     case 0x4842c4c8:
@@ -4295,6 +5557,47 @@ static MemTxResult rcc_unknown_read(void *opaque, hwaddr offset,
         /* CM_CLKSEL_SYS: board fixture uses a 20 MHz SYS_CLKIN1. */
         *value = 2;
         return MEMTX_OK;
+    case 0x4ae06410:
+        if (size != 4) {
+            break;
+        }
+        *value = s->dsp1_reset_control;
+        return MEMTX_OK;
+    case 0x4ae06400:
+    case 0x4ae06404:
+        if (size != 4) {
+            break;
+        }
+        /* Fixed powered reset domain; power transitions are not implemented. */
+        *value = offset + 0x40000000 == 0x4ae06400 ? 0x3f0003 : 0x3f7;
+        return MEMTX_OK;
+    case 0x4a005400:
+        if (size != 4) {
+            break;
+        }
+        *value = s->dsp1_clkstctrl |
+                 ((s->dsp1_clkctrl && s->dsp1_clkstctrl != 1) ? BIT(8) : 0);
+        return MEMTX_OK;
+    case 0x4a005420:
+        if (size != 4) {
+            break;
+        }
+        *value = s->dsp1_clkctrl |
+                 (s->dsp1_clkctrl && s->dsp1_clkstctrl != 1 ?
+                  (s->dsp1_reset_asserted ? 0x50000 : 0) : 0x70000);
+        return MEMTX_OK;
+    case 0x4ae06414:
+        if (size != 4) {
+            break;
+        }
+        *value = s->dsp1_reset_status;
+        return MEMTX_OK;
+    case 0x4a00255c:
+        if (size != 4) {
+            break;
+        }
+        *value = s->dsp1_vector;
+        return MEMTX_OK;
     case 0x4a005160:
     case 0x4a005164:
     case 0x4a005168:
@@ -4333,6 +5636,88 @@ static MemTxResult rcc_unknown_write(void *opaque, hwaddr offset,
 {
     MH2PRCCMachineState *s = opaque;
 
+    if (s->power_clocks && s->mlb_clock_peer &&
+        offset + 0x40000000 >= 0x4a002cf8 &&
+        offset + 0x40000000 < 0x4a002d20) {
+        if (size != 4 || (offset & 3) || (value & ~0x00ff00ffU) ||
+            s->mmr_lock2 != 0xf757fdc0) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "mh2p-rcc: invalid or locked DSP1 DMA crossbar "
+                          "write at 0x%" HWADDR_PRIx "\n", offset + 0x40000000);
+            return MEMTX_ERROR;
+        }
+        s->dsp_dma_route[(offset + 0x40000000 - 0x4a002cf8) / 4] = value;
+        memset(s->mcasp_dma_blocked, 0, sizeof(s->mcasp_dma_blocked));
+        memset(s->mcasp_dma_request, 0, sizeof(s->mcasp_dma_request));
+        rcc_mcasp_dma_schedule(s);
+        return MEMTX_OK;
+    }
+    for (unsigned i = 0;
+         s->power_clocks && s->mlb_clock_peer &&
+         i < ARRAY_SIZE(rcc_mcasp_data); i++) {
+        hwaddr reg = offset + 0x40000000 - rcc_mcasp_data[i].base;
+        uint32_t fifo = s->mcasp[i].config[
+            ARRAY_SIZE(rcc_mcasp_config) - 2];
+        uint32_t format = 0;
+
+        if (reg >= rcc_mcasp_data[i].size) {
+            continue;
+        }
+        for (unsigned n = 0; n < ARRAY_SIZE(rcc_mcasp_config); n++) {
+            if (rcc_mcasp_config[n].offset == 0xa8) {
+                format = s->mcasp[i].config[n];
+            }
+        }
+        if (size == 4 && !(reg & 3) && !(format & BIT(3)) &&
+            (fifo & BIT(16)) && rcc_mcasp_fifo_write(s, i, value)) {
+            return MEMTX_OK;
+        }
+        qemu_log_mask(LOG_UNIMP, "mh2p-rcc: unsupported McASP%u DATA "
+                      "write at 0x%" HWADDR_PRIx " size=%u; "
+                      "requires aligned words, DATA format and WFIFO space\n",
+                      i + 1, offset + 0x40000000, size);
+        return MEMTX_ERROR;
+    }
+    for (unsigned i = 0; s->power_clocks && i < ARRAY_SIZE(s->mcasp); i++) {
+        hwaddr reg = offset + 0x40000000 - (rcc_mcasp_gblctl[i] - 0x44);
+
+        if (size == 4 && !(reg & 3) && reg < 0x1010) {
+            return rcc_mcasp_write(s, i, reg, value);
+        }
+    }
+    if (size == 4 && offset + 0x40000000 == 0x4ae06414 &&
+        !(value & ~0xfU)) {
+        s->dsp1_reset_status &= ~value;
+        return MEMTX_OK;
+    }
+    if (size == 4 && offset + 0x40000000 == 0x4ae06410 &&
+        !(value & ~3U) && (s->dsp1 || value == 3)) {
+        s->dsp1_reset_control = value;
+        rcc_dsp1_control(s);
+        return MEMTX_OK;
+    }
+    if (size == 4 && offset + 0x40000000 == 0x4a00255c &&
+        !(value & ~0xff3fffffU)) {
+        s->dsp1_vector = value;
+        return MEMTX_OK;
+    }
+    if (size == 4 && offset + 0x40000000 == 0x4ae06400 &&
+        (value & 3) == 3 && !(value & ~0x3f001fU)) {
+        /* Read-only memory-on fields; the domain is already powered. */
+        return MEMTX_OK;
+    }
+    if (size == 4 && offset + 0x40000000 == 0x4a005400 &&
+        !(value & ~0x103U)) {
+        s->dsp1_clkstctrl = value & 3;
+        rcc_dsp1_control(s);
+        return MEMTX_OK;
+    }
+    if (size == 4 && offset + 0x40000000 == 0x4a005420 &&
+        !(value & ~0x70001U)) {
+        s->dsp1_clkctrl = value & 1;
+        rcc_dsp1_control(s);
+        return MEMTX_OK;
+    }
     if (size == 4 && offset + 0x40000000 == 0x4a002554 &&
         !(value & 0x110000) && (value & 3) != 3 &&
         ((value >> 4) & 3) != 3) {
@@ -4358,10 +5743,28 @@ static MemTxResult rcc_unknown_write(void *opaque, hwaddr offset,
         uint32_t status = reset & 0x70000;
         uint64_t control = value & ~(uint64_t)status;
 
+        if (i < ARRAY_SIZE(s->mcasp) && size == 4 &&
+            offset + 0x40000000 == rcc_disabled_clkctrl[i].address) {
+            uint32_t mask = i < 2 ? 0xffc00003U : 0x0fc00003U;
+            uint32_t selected = value & mask;
+            uint32_t mode = selected & 3;
+
+            if ((value & ~(uint64_t)(mask | 0x30000U)) ||
+                (mode != 0 && mode != 2) ||
+                (selected >> 28) > 0xd ||
+                ((selected >> 24) & 0xf) > 0xd) {
+                break;
+            }
+            s->disabled_clkctrl[i] = selected | (mode == 2 ? 0 : 0x30000);
+            memset(s->mcasp[i].sync_deadline, 0,
+                   sizeof(s->mcasp[i].sync_deadline));
+            rcc_mcasp_sync(s);
+            return MEMTX_OK;
+        }
         if (size == 4 && offset + 0x40000000 ==
             rcc_disabled_clkctrl[i].address &&
             (control == 0 || control == (reset & ~status))) {
-            /* Only the disabled reset clock selections are modeled. */
+            /* Clock selection while disabled does not assert a clock output. */
             s->disabled_clkctrl[i] = control | status;
             return MEMTX_OK;
         }
@@ -4586,6 +5989,16 @@ static MemTxResult rcc_unknown_write(void *opaque, hwaddr offset,
     if (size == 4 && offset + 0x40000000 == 0x4a002698 &&
         !(value & ~7U)) {
         s->mlb_l3_pressure = value;
+        return MEMTX_OK;
+    }
+    if (size == 4 && offset + 0x40000000 == 0x4ae06130 &&
+        value <= 4) {
+        s->mlb_mcasp_clkselect = value;
+        for (unsigned i = 0; i < ARRAY_SIZE(s->mcasp); i++) {
+            memset(s->mcasp[i].sync_deadline, 0,
+                   sizeof(s->mcasp[i].sync_deadline));
+        }
+        rcc_mcasp_sync(s);
         return MEMTX_OK;
     }
     if (size == 4 && offset + 0x40000000 == 0x4a0026d0) {
@@ -4955,6 +6368,24 @@ static void rcc_reset(void *opaque)
     s->edma_epoch++;
     memset(s->edma_queue, 0, sizeof(s->edma_queue));
     s->edma_qemr = 0;
+    memset(s->dsp_edma_registers, 0, sizeof(s->dsp_edma_registers));
+    for (unsigned i = 0; i < ARRAY_SIZE(s->dsp_dma_route); i++) {
+        unsigned first = i < 8 ? 128 + i * 2 : 154 + (i - 8) * 2;
+
+        s->dsp_dma_route[i] = first | ((first + 1) << 16);
+    }
+    memset(s->mcasp_dma_blocked, 0, sizeof(s->mcasp_dma_blocked));
+    timer_del(s->mcasp_dma_timer);
+    timer_del(s->mcasp_tx_timer);
+    memset(s->dsp_edma_param, 0, sizeof(s->dsp_edma_param));
+    s->dsp_edma_event = s->dsp_edma_enable = s->dsp_edma_missed = 0;
+    memset(s->dsp_edma_region_event, 0, sizeof(s->dsp_edma_region_event));
+    memset(s->dsp_edma_region_enable, 0, sizeof(s->dsp_edma_region_enable));
+    memset(s->dsp_edma_region_missed, 0, sizeof(s->dsp_edma_region_missed));
+    s->dsp_edma_ier = s->dsp_edma_ipr = 0;
+    memset(s->dsp_edma_qrae, 0, sizeof(s->dsp_edma_qrae));
+    memset(s->dsp_edma_qeer, 0, sizeof(s->dsp_edma_qeer));
+    memset(s->dsp_edma_drae, 0, sizeof(s->dsp_edma_drae));
     rcc_edma_update_irq(s);
     memset(s->usb_clkctrl, 0, sizeof(s->usb_clkctrl));
     memset(s->usb_phy_clkctrl, 0, sizeof(s->usb_phy_clkctrl));
@@ -4967,6 +6398,7 @@ static void rcc_reset(void *opaque)
     s->mlb_clk_bg_ctrl = 1;
     s->mlb_io_ctrl[0] = s->mlb_io_ctrl[1] = 0x30;
     s->mlb_dll = s->mlb_clock = 0;
+    s->mlb_mcasp_clkselect = 0;
     memset(s->mlb_mdat, 0, sizeof(s->mlb_mdat));
     memset(s->mlb_mdwe, 0, sizeof(s->mlb_mdwe));
     memset(s->mlb_channel_table, 0, sizeof(s->mlb_channel_table));
@@ -4975,6 +6407,11 @@ static void rcc_reset(void *opaque)
         s->mlb_regs[i] = rcc_mlb_registers[i].reset;
     }
     s->ipu1_clkctrl = s->ipu1_firmware ? 1 : 0;
+    s->dsp1_clkctrl = 0;
+    s->dsp1_clkstctrl = 3;
+    s->dsp1_reset_control = s->dsp1_reset_asserted = 3;
+    s->dsp1_reset_status = s->dsp1_vector = 0;
+    rcc_dsp1_control(s);
     s->ipu1_clkstctrl = 3;
     s->ipu1_reset_control = s->ipu1_reset_asserted = 7;
     s->ipu1_reset_status = 0;
@@ -5012,6 +6449,27 @@ static void rcc_reset(void *opaque)
     }
     for (unsigned i = 0; i < ARRAY_SIZE(rcc_disabled_clkctrl); i++) {
         s->disabled_clkctrl[i] = rcc_disabled_clkctrl[i].reset;
+    }
+    if (s->power_clocks &&
+        s->entry != 0x40300000 && s->entry != 0x40340000) {
+        /*
+         * The original IPL enables McASP1/2/3/6/8 and selects MLBP_CLK
+         * before entering QNX startup. This does not supply serial clocks.
+         */
+        for (unsigned i = 0; i < ARRAY_SIZE(s->mcasp); i++) {
+            if ((BIT(0) | BIT(1) | BIT(2) | BIT(5) | BIT(7)) & BIT(i)) {
+                s->disabled_clkctrl[i] = 0x0d000002;
+            }
+        }
+    }
+    memset(s->mcasp, 0, sizeof(s->mcasp));
+    timer_del(s->mcasp_sync_timer);
+    s->mlb_peer_reset_released = false;
+    for (unsigned i = 0; i < ARRAY_SIZE(s->mcasp); i++) {
+        for (unsigned j = 0; j < ARRAY_SIZE(rcc_mcasp_config); j++) {
+            s->mcasp[i].config[j] = rcc_mcasp_config[j].reset;
+        }
+        rcc_mcasp_tx_update(s, i);
     }
     s->pcie_dpll_select = 0x04000000;
     s->pcie_dpll_divider = 1;
@@ -5072,6 +6530,7 @@ static void rcc_reset(void *opaque)
     for (unsigned i = 0; i < ARRAY_SIZE(s->uart); i++) {
         s->uart[i].mdr1 = 7;
         s->uart[i].sysconfig = 0;
+        s->uart[i].efr = 0;
         rcc_uart_set_clock(&s->uart[i], true);
     }
     s->watchdog_stop = 0;
@@ -5096,7 +6555,7 @@ static void rcc_init(MachineState *ms)
 {
     MH2PRCCMachineState *s = (MH2PRCCMachineState *)ms;
     MemoryRegion *sysmem = get_system_memory();
-    DeviceState *gic, *mailbox, *ipu_mmu;
+    DeviceState *gic, *mailbox, *ipu_mmu, *dsp_mmu[2];
     DriveInfo *nor_drive = drive_get(IF_PFLASH, 0, 0);
     PFlashCFI02 *nor;
     g_autofree char *image = NULL;
@@ -5231,6 +6690,9 @@ static void rcc_init(MachineState *ms)
     memory_region_init_io(&s->edma, OBJECT(ms), &rcc_edma_ops, s,
                           "mh2p-rcc-edma-config", 0x10000);
     memory_region_add_subregion(sysmem, 0x43300000, &s->edma);
+    memory_region_init_io(&s->dsp_edma, OBJECT(ms), &rcc_dsp_edma_ops, s,
+                          "mh2p-rcc-dsp1-edma", 0x8000);
+    memory_region_add_subregion(sysmem, 0x40d10000, &s->dsp_edma);
     for (unsigned i = 0; i < ARRAY_SIZE(rcc_gmac_resets); i++) {
         g_autofree char *name = g_strdup_printf("mh2p-rcc-gmac-reset%u", i);
 
@@ -5306,7 +6768,8 @@ static void rcc_init(MachineState *ms)
     qdev_prop_set_bit(DEVICE(s->cpu), "has_el2", false);
     qdev_prop_set_bit(DEVICE(s->cpu), "l2-axi-error-irq", true);
     qdev_prop_set_uint64(DEVICE(s->cpu), "reset-cbar", RCC_GIC_BASE);
-    qdev_prop_set_uint64(DEVICE(s->cpu), "cntfrq", 20000000);
+    /* COUNTER_REALTIME master counter, not the 20 MHz SYS_CLK1 source. */
+    qdev_prop_set_uint64(DEVICE(s->cpu), "cntfrq", 6144000);
     qdev_realize(DEVICE(s->cpu), NULL, &error_fatal);
     define_arm_cp_regs(s->cpu, rcc_cpregs);
     object_unref(OBJECT(s->cpu));
@@ -5380,6 +6843,12 @@ static void rcc_init(MachineState *ms)
     memory_region_add_subregion(sysmem, 0x4a002a48, &s->crossbar.registers);
     s->mpu_watchdog_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                        rcc_mpu_wdt_expired, s);
+    s->mcasp_sync_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                     rcc_mcasp_sync, s);
+    s->mcasp_dma_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                    rcc_mcasp_dma, s);
+    s->mcasp_tx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                   rcc_mcasp_tx_tick, s);
     memory_region_init_io(&s->mpu_watchdog, OBJECT(ms), &rcc_mpu_wdt_ops, s,
                           "mh2p-rcc-mpu-watchdog", 0x18);
     memory_region_add_subregion(sysmem, 0x482a0000, &s->mpu_watchdog);
@@ -5421,10 +6890,22 @@ static void rcc_init(MachineState *ms)
         uart->base = rcc_uarts[i].base;
         uart->irq = s->crossbar.inputs[rcc_uarts[i].irq];
         uart->clock_enabled = true;
+        uart->banked_efr = s->uart_efr;
         uart->core = serial_mm_init(sysmem, rcc_uarts[i].base, 2,
                                    qemu_allocate_irq(rcc_uart_irq, uart, 0),
                                    3000000, serial_hd(rcc_uarts[i].serial),
                                    DEVICE_LITTLE_ENDIAN);
+        /* DRA7 transmit FIFO depth, rather than the 16550 core's 16 bytes. */
+        fifo8_destroy(&uart->core->serial.xmit_fifo);
+        fifo8_create(&uart->core->serial.xmit_fifo, 64);
+        if (uart->banked_efr) {
+            static const uint8_t triggers[] = { 8, 16, 56, 60 };
+            SerialState *serial = &uart->core->serial;
+
+            fifo8_destroy(&serial->recv_fifo);
+            fifo8_create(&serial->recv_fifo, 64);
+            memcpy(serial->recv_fifo_triggers, triggers, sizeof(triggers));
+        }
         memory_region_init_io(&uart->registers, OBJECT(ms), &rcc_uart_ops,
                               uart, "mh2p-rcc-uart", 0x100);
         memory_region_add_subregion_overlap(sysmem, rcc_uarts[i].base,
@@ -5442,6 +6923,10 @@ static void rcc_init(MachineState *ms)
         s->gpio[i] = gpio;
         sysbus_realize_and_unref(SYS_BUS_DEVICE(gpio), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(gpio), 0, gpio_base[i]);
+        if (i == 7 && s->mlb_clock_peer) {
+            qdev_connect_gpio_out_named(gpio, "pins", 19,
+                qemu_allocate_irq(rcc_mlb_peer_reset, s, 0));
+        }
         sysbus_connect_irq(SYS_BUS_DEVICE(gpio), 0,
                            s->crossbar.inputs[irq1[i]]);
         sysbus_connect_irq(SYS_BUS_DEVICE(gpio), 1,
@@ -5507,6 +6992,31 @@ static void rcc_init(MachineState *ms)
     memory_region_add_subregion(sysmem, 0x20000000,
                                 &s->pcie.outbound_window);
     s->init_done.notify = rcc_init_done;
+    for (unsigned i = 0; i < 2; i++) {
+        static const unsigned irqs[] = { 23, 145 };
+        g_autofree char *name = g_strdup_printf("dsp1-mmu%u", i);
+        DeviceState *mmu = qdev_new(TYPE_MH2P_IPU_MMU);
+
+        object_property_add_child(OBJECT(ms), name, OBJECT(mmu));
+        qdev_prop_set_bit(mmu, "stall-cpu", false);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(mmu), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(mmu), 0, 0x40d01000 + i * 0x1000);
+        sysbus_connect_irq(SYS_BUS_DEVICE(mmu), 0, s->crossbar.inputs[irqs[i]]);
+        dsp_mmu[i] = mmu;
+    }
+    if (s->dsp1_backend) {
+        s->dsp1 = mh2p_rcc_dsp_create(OBJECT(ms), dsp_mmu, s->dsp1_backend);
+        s->dsp_crossbar[0].peer = s->crossbar.peer;
+        s->crossbar.peer = &s->dsp_crossbar[0];
+        for (unsigned i = 0; i < 64; i++) {
+            s->dsp_crossbar[0].outputs[i] =
+                qdev_get_gpio_in_named(s->dsp1, "events", i + 32);
+        }
+        for (unsigned i = 0; i < ARRAY_SIZE(dsp_mmu); i++) {
+            sysbus_connect_irq(SYS_BUS_DEVICE(dsp_mmu[i]), 1,
+                              qdev_get_gpio_in_named(s->dsp1, "events", i + 25));
+        }
+    }
     ipu_mmu = qdev_new(TYPE_MH2P_IPU_MMU);
     object_property_add_child(OBJECT(ms), "ipu1-mmu", OBJECT(ipu_mmu));
     sysbus_realize_and_unref(SYS_BUS_DEVICE(ipu_mmu), &error_fatal);
@@ -5604,6 +7114,19 @@ static void rcc_set_ipu1_firmware(Object *obj, const char *value, Error **errp)
     s->ipu1_firmware = g_strdup(value);
 }
 
+static char *rcc_get_dsp1_backend(Object *obj, Error **errp)
+{
+    return g_strdup(((MH2PRCCMachineState *)obj)->dsp1_backend);
+}
+
+static void rcc_set_dsp1_backend(Object *obj, const char *value, Error **errp)
+{
+    MH2PRCCMachineState *s = (MH2PRCCMachineState *)obj;
+
+    g_free(s->dsp1_backend);
+    s->dsp1_backend = g_strdup(value);
+}
+
 static bool rcc_get_ipu1_smp(Object *obj, Error **errp)
 {
     return ((MH2PRCCMachineState *)obj)->ipu1_smp;
@@ -5639,9 +7162,39 @@ static bool rcc_get_power_clocks(Object *obj, Error **errp)
     return ((MH2PRCCMachineState *)obj)->power_clocks;
 }
 
+static bool rcc_get_uart_efr(Object *obj, Error **errp)
+{
+    return ((MH2PRCCMachineState *)obj)->uart_efr;
+}
+
+static void rcc_set_uart_efr(Object *obj, bool value, Error **errp)
+{
+    ((MH2PRCCMachineState *)obj)->uart_efr = value;
+}
+
+static void rcc_get_mcasp_reset_request(Object *obj, Visitor *v,
+                                       const char *name, void *opaque,
+                                       Error **errp)
+{
+    MH2PRCCMachineState *s = (MH2PRCCMachineState *)obj;
+    uint32_t request = s->mcasp[GPOINTER_TO_UINT(opaque)].reset_request;
+
+    visit_type_uint32(v, name, &request, errp);
+}
+
 static void rcc_set_power_clocks(Object *obj, bool value, Error **errp)
 {
     ((MH2PRCCMachineState *)obj)->power_clocks = value;
+}
+
+static bool rcc_get_mlb_clock_peer(Object *obj, Error **errp)
+{
+    return ((MH2PRCCMachineState *)obj)->mlb_clock_peer;
+}
+
+static void rcc_set_mlb_clock_peer(Object *obj, bool value, Error **errp)
+{
+    ((MH2PRCCMachineState *)obj)->mlb_clock_peer = value;
 }
 
 static void rcc_machine_init(MachineClass *mc)
@@ -5672,6 +7225,8 @@ static void rcc_machine_init(MachineClass *mc)
     object_class_property_add_str(OBJECT_CLASS(mc), "experimental-ipu1-firmware",
                                   rcc_get_ipu1_firmware,
                                   rcc_set_ipu1_firmware);
+    object_class_property_add_str(OBJECT_CLASS(mc), "experimental-dsp1-backend",
+                                  rcc_get_dsp1_backend, rcc_set_dsp1_backend);
     object_class_property_add_bool(OBJECT_CLASS(mc), "experimental-ipu1-smp",
                                    rcc_get_ipu1_smp, rcc_set_ipu1_smp);
     object_class_property_add_bool(OBJECT_CLASS(mc), "experimental-ipu1-native",
@@ -5680,6 +7235,18 @@ static void rcc_machine_init(MachineClass *mc)
                                    rcc_get_ipu2_native, rcc_set_ipu2_native);
     object_class_property_add_bool(OBJECT_CLASS(mc), "experimental-power-clocks",
                                    rcc_get_power_clocks, rcc_set_power_clocks);
+    object_class_property_add_bool(OBJECT_CLASS(mc), "experimental-mlb-clock-peer",
+                                   rcc_get_mlb_clock_peer,
+                                   rcc_set_mlb_clock_peer);
+    object_class_property_add_bool(OBJECT_CLASS(mc), "experimental-uart-efr",
+                                   rcc_get_uart_efr, rcc_set_uart_efr);
+    for (unsigned i = 0; i < ARRAY_SIZE(rcc_mcasp_gblctl); i++) {
+        g_autofree char *name = g_strdup_printf("mcasp%u-reset-request", i + 1);
+
+        object_class_property_add(OBJECT_CLASS(mc), name, "uint32",
+                                  rcc_get_mcasp_reset_request, NULL, NULL,
+                                  GUINT_TO_POINTER(i));
+    }
 }
 
 DEFINE_MACHINE_EXTENDED("mh2p-rcc", MACHINE, MH2PRCCMachineState,

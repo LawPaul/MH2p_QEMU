@@ -7,6 +7,7 @@ mh2p_rcc_pcie_iatu(unsigned viewport, uint64_t reg, uint64_t value) "viewport=0x
 mh2p_rcc_qdma(unsigned channel, uint32_t source, uint32_t target, unsigned bytes, unsigned tcc) "channel=%u src=0x%x dst=0x%x bytes=%u tcc=%u"
 mh2p_rcc_uart3_state(const char *operation, uint64_t value, bool clock, unsigned mode, unsigned ier, unsigned lcr, unsigned lsr, unsigned iir, unsigned rx, bool core_irq) "op=%s value=0x%" PRIx64 " clock=%d mode=%u ier=0x%x lcr=0x%x lsr=0x%x iir=0x%x rx=%u core_irq=%d"
 mh2p_rcc_uart3_rhr_origin(int cpu, uint64_t pc, uint64_t value) "cpu=%d pc=0x%" PRIx64 " value=0x%" PRIx64
+mh2p_rcc_gp_timer_write(unsigned timer, uint64_t offset, uint64_t value, unsigned size, uint32_t status, uint32_t enabled, uint32_t control, uint32_t count) "timer=%u offset=0x%" PRIx64 " value=0x%" PRIx64 " size=%u status=0x%x enabled=0x%x control=0x%x count=0x%x"
 
 # omap1.c
 omap1_pwl_clocking_scheme(const char *scheme) "omap1 CLKM: clocking scheme set to %s"

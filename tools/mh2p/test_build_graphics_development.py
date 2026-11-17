@@ -32,6 +32,29 @@ def startup():
 
 
 class GraphicsDevelopmentTests(unittest.TestCase):
+    def test_invalid_poll_budget_is_rejected_before_media_access(self):
+        for value in (-1, 65537, True, 1.5, "4096"):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                    ValueError, "poll spins"):
+                graphics.build("missing", "unused", "/compiler",
+                               experimental_poll_spins=value)
+
+    def test_poll_experiment_is_recorded_and_only_applied_to_screen_adapter(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.make_sources(root)
+            source = root / "source.bin"
+            source.write_bytes(startup())
+            with patch.object(graphics, "ROOT", root), \
+                    patch.object(graphics.subprocess, "run",
+                                 side_effect=self.fake_compile):
+                manifest = graphics.build(source, root / "build", "/compiler",
+                                          experimental_poll_spins=4096)
+            self.assertEqual(manifest["experimental_poll_spins"], 4096)
+            cpu_command, screen_command = manifest["compiler_commands"]
+            self.assertNotIn("-DGLBRIDGE_POLL_SPINS=4096", cpu_command)
+            self.assertIn("-DGLBRIDGE_POLL_SPINS=4096", screen_command)
+
     def test_replaces_only_adapters_and_retains_source_and_checksums(self):
         source = startup()
         before = hashlib.sha256(source).digest()

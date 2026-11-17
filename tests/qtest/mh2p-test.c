@@ -4785,6 +4785,54 @@ static void test_dc_window_scanout(void)
     test_dc_window_scanout_size(33, 33, false);
 }
 
+static void test_dc_window_fault_bounded(void)
+{
+    const uint64_t dc = 0x54200000, mc = 0x70019000;
+    const uint32_t iova = 0x90000000, ptb = 0x80000000;
+    const uint32_t ptes = 0x80001000, physical = 0x80010000;
+    g_autofree char *path = NULL, *options = NULL, *log = NULL;
+    g_autoptr(GError) error = NULL;
+    int fd = g_file_open_tmp("mh2p-dc-fault-XXXXXX", &path, &error);
+    QTestState *s;
+
+    g_assert_no_error(error);
+    g_assert_cmpint(fd, >=, 0);
+    close(fd);
+    options = g_strdup_printf(
+        "-global tegra124-dc.experimental-window-scanout=on "
+        "-d guest_errors -D %s", path);
+    s = start_mh2p(options);
+    qtest_writel(s, mc + 0x10, 1);
+    qtest_writel(s, mc + 0x240, 0x80000007);
+    qtest_writel(s, mc + 0x228, 1U << 1);
+    qtest_writel(s, mc + 0x1c, 7);
+    qtest_writel(s, mc + 0x20, 0x80000000 | (ptb >> 12));
+    qtest_writel(s, ptb + (iova >> 22) * 4, 0x90000000 | (ptes >> 12));
+    qtest_writel(s, ptes, 0x80000000 | (physical >> 12));
+    qtest_writel(s, ptes + 4, 0);
+    qtest_writel(s, 0x600060d0, 0x40305001);
+    qtest_writel(s, 0x600060dc, 0x40000000);
+    dc_test_mode(s, 0, 2);
+    qtest_writel(s, dc + 0xa0, 0x108);
+    qtest_writel(s, dc + 0x108, 1U << 4);
+    qtest_writel(s, dc + 0x1c00, 1U << 30);
+    qtest_writel(s, dc + 0x1c0c, 12);
+    qtest_writel(s, dc + 0x1c14, (32 << 16) | 64);
+    qtest_writel(s, dc + 0x1c18, (32 << 16) | 256);
+    qtest_writel(s, dc + 0x1c24, 0x10001000);
+    qtest_writel(s, dc + 0x1c28, 256);
+    qtest_writel(s, dc + 0x2000, iova);
+    qtest_writel(s, dc + 0x104, 0x303);
+    qtest_clock_step(s, 200000);
+    qtest_quit(s);
+    g_assert_true(g_file_get_contents(path, &log, NULL, &error));
+    g_assert_no_error(error);
+    g_assert_nonnull(strstr(log, "display translation fault at 0x90001000"));
+    g_assert_nonnull(strstr(log, "window 0 DMA fault"));
+    g_assert_null(strstr(log, "display translation fault at 0x90001004"));
+    unlink(path);
+}
+
 static void test_dc_frames_hdmi(void)
 {
     const uint64_t dc = 0x54200000, hdmi = 0x54280000, sync = 0x50003080;
@@ -6099,6 +6147,7 @@ int main(int argc, char **argv)
     qtest_add_func("/mh2p/vic-cpu-method-ops", test_vic_cpu_method_ops);
     qtest_add_func("/mh2p/dc-frames-and-hdmi", test_dc_frames_hdmi);
     qtest_add_func("/mh2p/dc-window-scanout", test_dc_window_scanout);
+    qtest_add_func("/mh2p/dc-window-fault-bounded", test_dc_window_fault_bounded);
     qtest_add_func("/mh2p/dc-window-alpha", test_dc_window_alpha);
     qtest_add_func("/mh2p/dc-two-windows", test_dc_two_windows);
     qtest_add_func("/mh2p/dc-plld2-clock", test_dc_plld2);

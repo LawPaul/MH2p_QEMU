@@ -53,7 +53,7 @@ static void dra7_i2c_end(DRA7I2CState *s)
 {
     i2c_end_transfer(s->bus);
     s->control &= ~(STP | MST);
-    s->status |= BF;
+    s->status |= BF | ARDY;
 }
 
 static void dra7_i2c_pump(DRA7I2CState *s)

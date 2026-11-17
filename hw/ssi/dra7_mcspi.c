@@ -110,13 +110,8 @@ static bool dra7_mcspi_pump(DRA7McSPIState *s, unsigned index)
     while (fifo8_num_used(&c->tx) >= bytes && (!limit || c->words < limit)) {
         uint32_t tx = 0, rx;
 
-        /*
-         * No guessed peer or zero-filled response on an unattached bus.
-         * RX overflow and DMA need their actual engines, not a ready fixture.
-         */
-        if (!ssi_get_cs(s->bus, index) ||
-            (receive && fifo8_num_used(&c->rx) + bytes >
-             dra7_mcspi_capacity(c, true))) {
+        if (receive && fifo8_num_used(&c->rx) + bytes >
+            dra7_mcspi_capacity(c, true)) {
             return false;
         }
         for (unsigned i = 0; i < bytes; i++) {
@@ -124,6 +119,12 @@ static bool dra7_mcspi_pump(DRA7McSPIState *s, unsigned index)
         }
         c->eot = false;
         dra7_mcspi_select(s, index, true);
+        /* SPI has no ACK: an empty SSI bus cannot stop the master's clock. */
+        if (!ssi_get_cs(s->bus, index)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "dra7-mcspi: channel %u transfer without a peripheral; "
+                          "receiving the undriven SSI bus value\n", index);
+        }
         rx = ssi_transfer(s->bus, tx & MAKE_64BIT_MASK(0, bits));
         if (receive) {
             rx &= MAKE_64BIT_MASK(0, bits);
@@ -302,10 +303,9 @@ static MemTxResult dra7_mcspi_write(void *opaque, hwaddr offset,
             if (size < bytes || fifo8_num_used(&c->tx) + bytes >
                 dra7_mcspi_capacity(c, false) ||
                 ((c->control & 1) && !(s->module & 4) &&
-                 (!ssi_get_cs(s->bus, index) ||
-                  (((c->config >> 12) & 3) != 2 &&
-                   fifo8_num_used(&c->rx) + bytes >
-                   dra7_mcspi_capacity(c, true))))) {
+                 ((c->config >> 12) & 3) != 2 &&
+                 fifo8_num_used(&c->rx) + bytes >
+                 dra7_mcspi_capacity(c, true))) {
                 goto unsupported;
             }
             for (unsigned i = 0; i < bytes; i++) {
@@ -362,10 +362,6 @@ static MemTxResult dra7_mcspi_write(void *opaque, hwaddr offset,
                     if (c->config & (FFER | FFEW)) {
                         fifo8_reset(&c->tx);
                         fifo8_reset(&c->rx);
-                    } else if (!(s->module & 4) &&
-                               !fifo8_is_empty(&c->tx) &&
-                               !ssi_get_cs(s->bus, index)) {
-                        goto unsupported;
                     }
                 }
             }

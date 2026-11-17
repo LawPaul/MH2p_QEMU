@@ -25,9 +25,11 @@ class PairedProbeTests(unittest.TestCase):
                   ipu_native=False, ipu_no_trace=False, ipu_no_mmu=False,
                   ipu_trace_exception=False, ipu_trace_capture_failure=False,
                   ipu_sensor=False, ipu_uart_watchdog=False,
+                  ipu_uart_record=b"",
                   native_rstp=False, native_hid=False,
                   manual_startup_isolation=False,
                   rcc_icount_shift=0,
+                  concurrent_startup=False,
                   mnand_overlay=None,
                   ipu_shared_words=(0, 0, 0, 0, 0),
                   ipu_gpio6_data=0,
@@ -74,7 +76,7 @@ class PairedProbeTests(unittest.TestCase):
             if name == "rcc" and ipu_native:
                 (output / "rcc-m4-uart7.log").write_bytes(
                     b"[MAWD] >>> M4 Application WatchDog Failed!!!!!"
-                    if ipu_uart_watchdog else b"")
+                    if ipu_uart_watchdog else ipu_uart_record)
             if name == "rcc" and (ipu_native or ipu_fixture):
                 (output / "rcc-subcpu-uart-wire.bin").write_bytes(b"")
 
@@ -112,6 +114,9 @@ class PairedProbeTests(unittest.TestCase):
             tests[1].cmd.side_effect = read_endpoint
 
         def execute(console, captured, log, command, limit, background=False):
+            if command == probe.SERVER_COMMAND:
+                self.assertEqual(machines[1].cmd.call_args.args,
+                                 ("cont" if concurrent_startup else "stop",))
             if command == probe.PREREQUISITES[1]:
                 captured.extend(b"ifs image checksum is valid\n" * 6)
             if command == "/sbin/pcie_init -v -p0 -r25" and native_link:
@@ -141,7 +146,8 @@ class PairedProbeTests(unittest.TestCase):
             release_from_mmx()
             return {"mmx_reset_release_observed": True}
 
-        def connect_uart(mmx, rcc, directory, destination, input_peer=False):
+        def connect_uart(mmx, rcc, directory, destination, input_peer=False,
+                         persistence_store=None, persistence_catalog=None):
             for name in ("mmx", "rcc"):
                 (destination / f"{name}-uart-wire.bin").write_bytes(b"")
 
@@ -193,6 +199,7 @@ class PairedProbeTests(unittest.TestCase):
                     experimental_rcc_manual_startup_isolation=
                     manual_startup_isolation,
                     experimental_rcc_icount_shift=rcc_icount_shift,
+                    experimental_concurrent_startup=concurrent_startup,
                     mnand_overlay=mnand_overlay)
                 self.assertEqual(stage.call_count, 1 if ipu_native else 0)
                 self.assertEqual(check_network.call_count, 2 if network else 0)
@@ -209,7 +216,7 @@ class PairedProbeTests(unittest.TestCase):
             finally:
                 if (timeout or unsupported or asi_failure or ipu_bad_cpus or
                         ipu_capture_failure or ipu_fault_capture_failure or
-                        ipu_uart_watchdog):
+                        ipu_uart_watchdog or ipu_uart_record):
                     self.assertFalse((output / "result.json").exists())
                 if timeout:
                     for vm in machines:
@@ -217,6 +224,40 @@ class PairedProbeTests(unittest.TestCase):
                 for qtest in tests:
                     qtest.close.assert_called_once_with()
         return result, create, machines, tests
+
+    def test_concurrent_startup_preserves_native_network_acceptance(self):
+        for concurrent in (False, True):
+            with self.subTest(concurrent=concurrent), \
+                    tempfile.TemporaryDirectory() as directory:
+                result, _, _, _ = self.run_probe(
+                    directory, config_transport=True, native_link=True,
+                    pci_server=True, crossboard_init=True, network=True,
+                    concurrent_startup=concurrent)
+                self.assertEqual(result["experimental_concurrent_startup"],
+                                 concurrent)
+                self.assertTrue(result["native_bidirectional_network_verified"])
+
+    def test_concurrent_startup_requires_network_before_filesystem_access(self):
+        with self.assertRaisesRegex(ValueError, "requires native networking"):
+            probe.probe(
+                *[Path("unused")] * 6,
+                experimental_concurrent_startup=True)
+
+    def test_concurrent_startup_cli_is_explicit(self):
+        arguments = [
+            "probe", "--media", "media", "--nor", "nor", "--mnand", "mnand",
+            "--image", "image", "--output", "output", "--network",
+        ]
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled), \
+                    patch.object(probe.sys, "argv", arguments + (
+                        ["--experimental-concurrent-startup"] if enabled else [])), \
+                    patch.object(probe, "probe", return_value={}) as run, \
+                    patch("builtins.print"):
+                probe.main()
+            self.assertEqual(
+                run.call_args.kwargs["experimental_concurrent_startup"], enabled)
+            self.assertTrue(run.call_args.kwargs["network"])
 
     def test_persistent_mnand_is_opt_in_validated_and_not_snapshotted(self):
         for persistent in (False, True):
@@ -280,6 +321,7 @@ class PairedProbeTests(unittest.TestCase):
             "--image", "image", "--output", "output",
         ]
         for extra, shift in (([], 0),
+                             (["--experimental-rcc-icount-shift", "2"], 2),
                              (["--experimental-rcc-icount-shift", "3"], 3)):
             with patch.object(probe.sys, "argv", arguments + extra), \
                     patch.object(probe, "probe", return_value={}) as run, \
@@ -610,15 +652,61 @@ class PairedProbeTests(unittest.TestCase):
                 [{"label": "serial0", "filename": "null"}], {},
                 [{"label": "serial0", "filename": "mh2p-rstp",
                   "frontend-open": True}]]
-            rcc.cmd.side_effect = [[{"label": "serial0", "filename": "null"}]]
+            rcc.cmd.side_effect = [[{"label": "serial0", "filename": "null"}], {}]
             probe.connect_native_uart(mmx, rcc, root, root, input_peer=True)
             call = mmx.cmd.call_args_list[1]
             self.assertEqual(call.args, ("chardev-change",))
             self.assertEqual(call.kwargs["backend"], {
                 "type": "mh2p-rstp",
                 "data": {"logfile": str(root / "mmx-uart-wire.bin")}})
-            self.assertEqual(rcc.cmd.call_count, 1)
+            self.assertEqual(rcc.cmd.call_count, 2)
+            self.assertEqual(rcc.cmd.call_args_list[1].kwargs["backend"], {
+                "type": "file",
+                "data": {"out": str(root / "rcc-uart-wire.bin")}})
             self.assertTrue((root / "rcc-uart-wire.bin").is_file())
+
+    def test_connect_uart_input_peer_selects_persistence_store(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            mmx, rcc = MagicMock(), MagicMock()
+            mmx.cmd.side_effect = [
+                [{"label": "serial0", "filename": "null"}], {}, {},
+                [{"label": "serial0", "filename": "mh2p-rstp",
+                  "frontend-open": True}]]
+            rcc.cmd.side_effect = [[{"label": "serial0", "filename": "null"}], {}]
+            probe.connect_native_uart(mmx, rcc, root, root, input_peer=True,
+                                      persistence_store=root / "store.bin")
+            self.assertEqual(mmx.cmd.call_args_list[2].args, ("qom-set",))
+            self.assertEqual(mmx.cmd.call_args_list[2].kwargs, {
+                "path": "/chardevs/serial0", "property": "persistence-file",
+                "value": str((root / "store.bin").resolve())})
+
+    def test_connect_uart_input_peer_selects_persistence_catalog(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            mmx, rcc = MagicMock(), MagicMock()
+            mmx.cmd.side_effect = [
+                [{"label": "serial0", "filename": "null"}], {}, {},
+                [{"label": "serial0", "filename": "mh2p-rstp",
+                  "frontend-open": True}]]
+            rcc.cmd.side_effect = [[{"label": "serial0", "filename": "null"}], {}]
+            probe.connect_native_uart(mmx, rcc, root, root, input_peer=True,
+                                      persistence_catalog=root / "cat.txt")
+            self.assertEqual(mmx.cmd.call_args_list[2].kwargs, {
+                "path": "/chardevs/serial0", "property": "persistence-catalog",
+                "value": str((root / "cat.txt").resolve())})
+
+    def test_persistence_catalog_requires_input_peer(self):
+        with self.assertRaisesRegex(ValueError, "requires the RSTP input peer"):
+            probe.probe(Path("qemu"), Path("media"), Path("nor"),
+                        Path("mnand"), Path("image"), Path("output"),
+                        rcc_persistence_catalog=Path("cat.txt"))
+
+    def test_persistence_store_requires_input_peer(self):
+        with self.assertRaisesRegex(ValueError, "requires the RSTP input peer"):
+            probe.probe(Path("qemu"), Path("media"), Path("nor"),
+                        Path("mnand"), Path("image"), Path("output"),
+                        rcc_persistence_store=Path("store.bin"))
 
     def test_connect_uart_rejects_in_use_port_before_changing_either_vm(self):
         mmx, rcc = MagicMock(), MagicMock()
@@ -758,6 +846,19 @@ class PairedProbeTests(unittest.TestCase):
                 directory, config_transport=True, native_link=True,
                 pci_server=True, crossboard_init=True, network=True,
                 asi=True, ipu_native=True, ipu_uart_watchdog=True)
+
+    def test_native_reset_requests_reject_healthy_register_snapshot(self):
+        for record in (
+            b"0000061010  [IPC WD] REBOOT ! ! !\n\r",
+            b"0000061063  [M4PW]J6 WD reset req (ID=7)\n\r",
+        ):
+            with self.subTest(record=record), \
+                    tempfile.TemporaryDirectory() as directory, \
+                    self.assertRaisesRegex(RuntimeError, "Native M4 watchdog failure"):
+                self.run_probe(
+                    directory, config_transport=True, native_link=True,
+                    pci_server=True, crossboard_init=True, network=True,
+                    asi=True, ipu_native=True, ipu_uart_record=record)
 
     def test_sensor_fixture_is_explicit_and_applied_on_both_boots(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1752,6 +1853,41 @@ class PairedProbeTests(unittest.TestCase):
             self.assertEqual(result["discarded_bytes"], prefix_size)
             self.assertEqual(result["checksum_valid_frames"], 1)
             self.assertEqual(result["incomplete_frame_bytes"], 0)
+
+    def test_rcc_nor_state_creates_then_reuses_persistence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            base = directory / "base.bin"
+            state = directory / "state.bin"
+            raw = bytearray(b"\xa5" * probe.RCC_PERSISTENCE_OFFSET +
+                            b"\xff" * probe.RCC_PERSISTENCE_SIZE)
+            base.write_bytes(raw)
+            created = probe.prepare_rcc_nor_state(base, state)
+            self.assertTrue(created["created"])
+            self.assertEqual(state.read_bytes(), raw)
+            raw[probe.RCC_PERSISTENCE_OFFSET] = 0
+            state.write_bytes(raw)
+            reused = probe.prepare_rcc_nor_state(base, state)
+            self.assertFalse(reused["created"])
+            self.assertNotEqual(reused["persistence_sha256"],
+                                created["persistence_sha256"])
+            self.assertEqual(state.read_bytes(), raw)
+
+    def test_rcc_nor_state_rejects_changes_outside_persistence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            base = directory / "base.bin"
+            state = directory / "state.bin"
+            raw = bytearray(probe.RCC_PERSISTENCE_OFFSET +
+                            probe.RCC_PERSISTENCE_SIZE)
+            base.write_bytes(raw)
+            raw[0] = 1
+            state.write_bytes(raw)
+            with self.assertRaisesRegex(ValueError, "outside Per1/Per2"):
+                probe.prepare_rcc_nor_state(base, state)
+            base.write_bytes(b"short")
+            with self.assertRaisesRegex(ValueError, "64 MiB"):
+                probe.prepare_rcc_nor_state(base, state)
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@
 #include "hw/arm/mh2p_rcc_mmu.h"
 #include "hw/core/cpu.h"
 #include "hw/core/irq.h"
+#include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "qemu/bswap.h"
 #include "qemu/log.h"
@@ -26,6 +27,7 @@ typedef struct MH2PIPUMMU {
     uint32_t irqstatus, irqenable, fault_address, fault_status, gpr;
     uint32_t tlb_cam[32], tlb_ram[32];
     uint64_t blocked_cpus;
+    bool stall_cpu;
 } MH2PIPUMMU;
 
 OBJECT_DECLARE_SIMPLE_TYPE(MH2PIPUMMU, MH2P_IPU_MMU)
@@ -206,7 +208,7 @@ static MemTxResult ipu_mmu_fault_response(MH2PIPUMMU *s, hwaddr address)
     if (s->gpr & 1) {
         return MEMTX_ERROR;
     }
-    if (!current_cpu || current_cpu->cpu_index >= 64) {
+    if (!s->stall_cpu || !current_cpu || current_cpu->cpu_index >= 64) {
         qemu_log_mask(LOG_UNIMP, "mh2p-ipu-mmu: unsupported stalled "
                       "non-CPU transaction at 0x%" HWADDR_PRIx "\n", address);
         return MEMTX_ERROR;
@@ -473,12 +475,17 @@ static void ipu_mmu_init(Object *obj)
     address_space_init(&s->fault_as, &s->fault_memory, "ipu1-mmu-fault");
 }
 
+static const Property ipu_mmu_properties[] = {
+    DEFINE_PROP_BOOL("stall-cpu", MH2PIPUMMU, stall_cpu, true),
+};
+
 static void ipu_mmu_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     device_class_set_legacy_reset(dc, ipu_mmu_reset);
     dc->vmsd = &ipu_mmu_vmstate;
+    device_class_set_props(dc, ipu_mmu_properties);
     dc->user_creatable = false;
 }
 

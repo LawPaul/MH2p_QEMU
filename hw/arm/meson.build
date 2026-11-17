@@ -102,7 +102,7 @@ arm_common_ss.add(when: 'CONFIG_MHI2_HARMAN', if_true: files('mhi2_harman.c'))
 arm_common_ss.add(when: 'CONFIG_MH2P', if_true: files('mh2p.c'))
 arm_common_ss.add(when: 'CONFIG_MH2P_RCC',
                  if_true: files('mh2p_rcc.c', 'mh2p_rcc_ipu.c',
-                                'mh2p_rcc_mmu.c'))
+                                'mh2p_rcc_mmu.c', 'mh2p_rcc_dsp.c'))
 
 arm_common_ss.add(when: 'CONFIG_ARM_SMMUV3', if_true: files('smmu-common.c'))
 arm_common_ss.add(when: 'CONFIG_COLLIE', if_true: files('collie.c'))

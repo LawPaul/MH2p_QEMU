@@ -114,6 +114,13 @@ static void reset_connection(void)
 
 int main(void)
 {
+    unsigned spins = GLBRIDGE_POLL_SPINS;
+    for (unsigned i = GLBRIDGE_POLL_SPINS; i; i--)
+        assert(transport_poll(&spins));
+    assert(!spins);
+    assert(!transport_poll(&spins));
+    assert(!transport_poll(&spins) && !spins);
+
     reset_connection();
     main_mapping_fails = 1;
     mapping_errno = 1;

@@ -9,10 +9,15 @@
  * that link so the unmodified MMX firmware receives native pointer and
  * keyboard input from any QEMU display.  Explicit vehicle clamp and main
  * power-state inputs are delivered to the original OOC on PWRMAN.
- * Optionally (experimental, see rstp_chr_open) PERSISTENCE requests from the
- * original rccpersistencebackend are answered like an RCC without stored
- * values (PE_NO_SUCH_KEY), and hidcontroller setProperty requests are
- * confirmed with a property report.
+ * The persistence channel serves the original MMX rccpersistencebackend
+ * from an emulated RCC key/value store, optionally backed by a host file.
+ * An optional catalog, extracted from the RCC PERSISTENCE application,
+ * makes missing values answer like the RCC: built-in defaults and
+ * PE_IO_ERROR for its own keys.  Keys the RCC forwards to its M4 (vehicle
+ * coding and identification) read as the catalogued M4 NvM ROM defaults
+ * when the catalog has them, else PE_NO_SUCH_KEY: the M4's UART relay is
+ * not on the link, and leaving them unanswered stalls MMX consumers such
+ * as the HMI.
  *
  * Copyright (c) 2025
  *
@@ -23,9 +28,11 @@
 #include "qemu/module.h"
 #include "qemu/cutils.h"
 #include "qemu/bswap.h"
+#include "qemu/cutils.h"
 #include "qemu/error-report.h"
 #include "qemu/fifo8.h"
 #include "qemu/timer.h"
+#include "qemu/units.h"
 #include "qapi/error.h"
 #include "qapi/visitor.h"
 #include "chardev/char.h"
@@ -59,7 +66,7 @@
 #define RSTP_CHN_WATCHDOG   0xff
 #define RSTP_WATCHDOG_NS    (1000 * SCALE_MS)
 
-#define RSTP_TX_DEPTH       128
+#define RSTP_TX_DEPTH       256
 #define RSTP_TX_WINDOW      8
 #define RSTP_RETRANSMIT_NS  (200 * SCALE_MS)
 #define RSTP_INIT_RETRY_NS  (100 * SCALE_MS)
@@ -67,16 +74,37 @@
 #define RSTP_OUTBUF_SIZE    8192
 
 /*
- * rccpersistencebackend wire format (PersistenceChannel parser): byte 0 high
- * nibble selects the header (0x0_: LE16 namespace + LE16 key; 0x8_: LE32 +
- * LE32), low nibble is the operation. Values carry a LE24 length + data;
- * errors carry one asi.persistence status byte.
+ * rccpersistencebackend messages: a type byte (bit 7 selects 32-bit instead
+ * of 16-bit little-endian namespace and key, the low nibble is the
+ * operation), namespace, key and, for data messages, a 24-bit length.
+ * Reads subscribe; reads and accepted writes are answered with an update
+ * carrying the stored value, failures with an error code.
  */
-#define PERS_OP_REQUEST     0x0
-#define PERS_OP_UPDATE      0x1
-#define PERS_OP_UPDATE2     0x2
-#define PERS_OP_ERROR       0xf
-#define PE_NO_SUCH_KEY      2
+#define PERS_TYPE_WIDE      0x80
+#define PERS_REQ_READ       0x00
+#define PERS_REQ_WRITE      0x72
+#define PERS_RSP_DATA       0x01
+#define PERS_RSP_ERROR      0x0f
+#define PERS_PE_NO_SUCH_NAMESPACE 1
+#define PERS_PE_NO_SUCH_KEY 2
+#define PERS_PE_IO_ERROR    3
+#define PERS_MAX_VALUE      (64 * KiB)
+#define PERS_RX_MAX         (9 + 3 + PERS_MAX_VALUE)
+#define PERS_TX_MAX         (1 * MiB)
+#define PERS_FILE_MAGIC     "MH2PPERS1\n"
+#define PERS_CATALOG_MAGIC  "# MH2P RCC persistence catalog v1"
+
+/* Owner of a catalogued key, as the RCC routes UART subscriptions. */
+enum {
+    PERS_OWNER_RCC,
+    PERS_OWNER_M4,
+};
+
+typedef struct PersCatalogEntry {
+    int owner;
+    uint32_t size;
+    GByteArray *fallback;
+} PersCatalogEntry;
 
 /* Keypanel function IDs consumed by hidcontroller. */
 #define KP_FID_KEY2             0x00
@@ -167,7 +195,13 @@ struct MH2PRstpChardev {
     RstpTxChannel keypanel;
     RstpTxChannel pwrman;
     RstpTxChannel persistence;
-    bool persistence_enabled;
+    GByteArray *pers_rx;
+    GByteArray *pers_tx;
+    GHashTable *pers_store;
+    char *pers_file;
+    GHashTable *pers_catalog;
+    GHashTable *pers_catalog_ns;
+    char *pers_catalog_file;
     bool pwrman_seen;
     int clamp_state;
     int power_state;
@@ -321,7 +355,7 @@ static void rstp_send_data(MH2PRstpChardev *s, uint8_t chn,
 static void rstp_arm_timer(MH2PRstpChardev *s)
 {
     RstpTxChannel *channels[] = { &s->keypanel, &s->pwrman,
-                                   &s->persistence };
+                                  &s->persistence };
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     int64_t deadline = INT64_MAX;
 
@@ -418,6 +452,8 @@ static void rstp_tx_queue(MH2PRstpChardev *s, const uint8_t *data, unsigned len)
     rstp_tx_queue_channel(s, &s->keypanel, data, len);
 }
 
+static void rstp_pers_refill(MH2PRstpChardev *s);
+
 /* Drop queued frames up to and including @sqn. */
 static void rstp_tx_acked(MH2PRstpChardev *s, RstpTxChannel *c, uint8_t sqn)
 {
@@ -441,6 +477,9 @@ static void rstp_tx_acked(MH2PRstpChardev *s, RstpTxChannel *c, uint8_t sqn)
     c->head = (c->head + acknowledged) % RSTP_TX_DEPTH;
     c->count -= acknowledged;
     c->sent_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (c == &s->persistence) {
+        rstp_pers_refill(s);
+    }
     rstp_tx_pump_channel(s, c);
 }
 
@@ -479,7 +518,7 @@ static void rstp_tx_nacked(MH2PRstpChardev *s, RstpTxChannel *c,
 static void rstp_reset_sequences(MH2PRstpChardev *s)
 {
     RstpTxChannel *channels[] = { &s->keypanel, &s->pwrman,
-                                   &s->persistence };
+                                  &s->persistence };
 
     memset(s->rx_last_sqn, 0xff, sizeof(s->rx_last_sqn));
     for (unsigned i = 0; i < ARRAY_SIZE(channels); i++) {
@@ -545,7 +584,7 @@ static void rstp_timer_cb(void *opaque)
 {
     MH2PRstpChardev *s = opaque;
     RstpTxChannel *channels[] = { &s->keypanel, &s->pwrman,
-                                   &s->persistence };
+                                  &s->persistence };
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     if (!s->link_up) {
@@ -629,57 +668,432 @@ static void rstp_handle_pwrman(MH2PRstpChardev *s, const uint8_t *data,
     }
 }
 
-/* Answer each request with PE_NO_SUCH_KEY; consume value writes silently. */
+static uint32_t rstp_pers_le(const uint8_t *p, unsigned width)
+{
+    uint32_t value = 0;
+
+    for (unsigned i = 0; i < width; i++) {
+        value |= (uint32_t)p[i] << (8 * i);
+    }
+    return value;
+}
+
+static GByteArray *rstp_pers_lookup(MH2PRstpChardev *s, uint32_t ns,
+                                    uint32_t key)
+{
+    uint64_t id = (uint64_t)ns << 32 | key;
+
+    return g_hash_table_lookup(s->pers_store, &id);
+}
+
+static void rstp_pers_insert(GHashTable *store, uint32_t ns, uint32_t key,
+                             const uint8_t *data, unsigned len)
+{
+    uint64_t *id = g_new(uint64_t, 1);
+    GByteArray *value = g_byte_array_sized_new(len);
+
+    *id = (uint64_t)ns << 32 | key;
+    g_byte_array_append(value, data, len);
+    g_hash_table_replace(store, id, value);
+}
+
+static GHashTable *rstp_pers_new_store(void)
+{
+    return g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free,
+                                 (GDestroyNotify)g_byte_array_unref);
+}
+
+static gint rstp_pers_compare_ids(gconstpointer a, gconstpointer b,
+                                  gpointer opaque)
+{
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+
+    return x < y ? -1 : x > y;
+}
+
+/* Records: namespace, key and length (32-bit little endian), then data. */
+static void rstp_pers_save(MH2PRstpChardev *s)
+{
+    g_autoptr(GByteArray) image = g_byte_array_new();
+    g_autoptr(GList) ids = NULL;
+    g_autoptr(GError) err = NULL;
+
+    if (!s->pers_file) {
+        return;
+    }
+    g_byte_array_append(image, (const uint8_t *)PERS_FILE_MAGIC,
+                        strlen(PERS_FILE_MAGIC));
+    ids = g_list_sort_with_data(g_hash_table_get_keys(s->pers_store),
+                                rstp_pers_compare_ids, NULL);
+    for (GList *l = ids; l; l = l->next) {
+        uint64_t id = *(uint64_t *)l->data;
+        GByteArray *value = g_hash_table_lookup(s->pers_store, &id);
+        uint8_t header[12];
+
+        stl_le_p(header, id >> 32);
+        stl_le_p(header + 4, (uint32_t)id);
+        stl_le_p(header + 8, value->len);
+        g_byte_array_append(image, header, sizeof(header));
+        g_byte_array_append(image, value->data, value->len);
+    }
+    if (!g_file_set_contents(s->pers_file, (const char *)image->data,
+                             image->len, &err)) {
+        warn_report("mh2p-rstp: cannot save persistence file: %s",
+                    err->message);
+    }
+}
+
+static GHashTable *rstp_pers_load(const char *path, Error **errp)
+{
+    g_autoptr(GHashTable) store = rstp_pers_new_store();
+    g_autofree char *contents = NULL;
+    g_autoptr(GError) err = NULL;
+    const uint8_t *p;
+    size_t len, magic = strlen(PERS_FILE_MAGIC);
+
+    if (!g_file_get_contents(path, &contents, &len, &err)) {
+        if (g_error_matches(err, G_FILE_ERROR, G_FILE_ERROR_NOENT)) {
+            return g_steal_pointer(&store);
+        }
+        error_setg(errp, "cannot read persistence file: %s", err->message);
+        return NULL;
+    }
+    if (len < magic || memcmp(contents, PERS_FILE_MAGIC, magic)) {
+        error_setg(errp, "'%s' is not an MH2P persistence file", path);
+        return NULL;
+    }
+    p = (const uint8_t *)contents + magic;
+    len -= magic;
+    while (len) {
+        uint32_t size;
+
+        if (len < 12 || (size = ldl_le_p(p + 8)) > PERS_MAX_VALUE ||
+            size > len - 12) {
+            error_setg(errp, "truncated or corrupt persistence file '%s'",
+                       path);
+            return NULL;
+        }
+        rstp_pers_insert(store, ldl_le_p(p), ldl_le_p(p + 4), p + 12, size);
+        p += 12 + size;
+        len -= 12 + size;
+    }
+    return g_steal_pointer(&store);
+}
+
+static void rstp_pers_free_entry(gpointer data)
+{
+    PersCatalogEntry *entry = data;
+
+    if (entry->fallback) {
+        g_byte_array_unref(entry->fallback);
+    }
+    g_free(entry);
+}
+
+static bool rstp_pers_parse_u32(const char *text, uint32_t *value)
+{
+    uint64_t v;
+
+    if (qemu_strtou64(text, NULL, 0, &v) || v > UINT32_MAX) {
+        return false;
+    }
+    *value = v;
+    return true;
+}
+
+/*
+ * Catalog lines: "<namespace> <key> rcc|m4 <size> [<default hex>]".  The
+ * owner says whether the RCC answers a missing value itself (PE_IO_ERROR,
+ * or the default) or forwards the subscription to its M4, which serves the
+ * default from its NvM blocks.
+ */
+static bool rstp_pers_load_catalog(const char *path, GHashTable **catalog,
+                                   GHashTable **namespaces, Error **errp)
+{
+    g_autoptr(GHashTable) keys = g_hash_table_new_full(
+        g_int64_hash, g_int64_equal, g_free, rstp_pers_free_entry);
+    g_autoptr(GHashTable) ns_set = g_hash_table_new_full(
+        g_int_hash, g_int_equal, g_free, NULL);
+    g_autofree char *contents = NULL;
+    g_auto(GStrv) lines = NULL;
+    g_autoptr(GError) err = NULL;
+
+    if (!g_file_get_contents(path, &contents, NULL, &err)) {
+        error_setg(errp, "cannot read persistence catalog: %s", err->message);
+        return false;
+    }
+    if (!g_str_has_prefix(contents, PERS_CATALOG_MAGIC)) {
+        error_setg(errp, "'%s' is not an MH2P RCC persistence catalog", path);
+        return false;
+    }
+    lines = g_strsplit(contents, "\n", -1);
+    for (unsigned n = 0; lines[n]; n++) {
+        g_auto(GStrv) f = g_strsplit_set(g_strstrip(lines[n]), " \t", -1);
+        g_autofree char **words = g_new0(char *, g_strv_length(f) + 1);
+        unsigned count = 0;
+        uint32_t ns, key, size;
+        PersCatalogEntry *entry;
+        uint64_t *id;
+        uint32_t *nsp;
+
+        for (unsigned i = 0; f[i]; i++) {
+            if (*f[i]) {
+                words[count++] = f[i];
+            }
+        }
+        if (!count || words[0][0] == '#') {
+            continue;
+        }
+        if ((count != 4 && count != 5) ||
+            !rstp_pers_parse_u32(words[0], &ns) ||
+            !rstp_pers_parse_u32(words[1], &key) ||
+            (strcmp(words[2], "rcc") && strcmp(words[2], "m4")) ||
+            !rstp_pers_parse_u32(words[3], &size) || size > PERS_MAX_VALUE ||
+            (count == 5 && strlen(words[4]) != 2 * size)) {
+            goto invalid;
+        }
+        entry = g_new0(PersCatalogEntry, 1);
+        entry->owner = strcmp(words[2], "rcc") ? PERS_OWNER_M4 :
+                                                 PERS_OWNER_RCC;
+        entry->size = size;
+        if (count == 5) {
+            entry->fallback = g_byte_array_sized_new(size);
+            for (uint32_t i = 0; i < size; i++) {
+                int hi = g_ascii_xdigit_value(words[4][2 * i]);
+                int lo = g_ascii_xdigit_value(words[4][2 * i + 1]);
+                uint8_t byte = hi << 4 | lo;
+
+                if (hi < 0 || lo < 0) {
+                    rstp_pers_free_entry(entry);
+                    goto invalid;
+                }
+                g_byte_array_append(entry->fallback, &byte, 1);
+            }
+        }
+        id = g_new(uint64_t, 1);
+        *id = (uint64_t)ns << 32 | key;
+        g_hash_table_replace(keys, id, entry);
+        nsp = g_new(uint32_t, 1);
+        *nsp = ns;
+        g_hash_table_add(ns_set, nsp);
+        continue;
+invalid:
+        error_setg(errp, "%s:%u: invalid persistence catalog line",
+                   path, n + 1);
+        return false;
+    }
+    *catalog = g_steal_pointer(&keys);
+    *namespaces = g_steal_pointer(&ns_set);
+    return true;
+}
+
+static void rstp_pers_reset_channel(MH2PRstpChardev *s)
+{
+    g_byte_array_set_size(s->pers_rx, 0);
+    g_byte_array_set_size(s->pers_tx, 0);
+    s->persistence.head = 0;
+    s->persistence.count = 0;
+}
+
+/* Move pending reply bytes into free frames of the persistence queue. */
+static void rstp_pers_refill(MH2PRstpChardev *s)
+{
+    RstpTxChannel *c = &s->persistence;
+    GByteArray *tx = s->pers_tx;
+    unsigned used = 0;
+
+    while (used < tx->len && c->count < RSTP_TX_DEPTH) {
+        unsigned n = MIN(tx->len - used, RSTP_MAX_DATA);
+
+        rstp_tx_queue_channel(s, c, tx->data + used, n);
+        used += n;
+    }
+    g_byte_array_remove_range(tx, 0, used);
+}
+
+/*
+ * The backend reads the remainder of a long value straight from the RSTP
+ * device, so a reply may span frames once its fixed header is complete.
+ * Replies longer than the frame queue wait in pers_tx until ACKs free it.
+ */
+static void rstp_pers_reply(MH2PRstpChardev *s, const uint8_t *data,
+                            unsigned len)
+{
+    if (s->pers_tx->len + len > PERS_TX_MAX) {
+        trace_mh2p_rstp_tx_full(s->persistence.chn, data[0]);
+        return;
+    }
+    g_byte_array_append(s->pers_tx, data, len);
+    rstp_pers_refill(s);
+}
+
+static void rstp_pers_error(MH2PRstpChardev *s, const uint8_t *req,
+                            unsigned header, uint8_t error)
+{
+    g_autofree uint8_t *rsp = g_malloc(header + 1);
+
+    memcpy(rsp, req, header);
+    rsp[0] = (req[0] & PERS_TYPE_WIDE) | PERS_RSP_ERROR;
+    rsp[header] = error;
+    rstp_pers_reply(s, rsp, header + 1);
+}
+
+/* The PE_* error the RCC sends for a key it does not serve at all, or 0. */
+static int rstp_pers_unknown(MH2PRstpChardev *s, uint32_t ns, uint32_t key,
+                             PersCatalogEntry **entry)
+{
+    uint64_t id = (uint64_t)ns << 32 | key;
+
+    *entry = g_hash_table_lookup(s->pers_catalog, &id);
+    if (*entry) {
+        return 0;
+    }
+    return g_hash_table_contains(s->pers_catalog_ns, &ns) ?
+           PERS_PE_NO_SUCH_KEY : PERS_PE_NO_SUCH_NAMESPACE;
+}
+
+/*
+ * Without a catalog every unknown value is PE_NO_SUCH_KEY.  With one, return
+ * the PE_* error to send, or 0 with @value pointing at an RCC built-in
+ * default.
+ */
+static int rstp_pers_missing(MH2PRstpChardev *s, uint32_t ns, uint32_t key,
+                             GByteArray **value)
+{
+    PersCatalogEntry *entry;
+    int error;
+
+    if (!s->pers_catalog) {
+        return PERS_PE_NO_SUCH_KEY;
+    }
+    error = rstp_pers_unknown(s, ns, key, &entry);
+    if (error) {
+        return error;
+    }
+    if (entry->fallback) {
+        *value = entry->fallback;
+        return 0;
+    }
+    if (entry->owner == PERS_OWNER_M4) {
+        trace_mh2p_rstp_persistence_m4_key(ns, key);
+        return PERS_PE_NO_SUCH_KEY;
+    }
+    return PERS_PE_IO_ERROR;
+}
+
+/* Sends an update carrying @value for the namespace and key of @req. */
+static void rstp_pers_send_value(MH2PRstpChardev *s, const uint8_t *req,
+                                 unsigned header, const GByteArray *value)
+{
+    g_autofree uint8_t *rsp = g_malloc(header + 3 + value->len);
+
+    memcpy(rsp, req, header);
+    rsp[0] = (req[0] & PERS_TYPE_WIDE) | PERS_RSP_DATA;
+    rsp[header] = value->len;
+    rsp[header + 1] = value->len >> 8;
+    rsp[header + 2] = value->len >> 16;
+    memcpy(rsp + header + 3, value->data, value->len);
+    rstp_pers_reply(s, rsp, header + 3 + value->len);
+}
+
+/* Returns the request length consumed, 0 if incomplete, -1 if invalid. */
+static int rstp_pers_request(MH2PRstpChardev *s, const uint8_t *req,
+                             unsigned avail)
+{
+    unsigned width = req[0] & PERS_TYPE_WIDE ? 4 : 2;
+    unsigned header = 1 + 2 * width;
+    uint8_t op = req[0] & ~PERS_TYPE_WIDE;
+    uint32_t ns, key, size;
+    GByteArray *value;
+
+    if (avail < header) {
+        return 0;
+    }
+    ns = rstp_pers_le(req + 1, width);
+    key = rstp_pers_le(req + 1 + width, width);
+    if (op == PERS_REQ_WRITE) {
+        if (avail < header + 3) {
+            return 0;
+        }
+        size = rstp_pers_le(req + header, 3);
+        if (size > PERS_MAX_VALUE) {
+            trace_mh2p_rstp_persistence_invalid(req[0], ns, key, size);
+            return -1;
+        }
+        if (avail < header + 3 + size) {
+            return 0;
+        }
+        if (s->pers_catalog) {
+            PersCatalogEntry *entry;
+            int error = rstp_pers_unknown(s, ns, key, &entry);
+
+            if (error) {
+                trace_mh2p_rstp_persistence_error(ns, key, error);
+                rstp_pers_error(s, req, header, error);
+                return header + 3 + size;
+            }
+        }
+        value = rstp_pers_lookup(s, ns, key);
+        if (!value || value->len != size ||
+            memcmp(value->data, req + header + 3, size)) {
+            rstp_pers_insert(s->pers_store, ns, key, req + header + 3, size);
+            rstp_pers_save(s);
+            value = rstp_pers_lookup(s, ns, key);
+        }
+        trace_mh2p_rstp_persistence_write(ns, key, size);
+        /*
+         * Like nvdPersis_Write_Update_Res_Uart, report the stored value
+         * back; the backend refreshes mapped keys only from updates.
+         */
+        rstp_pers_send_value(s, req, header, value);
+        return header + 3 + size;
+    }
+    if (op != PERS_REQ_READ) {
+        trace_mh2p_rstp_persistence_invalid(req[0], ns, key, 0);
+        return -1;
+    }
+    value = rstp_pers_lookup(s, ns, key);
+    if (!value) {
+        int error = rstp_pers_missing(s, ns, key, &value);
+
+        if (error) {
+            trace_mh2p_rstp_persistence_error(ns, key, error);
+            rstp_pers_error(s, req, header, error);
+            return header;
+        }
+    }
+    trace_mh2p_rstp_persistence_read(ns, key, value->len);
+    rstp_pers_send_value(s, req, header, value);
+    return header;
+}
+
 static void rstp_handle_persistence(MH2PRstpChardev *s, const uint8_t *data,
                                     unsigned len)
 {
-    while (len) {
-        uint8_t op = data[0] & 0x0f;
-        unsigned hl, need;
-        uint32_t ns, key;
-        uint8_t reply[10];
+    GByteArray *rx = s->pers_rx;
+    unsigned used = 0;
 
-        switch (data[0] & 0xf0) {
-        case 0x00:
-            hl = 5;
-            break;
-        case 0x80:
-            hl = 9;
-            break;
-        default:
-            trace_mh2p_rstp_drop("persistence header", data[0], len);
-            return;
-        }
-        need = hl;
-        if (op == PERS_OP_UPDATE || op == PERS_OP_UPDATE2) {
-            need += 3;
-            if (len >= need) {
-                need += ldl_le_p(data + hl) & 0xffffff;
-            }
-        } else if (op == PERS_OP_ERROR) {
-            need += 1;
-        }
-        if (len < need) {
-            trace_mh2p_rstp_drop("persistence truncated", data[0], len);
-            return;
-        }
-        if (hl == 5) {
-            ns = lduw_le_p(data + 1);
-            key = lduw_le_p(data + 3);
-        } else {
-            ns = ldl_le_p(data + 1);
-            key = ldl_le_p(data + 5);
-        }
-        trace_mh2p_rstp_persistence(op, ns, key);
-        if (op == PERS_OP_REQUEST) {
-            memcpy(reply, data, hl);
-            reply[0] = (data[0] & 0xf0) | PERS_OP_ERROR;
-            reply[hl] = PE_NO_SUCH_KEY;
-            rstp_tx_queue_channel(s, &s->persistence, reply, hl + 1);
-        }
-        data += need;
-        len -= need;
+    if (rx->len + len > PERS_RX_MAX) {
+        trace_mh2p_rstp_persistence_invalid(rx->len ? rx->data[0] : 0, 0, 0,
+                                            rx->len + len);
+        g_byte_array_set_size(rx, 0);
+        return;
     }
+    g_byte_array_append(rx, data, len);
+    while (used < rx->len) {
+        int n = rstp_pers_request(s, rx->data + used, rx->len - used);
+
+        if (n < 0) {
+            /* Unknown framing: drop the stream rather than misparse it. */
+            used = rx->len;
+            break;
+        }
+        if (!n) {
+            break;
+        }
+        used += n;
+    }
+    g_byte_array_remove_range(rx, 0, used);
 }
 
 /*
@@ -721,7 +1135,7 @@ static void rstp_handle_payload(MH2PRstpChardev *s, uint8_t chn,
         rstp_handle_pwrman(s, data, len);
         return;
     }
-    if (chn == RSTP_CHN_PERSISTENCE && s->persistence_enabled) {
+    if (chn == RSTP_CHN_PERSISTENCE) {
         rstp_handle_persistence(s, data, len);
         return;
     }
@@ -780,6 +1194,7 @@ static void rstp_handle_frame(MH2PRstpChardev *s, const uint8_t *f,
         /* The MMX multiplexer restarted: its clients will start over. */
         trace_mh2p_rstp_rx(flag, 0, 0, len);
         rstp_reset_sequences(s);
+        rstp_pers_reset_channel(s);
         s->panels_ready = false;
         s->pwrman_seen = false;
         s->link_up = true;
@@ -798,6 +1213,9 @@ static void rstp_handle_frame(MH2PRstpChardev *s, const uint8_t *f,
         trace_mh2p_rstp_rx(flag, f[1] ? f[2] : 0, 0, len);
         for (unsigned i = 0; i < f[1]; i++) {
             s->rx_last_sqn[f[2 + i]] = 0xff;
+            if (f[2 + i] == RSTP_CHN_PERSISTENCE) {
+                rstp_pers_reset_channel(s);
+            }
         }
         return;
     case RSTP_FLAG_ACK:
@@ -1219,8 +1637,7 @@ static void rstp_reset(void *opaque)
     s->keypanel.count = 0;
     s->pwrman.head = 0;
     s->pwrman.count = 0;
-    s->persistence.head = 0;
-    s->persistence.count = 0;
+    rstp_pers_reset_channel(s);
     s->pwrman_seen = false;
     s->touch_down = false;
     s->touch_moved = false;
@@ -1251,16 +1668,9 @@ static bool rstp_chr_open(Chardev *chr, ChardevBackend *backend,
     s->keypanel.chn = RSTP_CHN_KEYPANEL;
     s->pwrman.chn = RSTP_CHN_PWRMAN;
     s->persistence.chn = RSTP_CHN_PERSISTENCE;
-    /*
-     * Experimental, opt-in (=1): QEMU_MH2P_RSTP_PROPREPLY confirms keypanel
-     * setProperty requests (untested); QEMU_MH2P_RSTP_PERSISTENCE answers
-     * PERSISTENCE with PE_NO_SUCH_KEY, which without real values makes
-     * hidcontroller fail.
-     */
+    /* Experimental, opt-in: confirm keypanel setProperty requests. */
     s->prop_reply =
         g_strcmp0(g_getenv("QEMU_MH2P_RSTP_PROPREPLY"), "1") == 0;
-    s->persistence_enabled =
-        g_strcmp0(g_getenv("QEMU_MH2P_RSTP_PERSISTENCE"), "1") == 0;
     rstp_reset(s);
     qemu_register_reset(rstp_reset, s);
     s->hs = qemu_input_handler_register((DeviceState *)s,
@@ -1280,6 +1690,13 @@ static void rstp_chr_finalize(Object *obj)
         timer_free(s->watchdog_timer);
         fifo8_destroy(&s->outbuf);
     }
+    g_byte_array_unref(s->pers_rx);
+    g_byte_array_unref(s->pers_tx);
+    g_hash_table_unref(s->pers_store);
+    g_free(s->pers_file);
+    g_clear_pointer(&s->pers_catalog, g_hash_table_unref);
+    g_clear_pointer(&s->pers_catalog_ns, g_hash_table_unref);
+    g_free(s->pers_catalog_file);
 }
 
 static void rstp_chr_class_init(ObjectClass *oc, const void *data)
@@ -1363,10 +1780,75 @@ static void rstp_set_power_state(Object *obj, Visitor *v, const char *name,
     }
 }
 
+static char *rstp_get_persistence_file(Object *obj, Error **errp)
+{
+    return g_strdup(CHARDEV_MH2P_RSTP(obj)->pers_file ?: "");
+}
+
+/*
+ * Selecting a file replaces the store with its contents (empty if it does
+ * not exist yet) and saves every later change to it; "" keeps the current
+ * contents in memory only.
+ */
+static void rstp_set_persistence_file(Object *obj, const char *value,
+                                      Error **errp)
+{
+    MH2PRstpChardev *s = CHARDEV_MH2P_RSTP(obj);
+    GHashTable *store;
+
+    if (!*value) {
+        g_clear_pointer(&s->pers_file, g_free);
+        return;
+    }
+    store = rstp_pers_load(value, errp);
+    if (!store) {
+        return;
+    }
+    g_hash_table_unref(s->pers_store);
+    s->pers_store = store;
+    g_free(s->pers_file);
+    s->pers_file = g_strdup(value);
+}
+
+static char *rstp_get_persistence_catalog(Object *obj, Error **errp)
+{
+    return g_strdup(CHARDEV_MH2P_RSTP(obj)->pers_catalog_file ?: "");
+}
+
+/* "" drops the catalog: every missing value is PE_NO_SUCH_KEY again. */
+static void rstp_set_persistence_catalog(Object *obj, const char *value,
+                                         Error **errp)
+{
+    MH2PRstpChardev *s = CHARDEV_MH2P_RSTP(obj);
+    GHashTable *catalog = NULL, *namespaces = NULL;
+
+    if (*value && !rstp_pers_load_catalog(value, &catalog, &namespaces,
+                                          errp)) {
+        return;
+    }
+    g_clear_pointer(&s->pers_catalog, g_hash_table_unref);
+    g_clear_pointer(&s->pers_catalog_ns, g_hash_table_unref);
+    s->pers_catalog = catalog;
+    s->pers_catalog_ns = namespaces;
+    g_free(s->pers_catalog_file);
+    s->pers_catalog_file = *value ? g_strdup(value) : NULL;
+}
+
 static void rstp_chr_init(Object *obj)
 {
-    CHARDEV_MH2P_RSTP(obj)->clamp_state = -1;
-    CHARDEV_MH2P_RSTP(obj)->power_state = -1;
+    MH2PRstpChardev *s = CHARDEV_MH2P_RSTP(obj);
+
+    s->clamp_state = -1;
+    s->power_state = -1;
+    s->pers_rx = g_byte_array_new();
+    s->pers_tx = g_byte_array_new();
+    s->pers_store = rstp_pers_new_store();
+    object_property_add_str(obj, "persistence-file",
+                            rstp_get_persistence_file,
+                            rstp_set_persistence_file);
+    object_property_add_str(obj, "persistence-catalog",
+                            rstp_get_persistence_catalog,
+                            rstp_set_persistence_catalog);
     object_property_add(obj, "clamp-state", "int",
                         rstp_get_clamp_state, rstp_set_clamp_state, NULL, NULL);
     object_property_add(obj, "power-state", "int",
