@@ -24,5 +24,7 @@ MemTxResult mh2p_pcie_config_access(DeviceState *dev, bool local_ready,
 MemTxResult mh2p_pcie_memory_access(DeviceState *dev, bool local_ready,
                                   uint32_t address, unsigned size,
                                   uint32_t *value, bool write);
+/* Diagnostic event in the MH2P_PCIE_LOG transaction log (tag >= 0x200). */
+void mh2p_pcie_log_event(unsigned tag, uint32_t a, uint32_t b, uint32_t c);
 
 #endif

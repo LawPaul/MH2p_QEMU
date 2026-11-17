@@ -106,3 +106,5 @@ z2_aer915_event(int8_t event, int8_t len) "i2c event =0x%x len=%d bytes"
 # bcm2838.c
 bcm2838_gic_set_irq(int irq, int level) "gic irq:%d lvl:%d"
 mh2p_rcc_clkctrl(uint64_t addr, uint64_t value, int cpu, uint64_t pc) "addr=0x%" PRIx64 " value=0x%" PRIx64 " cpu=%d pc=0x%" PRIx64
+mh2p_pcie_msi(uint32_t address, unsigned vector, uint32_t pending0) "address 0x%x vector %u pending0 0x%x"
+mh2p_pcie_msi_level(bool level, uint32_t pending0, uint32_t mask0, uint32_t ctrl, bool ready) "level %d pending0 0x%x mask0 0x%x ctrl 0x%x root-ready %d"

@@ -10,6 +10,7 @@
 #include "qemu/main-loop.h"
 #include "qemu/module.h"
 #include "qemu/sockets.h"
+#include "qemu/thread.h"
 #include "qemu/timer.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/misc/mh2p_pcie_config.h"
@@ -47,6 +48,78 @@ struct MH2PPCIeConfigState {
     uint32_t sequence, epoch;
     bool failed, in_flight, peer_ready, replying;
 };
+
+/*
+ * Diagnostic transaction log, off unless MH2P_PCIE_LOG=<prefix> is set: one
+ * 40-byte little-endian record per configuration/memory transaction, written
+ * to <prefix>.<pid>.bin.  Both directions are covered: "served" records are
+ * the peer's accesses executed here, "requested" ones are ours sent to the
+ * peer (with their round-trip time).
+ */
+#define LOG_SERVED 0x100
+typedef struct QEMU_PACKED {
+    int64_t host_ns;        /* QEMU_CLOCK_REALTIME */
+    int64_t guest_ns;       /* QEMU_CLOCK_VIRTUAL */
+    uint32_t tag;           /* op | status << 4 | LOG_SERVED */
+    uint32_t address;
+    uint32_t size;
+    uint32_t value;
+    int64_t latency_ns;     /* requested only: round trip */
+} MH2PPCIeLogRecord;
+
+static QemuMutex log_lock;
+static FILE *log_file;
+static unsigned log_pending;
+static int64_t log_flushed_ns;
+
+static void log_init(void)
+{
+    const char *prefix = getenv("MH2P_PCIE_LOG");
+    g_autofree char *path = NULL;
+
+    qemu_mutex_init(&log_lock);
+    if (!prefix || !*prefix) {
+        return;
+    }
+    path = g_strdup_printf("%s.%u.bin", prefix, (unsigned)getpid());
+    log_file = fopen(path, "wb");
+    if (!log_file) {
+        error_report("mh2p-pcie-config: cannot open %s", path);
+    }
+}
+
+static void log_record(unsigned tag, uint32_t address, uint32_t size,
+                       uint32_t value, int64_t start_ns)
+{
+    MH2PPCIeLogRecord r;
+    int64_t now;
+
+    if (!log_file) {
+        return;
+    }
+    now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    r.host_ns = cpu_to_le64(now);
+    r.guest_ns = cpu_to_le64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    r.tag = cpu_to_le32(tag);
+    r.address = cpu_to_le32(address);
+    r.size = cpu_to_le32(size);
+    r.value = cpu_to_le32(value);
+    r.latency_ns = cpu_to_le64(start_ns ? now - start_ns : 0);
+    qemu_mutex_lock(&log_lock);
+    fwrite(&r, sizeof(r), 1, log_file);
+    /* the emulators are killed, not shut down: flush often */
+    if (++log_pending >= 256 || now - log_flushed_ns > 500000000LL) {
+        fflush(log_file);
+        log_pending = 0;
+        log_flushed_ns = now;
+    }
+    qemu_mutex_unlock(&log_lock);
+}
+
+void mh2p_pcie_log_event(unsigned tag, uint32_t a, uint32_t b, uint32_t c)
+{
+    log_record(tag, a, b, c, 0);
+}
 
 static void config_close(MH2PPCIeConfigState *s)
 {
@@ -106,6 +179,10 @@ static void config_respond(MH2PPCIeConfigState *s)
                       op == WRITE || op == MEMORY_WRITE) != MEMTX_OK) {
         status = UNSUPPORTED;
         value = 0;
+    }
+    if (op != STATE) {
+        log_record(LOG_SERVED | op | status << 4, ldl_le_p(s->rx + 20),
+                   ldl_le_p(s->rx + 24), value, 0);
     }
     memcpy(s->tx, s->rx, FRAME_SIZE);
     stl_le_p(s->tx + 8, op | RESPONSE);
@@ -306,6 +383,10 @@ static MemTxResult config_rpc(MH2PPCIeConfigState *s, bool ready, unsigned op,
     trace_mh2p_pcie_rpc(op, reg, size, *value, status,
                         qemu_clock_get_ns(QEMU_CLOCK_REALTIME) -
                         (deadline - RPC_TIMEOUT_NS));
+    if (op != STATE) {
+        log_record(op | status << 4, reg, size, *value,
+                   deadline - RPC_TIMEOUT_NS);
+    }
     if (status == ABSENT && op >= MEMORY_READ) {
         error_report("mh2p-pcie-config: memory access to absent peer "
                      "at 0x%x size %u", reg, size);
@@ -509,6 +590,7 @@ static const TypeInfo config_info = {
 
 static void config_register_types(void)
 {
+    log_init();
     type_register_static(&config_info);
 }
 
