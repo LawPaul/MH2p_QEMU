@@ -1066,8 +1066,15 @@ static void rcc_dsp1_control(MH2PRCCMachineState *s)
     if (s->dsp1) {
         s->dsp1_reset_asserted = mh2p_rcc_dsp_control(
             s->dsp1, s->dsp1_reset_control, clock, s->dsp1_vector & 0x3fffff);
-        s->dsp1_reset_status |= old & ~s->dsp1_reset_asserted;
+    } else {
+        /*
+         * The PRM completes a reset release once the DSP1 clock runs,
+         * whether or not a backend executes the DSP afterwards.
+         */
+        s->dsp1_reset_asserted = clock ? s->dsp1_reset_control
+                                       : old | s->dsp1_reset_control;
     }
+    s->dsp1_reset_status |= old & ~s->dsp1_reset_asserted;
 }
 
 static void rcc_ipu1_control(MH2PRCCMachineState *s)
@@ -5691,7 +5698,7 @@ static MemTxResult rcc_unknown_write(void *opaque, hwaddr offset,
         return MEMTX_OK;
     }
     if (size == 4 && offset + 0x40000000 == 0x4ae06410 &&
-        !(value & ~3U) && (s->dsp1 || value == 3)) {
+        !(value & ~3U)) {
         s->dsp1_reset_control = value;
         rcc_dsp1_control(s);
         return MEMTX_OK;
