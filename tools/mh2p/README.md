@@ -6,6 +6,15 @@ contribution or a complete head-unit emulator. See the
 See the [main guide](../../README.md) for the scope of this MH2P preview.
 Inherited shared helpers do not imply support for other head-unit platforms.
 
+The obsolete MHI2 machine, peripherals, launchers, profiles and boot evidence
+have been removed. Reused filesystem/image helpers now live in this directory;
+the diagnostic graphics transport, renderer and regression sources live in
+[glforward/](glforward/README.md). Tegra30 GPIO, I2C, NOR and timer models remain
+because the MH2P board uses them. MHI2-only CWM adapters, codec forwarding,
+shader profiles and artwork overrides are not retained. Active graphics
+controls use the `MH2P_*` prefix; private launchers using the old prefix must
+be updated.
+
 ## Current status and release boundaries
 
 The tested local profile is Porsche **MH2p_ER_POG35_P2865**, MMX variant
@@ -329,6 +338,71 @@ memory. Neither diagnostic executes instructions, accesses host memory/MMIO,
 fills caches or writes back dirty lines. Both report an error when no backend
 instance exists.
 
+A longer paired control at the explicit 2,000-cycle quota, retaining the
+private backend's existing floating-point assumptions, was observed in the
+original DSP firmware's `C$$EXIT` loop at 32.295 RCC virtual seconds
+(628,940,000 DSP cycles). The backend still reported `failed=false` and continued counting
+instructions in that terminal loop. Successful earlier ping replies, an
+empty backend error and increasing cycle counts therefore cannot establish
+DSP survival. Instruction history traces the exit to the native McASP1
+receive high-clock reset timeout: the guest requests global control
+`0x1f02`, but reads `0x1f00` until its polling counter expires. That receiver
+selects an external serial clock, which the current MLB high-clock peer does
+not supply; the DRA7 initialization sequence requires a running external
+ACLKR for global-control synchronization. The default configuration still
+has no external receive serial clock. Forcing the reset readback or extending
+the guest timeout would conceal that missing hardware, not fix it. This is
+not a five-minute endurance pass or a backend-detected execution fault.
+
+For local clock-routing experiments, machine properties
+`experimental-mcasp1-rx-clock-hz` through
+`experimental-mcasp8-rx-clock-hz` connect an explicit external ACLKR input
+(0, disconnected, by default; maximum 1 GHz). These are independent of
+the MLB high-clock peer. They require experimental power clocks, module
+enablement and asynchronous RX external-clock selection; synchronous RX
+continues to use the transmitter clock and frame sync, bypassing both RX
+generators regardless of the receive frame-source setting.
+Reset changes synchronize after one
+selected serial-clock period, including receiver state-machine release into
+its initial frame-sync wait. An asynchronous internal RX frame-sync generator
+is not implemented and its reset-release acknowledgement remains withheld.
+Disconnecting the clock stalls pending changes
+without clearing already latched state. This fixture does not establish the
+real board's clock routing or frequency. It supplies no frame sync, samples,
+receive FIFO data or DMA events, and is not an audio-health verdict.
+
+A paired original-firmware control with the explicit 3.072 MHz McASP1
+receive-clock fixture completed the five-minute DSP-survival observation.
+The exact acceptance sample was 300.025970 RCC virtual seconds; the final
+DSP sample reached 300.096222 seconds and 5,984,976,000 cycles. Across 973
+samples there was no backend fault, terminal firmware exit, counter reset
+or cycle regression. Native logs contained no fatal M4 watchdog, native DSP
+watchdog reset or completed ProcessManager shutdown. All eight required
+watchdog/control threads in `DIRANA3_APP`, `PWR_AMP`, `MIC_ADC` and
+`SYS_LINK` remained present in the final capture, including `SLK_CYC`.
+The bounded paired run and all helpers exited successfully after 9,868.62
+host seconds; this was five guest minutes, not five host minutes.
+McASP1 and McASP8
+receive reset readback reached `0x1e`; the latter also requires synchronous
+receive to bypass its local frame generator, not just its clock generator.
+Original firmware, watchdog deadlines, diagnostic DSP quota and the six
+existing floating-point assumptions were unchanged. This establishes
+survival under the explicit experimental clock fixture, not physical board
+clock routing or an operational receive audio stream. Receive samples/DMA
+remain unimplemented, and amplifier I2C NACKs still occur.
+
+The endurance run averaged 32.9 host seconds per RCC virtual second.
+A subsequent bounded performance experiment did not establish an end-to-end
+speedup from caching external DSP instruction decoding and packet validation,
+so those candidate changes were discarded. Timing the backend step calls in
+that experiment measured 20.16 host seconds inside the DSP backend over
+196.74 elapsed seconds; in a later 20-million-cycle window, approximately
+3.88 of 28.65 host seconds were inside the backend. The remaining time is
+outside those calls, not accounted for by DSP interpretation. These are
+startup-window measurements, not a complete endurance-run profile. The
+deterministic RCC `icount shift=0` profile and guest pacing remain unchanged;
+the long runtime must not be attributed solely to the DSP interpreter.
+
 The original RCC loader now creates its IPC device nodes and loads/starts
 the unchanged DSP image through its own allocated mappings. TIMER10 is connected
 to the existing counter/IRQ/clock/reset model. The power-clock experiment also
@@ -345,7 +419,8 @@ connected serial clocks, the synchronized global-control readback stays reset;
 the requested value is not a readiness acknowledgement. Read-only machine
 properties `mcasp1-reset-request` through `mcasp8-reset-request` expose that
 distinction. PRCM module enable/disable and clock-source selection are
-modeled, but external serial clocks and clock adjustment remain unsupported.
+modeled; external receive serial clocks require the explicit fixture above.
+Clock adjustment remains unsupported.
 With experimental power clocks enabled, direct-start boot restores the
 original IPL's McASP1/2/3/6/8 handoff: MODULEMODE=2 and AHCLKX source MLBP_CLK
 (`0x0d000002`). Starting an IPL instead retains hardware-reset clock state
@@ -454,6 +529,15 @@ fatal watchdog loop or M4 power-controller watchdog reset request fails
 the check even if display initialization succeeded. Normal watchdog setup
 and status messages do not fail it. An empty or short M4 capture contains
 no such failure evidence, but is not a watchdog-health pass.
+
+For RCC audio captures, add `--rcc-audio-log /path/to/rcc-boot-0.log`.
+A native `[SLK_CYC]` timestamped `[SL_DSP_Watchdog]Reset: DSP WD Detection`
+line fails the check even if display initialization or subsequent DSP replies
+succeeded. A watchdog warning alone is not a reset. Command echoes are not
+accepted as native reset records, and absence of reset records does not
+establish sustained DSP or audio health. The same option rejects a native
+`[PMR_RBT]` completed process-shutdown record. Use captures ending before
+intentional guest shutdown when checking an endurance interval.
 
 Short original-QNX controls show that the unchanged A15 `IPC_APP` can
 initialize its `IPC_CYC` thread at its native priority 1, waiting on the
@@ -1282,7 +1366,7 @@ directories from the same diagnostic IFS using
 (up to 65536). The budget permits that many additional MMIO polls before
 sleeping on each reply chunk or bridge-lock acquisition. It never resets
 while that wait is pending; after exhaustion the existing sleep and reply
-timeout behavior remains. The default is zero, including MHI2 builds.
+timeout behavior remains. The default is zero.
 The compiler commands and selected budget are recorded in the manifest.
 Compare identical HMI actions, host CPU time, wall time, guest time and
 watchdog health; a larger budget is not an established performance improvement.
@@ -1370,9 +1454,8 @@ and the video encoder service imports IPTE displayable capture and
 `NvVideoStreamEncoder*` APIs, with ISO transmit targets `/dev/mlb/isoTX1`
 and `/dev/mlb/isoTX2`. Its NVIDIA library supports H.264 with Screen or
 EGLStream input; the Screen encode entry converts its buffer using
-`NvxScreenCreateNvMediaVideoSurfaceSibling`. The existing MHI2 bridge's
-asynchronous host encoder is relevant prior art, but its legacy native-image
-interpretation is not compatible by assumption with these Screen buffers.
+`NvxScreenCreateNvMediaVideoSurfaceSibling`. The removed legacy bridge's
+native-image interpretation was not verified against these Screen buffers.
 Encoder settings and callback layouts also need verification before reuse.
 
 MOST support does not establish that the cluster uses MOST in this variant.
@@ -1384,8 +1467,8 @@ active physical output or of every vehicle variant's routing.
 
 The original RCC ISO driver also contains split-driver virtual-IP socket
 interfaces and MOSTV0 through MOSTV4 endpoints. Its connection setup and
-packet framing remain unverified; MHI2 PCIe BAR/channel constants must not
-be copied as an MH2P transport implementation. The next bounded checks are
+packet framing remain unverified; no synthetic PCIe BAR/channel constants
+are established as an MH2P transport implementation. The next bounded checks are
 to observe cluster displayable 41 on the Screen bridge, then verify the
 native encoder ABI and RCC ISO handoff independently. No end-to-end MH2P
 MOST/cluster-video emulation is claimed.

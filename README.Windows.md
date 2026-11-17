@@ -17,7 +17,7 @@ Intel Iris Xe graphics.
 | GL bridge | Synchronous replies over a TCP **socket** chardev on Windows (no FIFO chardev there) |
 | Display stack | Opt-in `experimental-permissive` modes (GK20A, DC, host1x, SOR, VIC); GK20A BAR1 + GMMU walk behind the Tegra SMMU; PMC DPD registers. With these, the original `devg-nvrm`, `nvdisp`, `screen` and `displaymanager` come up |
 | RCC | McSPI clocks start enabled when IPU1 firmware is loaded directly, as the bootloader leaves them (fixes the M4 `T_M4_Accl_Ctrl` bus fault) |
-| Renderer (`glhost`) | ANGLE default display; TCP transport (`MHI2_GL_CONNECT`); opt-in CPU ASTC decode (`MHI2_ASTC_SOFTWARE=1`) because ANGLE/D3D11 has no ASTC; opt-in live window with touch (`MHI2_GL_WINDOW=1`, `MHI2_GL_INPUT`) |
+| Renderer (`glhost`) | ANGLE default display; TCP transport (`MH2P_GL_CONNECT`); opt-in CPU ASTC decode (`MH2P_ASTC_SOFTWARE=1`) because ANGLE/D3D11 has no ASTC; opt-in live window with touch (`MH2P_GL_WINDOW=1`, `MH2P_GL_INPUT`) |
 
 All new device behaviour is off unless you turn it on, so the default behaviour of the models is
 unchanged.
@@ -41,7 +41,7 @@ Put `C:\msys64\ucrt64\bin` on `PATH` when running `qemu-system-arm.exe` outside 
 ## Build the renderer (glhost) with ANGLE
 
 ```sh
-pacman -S --needed mingw-w64-ucrt-x86_64-angleproject mingw-w64-ucrt-x86_64-ffmpeg
+pacman -S --needed mingw-w64-ucrt-x86_64-angleproject
 ```
 
 CPU ASTC decode needs [ARM astc-encoder](https://github.com/ARM-software/astc-encoder)
@@ -54,20 +54,18 @@ for f in $A/astcenc_*.cpp; do
       -DASTCENC_POPCNT=1 -DASTCENC_F16C=0 -DASTCENC_NEON=0 -msse4.1 -mpopcnt \
       -I$A -c $f -o $O/$(basename $f .cpp).o
 done
-g++ -O2 -std=c++17 -I$A -c tools/mhi2/glforward/host/astc_soft.cpp -o $O/astc_soft.o
+g++ -O2 -std=c++17 -I$A -c tools/mh2p/glforward/host/astc_soft.cpp -o $O/astc_soft.o
 ar rcs $O/libastcsoft.a $O/*.o
 
-gcc -O2 -D_GNU_SOURCE -DGLHOST_ASTC_SOFTWARE tools/mhi2/glforward/host/glhost.c \
+gcc -O2 -D_GNU_SOURCE -DGLHOST_ASTC_SOFTWARE tools/mh2p/glforward/host/glhost.c \
   -o ../build-glhost/glhost.exe \
-  $(pkg-config --cflags --libs libavcodec libavutil libswscale) $O/libastcsoft.a \
+  $O/libastcsoft.a \
   -lstdc++ -lEGL.dll -lGLESv2.dll -lws2_32 -lgdi32 -pthread -lm
 ```
 
 Without astc-encoder, leave out `-DGLHOST_ASTC_SOFTWARE`, `astc_soft.cpp` and `libastcsoft.a`. The
 HMI then renders without its ASTC artwork on hosts that have no native ASTC.
 
-`glhost.exe --check-shaders` should report an ANGLE/Direct3D 11 renderer and compile all
-translated shaders.
 
 ## Prepare media
 
@@ -117,22 +115,22 @@ Serial ports:
 Renderer, started alongside (Windows `cmd`):
 
 ```
-set MHI2_GL_CONNECT=127.0.0.1:P_GL
-set MHI2_GL_FRAME=<out>\frame.ppm
-set MHI2_ASTC_SOFTWARE=1
-set MHI2_GL_WINDOW=1
-set MHI2_GL_INPUT=127.0.0.1:P_QMP
+set MH2P_GL_CONNECT=127.0.0.1:P_GL
+set MH2P_GL_FRAME=<out>\frame.ppm
+set MH2P_ASTC_SOFTWARE=1
+set MH2P_GL_WINDOW=1
+set MH2P_GL_INPUT=127.0.0.1:P_QMP
 glhost.exe
 ```
 
 ### Live window, touch and ignition
 
-- `MHI2_GL_WINDOW=1` shows each published display frame in a window titled
+- `MH2P_GL_WINDOW=1` shows each published display frame in a window titled
   "MH2P HMI (glhost)". glhost still renders offscreen; the window is a GDI view of the same frame.
-  While the window is open, `MHI2_GL_FRAME` is rewritten at most once per
-  `MHI2_GL_FRAME_INTERVAL_MS` (default 1000; 0 = every frame). Without the window, every frame is
+  While the window is open, `MH2P_GL_FRAME` is rewritten at most once per
+  `MH2P_GL_FRAME_INTERVAL_MS` (default 1000; 0 = every frame). Without the window, every frame is
   written.
-- With `MHI2_GL_INPUT` pointing at the MMX QMP socket:
+- With `MH2P_GL_INPUT` pointing at the MMX QMP socket:
   - left-button press, drag and release are sent as absolute pointer events
     (`input-send-event`);
   - the `mh2p-rstp` chardev turns these into native RSTP keypanel touch records (channel 0x40)

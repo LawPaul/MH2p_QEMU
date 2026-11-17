@@ -153,35 +153,6 @@ static const USBDesc desc_hub = {
     .str  = desc_strings,
 };
 
-/* Local MHI2 USB2532 fixture: two external ports and the internal HFC port.
- * High-speed children use direct EHCI transactions. Split transactions for
- * full/low-speed children behind this high-speed hub are not implemented. */
-static const USBDescIface mhi2_hub_iface = {
-    .bNumEndpoints = 1, .bInterfaceClass = USB_CLASS_HUB,
-    .eps = (USBDescEndpoint[]) {{
-        .bEndpointAddress = USB_DIR_IN | 1,
-        .bmAttributes = USB_ENDPOINT_XFER_INT,
-        .wMaxPacketSize = 1, .bInterval = 12,
-    }},
-};
-static const USBDescDevice mhi2_hub_device = {
-    .bcdUSB = 0x0200, .bDeviceClass = USB_CLASS_HUB, .bDeviceProtocol = 1,
-    .bMaxPacketSize0 = 64, .bNumConfigurations = 1,
-    .confs = (USBDescConfig[]) {{
-        .bNumInterfaces = 1, .bConfigurationValue = 1,
-        .bmAttributes = USB_CFG_ATT_ONE | USB_CFG_ATT_SELFPOWER,
-        .nif = 1, .ifs = &mhi2_hub_iface,
-    }},
-};
-static const USBDescStrings mhi2_hub_strings = {
-    [1] = "Microchip", [2] = "MHI2 media connector hub", [3] = "MHI2-HUB-001",
-};
-static const USBDesc mhi2_hub_desc = {
-    .id = {.idVendor = 0x0424, .idProduct = 0x2532, .bcdDevice = 0x0100,
-           .iManufacturer = 1, .iProduct = 2, .iSerialNumber = 3},
-    .full = &desc_device_hub, .high = &mhi2_hub_device, .str = mhi2_hub_strings,
-};
-
 static const uint8_t qemu_hub_hub_descriptor[] =
 {
         0x00,                   /*  u8  bLength; patched in later */
@@ -538,10 +509,6 @@ static void usb_hub_handle_control(USBDevice *dev, USBPacket *p,
                 data[n] = 0x00;
                 var_hub_size++;
             }
-            if (USB_DEVICE_GET_CLASS(dev)->usb_desc == &mhi2_hub_desc) {
-                /* The final port contains the soldered-down feature controller. */
-                data[7 + s->num_ports / 8] |= 1u << (s->num_ports % 8);
-            }
 
             /* fill PortPwrCtrlMask bits */
             limit = limit + DIV_ROUND_UP(s->num_ports, 8);
@@ -736,23 +703,9 @@ static const TypeInfo hub_info = {
     .class_init    = usb_hub_class_initfn,
 };
 
-static void mhi2_hub_class_init(ObjectClass *klass, const void *data)
-{
-    USBDeviceClass *uc = USB_DEVICE_CLASS(klass);
-    uc->usb_desc = &mhi2_hub_desc;
-    uc->product_desc = "MHI2 USB2532 media connector hub";
-    uc->handle_attach = usb_desc_attach;
-}
-
-static const TypeInfo mhi2_hub_info = {
-    .name = "usb-mhi2-hub", .parent = TYPE_USB_HUB,
-    .class_init = mhi2_hub_class_init,
-};
-
 static void usb_hub_register_types(void)
 {
     type_register_static(&hub_info);
-    type_register_static(&mhi2_hub_info);
 }
 
 type_init(usb_hub_register_types)

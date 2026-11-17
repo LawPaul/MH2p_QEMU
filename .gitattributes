@@ -7,5 +7,3 @@
 Cargo.lock      diff=toml merge=binary
 
 *.patch         -text -whitespace
-
-tools/mhi2/source-version.txt export-subst

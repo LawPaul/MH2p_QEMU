@@ -21,8 +21,6 @@ Do not include:
 The existing upstream QEMU firmware and test-key fixtures have separate
 provenance and licensing. Do not remove upstream copyright notices,
 author attribution or license files as a supposed PII cleanup.
-The small historical MHI2 boot logs are diagnostic text, not firmware
-payloads; one embedded vendor build path is explicitly redacted.
 
 ## Current-tree checks
 

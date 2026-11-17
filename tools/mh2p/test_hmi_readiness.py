@@ -10,7 +10,9 @@ import unittest
 from unittest.mock import patch
 
 from hmi_readiness import (display_wait_command, main,
+                           verify_native_dsp_watchdogs,
                            verify_native_m4_watchdogs,
+                           verify_native_rcc_audio,
                            verify_original_hmi_display)
 
 
@@ -18,6 +20,74 @@ VALID = (
     b"Jan 01 00:04:28    5 10203     1 [268210] 00:04:28.210 "
     b"DEBUG <Fw.Display>         waitForDSIDisplayManagement: succeeded!\r\n")
 TIMEOUT = b"NATIVE_HMI_DISPLAY_WAIT_TIMEOUT\r\n"
+
+
+class DspWatchdogTests(unittest.TestCase):
+    RESET = b"[SLK_CYC] 74.174  [SL_DSP_Watchdog]Reset: DSP WD Detection"
+
+    def test_native_reset_and_console_newlines(self):
+        for prefix in (b"", b"\r", b"# ", b"\r# "):
+            for newline in (b"\n", b"\r\n", b"\r\r\n"):
+                with self.subTest(prefix=prefix, newline=newline), \
+                        self.assertRaisesRegex(
+                            RuntimeError, "DSP watchdog reset at 74.174 seconds"):
+                    verify_native_dsp_watchdogs(prefix + self.RESET + newline)
+
+    def test_warning_echo_and_missing_evidence_are_not_resets(self):
+        verify_native_dsp_watchdogs(
+            b"[SLK_CYC] 64.074  [SL_DSP_Watchdog]Warning: "
+            b"DSP WD Detection soon\r\n"
+            b"# echo '" + self.RESET + b"'\r\n"
+            b"cmd = RCC2_PINGME_REQ\r\n")
+        verify_native_dsp_watchdogs(b"")
+
+    def test_first_reset_is_reported_despite_subsequent_replies(self):
+        with self.assertRaisesRegex(RuntimeError, "74.174 seconds"):
+            verify_native_dsp_watchdogs(
+                self.RESET + b"\ncmd = RCC2_PINGME_REQ\n" +
+                self.RESET.replace(b"74.174", b"134.711") + b"\n")
+
+    def test_cli_audio_failure_overrides_display_success(self):
+        for record, message in (
+                (self.RESET, "Native DSP watchdog reset"),
+                (b"[PMR_RBT] 314234 - Process shutdown is done...",
+                 "Native RCC ProcessManager shutdown")):
+            with self.subTest(message=message), \
+                    tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                display = root / "display.log"
+                audio = root / "audio.log"
+                display.write_bytes(VALID)
+                audio.write_bytes(record + b"\r\n")
+                with patch.object(sys, "argv", [
+                        "hmi_readiness", str(display),
+                        "--rcc-audio-log", str(audio)]), \
+                        redirect_stderr(io.StringIO()) as stderr, \
+                        self.assertRaises(SystemExit) as error:
+                    main()
+                self.assertEqual(error.exception.code, 1)
+                self.assertIn(message, stderr.getvalue())
+
+
+class AudioLifecycleTests(unittest.TestCase):
+    def test_completed_shutdown_rejected_despite_subsequent_startup(self):
+        for prefix in (b"", b"# "):
+            for newline in (b"\n", b"\r\n", b"\r\r\n"):
+                with self.subTest(prefix=prefix, newline=newline), \
+                        self.assertRaisesRegex(
+                            RuntimeError,
+                            "ProcessManager shutdown at tick 314234"):
+                    verify_native_rcc_audio(
+                        prefix +
+                        b"[PMR_RBT] 314234 - Process shutdown is done..." +
+                        newline + b"[CAR_MAS] 320.646  Startup event sent to "
+                        b"ProcessManager\n")
+
+    def test_startup_process_list_and_command_echo_do_not_fail(self):
+        verify_native_rcc_audio(
+            b"4100 ./usr/bin/ProcessManager\r\n"
+            b"[CAR_MAS] 10.646  Startup event sent to ProcessManager\r\n"
+            b"# echo '[PMR_RBT] 314234 - Process shutdown is done...'\r\n")
 
 
 class M4WatchdogTests(unittest.TestCase):

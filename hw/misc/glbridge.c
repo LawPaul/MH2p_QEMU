@@ -1,5 +1,5 @@
 /*
- * Experimental GLES forwarding transport, extracted from mhi2_harman.c.
+ * Experimental MH2P GLES forwarding transport.
  * This optional host service is not a Tegra hardware device.
  * SPDX-License-Identifier: GPL-2.0-or-later
  */

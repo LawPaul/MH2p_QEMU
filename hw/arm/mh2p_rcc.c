@@ -809,6 +809,7 @@ typedef struct MH2PRCCMachineState {
     bool power_clocks;
     bool mlb_clock_peer;
     bool mlb_peer_reset_released;
+    uint32_t mcasp_external_rx_hz[8];
     QEMUTimer *mcasp_sync_timer;
     QEMUTimer *mcasp_dma_timer;
     QEMUTimer *mcasp_tx_timer;
@@ -4468,9 +4469,7 @@ static uint32_t rcc_mcasp_serial_hz(MH2PRCCMachineState *s, unsigned instance,
     uint32_t clock = s->disabled_clkctrl[instance];
     uint32_t bitclock = 0, highclock = 0, txclock = 0;
 
-    if (!s->power_clocks || !s->mlb_clock_peer ||
-        !s->mlb_peer_reset_released ||
-        (clock & 3) != 2) {
+    if (!s->power_clocks || (clock & 3) != 2) {
         return 0;
     }
     for (unsigned i = 0; i < ARRAY_SIZE(rcc_mcasp_config); i++) {
@@ -4487,8 +4486,12 @@ static uint32_t rcc_mcasp_serial_hz(MH2PRCCMachineState *s, unsigned instance,
     if (!transmit && !(txclock & BIT(6))) {
         return rcc_mcasp_serial_hz(s, instance, true);
     }
+    if (!transmit && !(bitclock & BIT(5))) {
+        return s->mcasp_external_rx_hz[instance];
+    }
     /* This peer supplies only PRCM's external MLBP high-clock route. */
-    if (!(bitclock & BIT(5)) || (highclock & BIT(15)) ||
+    if (!s->mlb_clock_peer || !s->mlb_peer_reset_released ||
+        !(bitclock & BIT(5)) || (highclock & BIT(15)) ||
         ((clock >> (transmit ? 24 : 28)) & 15) != 0xd) {
         return 0;
     }
@@ -4890,6 +4893,22 @@ static bool rcc_mcasp_tx_frame_config(MH2PRCCMachineState *s, unsigned i,
            *bits >= 8 && !(*bits & 3);
 }
 
+static bool rcc_mcasp_rx_frame_supported(MH2PRCCMachineState *s, unsigned i)
+{
+    uint32_t txclock = 0, rxframe = 0;
+
+    for (unsigned n = 0; n < ARRAY_SIZE(rcc_mcasp_config); n++) {
+        if (rcc_mcasp_config[n].offset == 0x6c) {
+            rxframe = s->mcasp[i].config[n];
+        }
+        if (rcc_mcasp_config[n].offset == 0xb0) {
+            txclock = s->mcasp[i].config[n];
+        }
+    }
+    /* Synchronous receive bypasses its own clock and frame-sync generators. */
+    return !(txclock & BIT(6)) || !(rxframe & BIT(1));
+}
+
 static void rcc_mcasp_tx_schedule(MH2PRCCMachineState *s)
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
@@ -4986,13 +5005,22 @@ static void rcc_mcasp_sync(void *opaque)
 
     for (unsigned i = 0; i < ARRAY_SIZE(s->mcasp); i++) {
         for (unsigned direction = 0; direction < 2; direction++) {
-            uint32_t mask = direction ? 0x1f00 : 0x7;
+            uint32_t mask = direction ? 0x1f00 : 0x1f;
             uint32_t pending = s->mcasp[i].reset_request & mask;
             uint32_t frequency = rcc_mcasp_serial_hz(s, i, direction);
             int64_t *deadline = &s->mcasp[i].sync_deadline[direction];
 
             if (direction && (pending & 0x700) != 0x700) {
                 pending &= ~BIT(11);
+            }
+            if (!direction) {
+                if (!(pending & BIT(2))) {
+                    pending &= ~BIT(3);
+                }
+                if (!(pending & BIT(3)) ||
+                    !rcc_mcasp_rx_frame_supported(s, i)) {
+                    pending &= ~BIT(4);
+                }
             }
             if (direction) {
                 uint32_t bits, slots;
@@ -5092,7 +5120,7 @@ static MemTxResult rcc_mcasp_read(MH2PRCCMachineState *s, unsigned instance,
         *value = s->mcasp[instance].tx_fifo_level;
         return MEMTX_OK;
     case 0x100c:
-        /* No receive samples enter while the receiver is held in reset. */
+        /* No receive sample source is connected. */
         *value = 0;
         return MEMTX_OK;
     }
@@ -5204,7 +5232,7 @@ static MemTxResult rcc_mcasp_write(MH2PRCCMachineState *s, unsigned instance,
             uint32_t request = (s->mcasp[instance].reset_request & ~mask) |
                                (value & mask);
 
-            if (!s->mlb_clock_peer &&
+            if (!s->mlb_clock_peer && !s->mcasp_external_rx_hz[instance] &&
                 request && request != s->mcasp[instance].reset_request) {
                 qemu_log_mask(LOG_UNIMP, "mh2p-rcc: McASP%u reset request "
                               "0x%x cannot synchronize: serial clocks "
@@ -5213,10 +5241,14 @@ static MemTxResult rcc_mcasp_write(MH2PRCCMachineState *s, unsigned instance,
             uint32_t bits, slots;
             bool frame_supported =
                 rcc_mcasp_tx_frame_config(s, instance, &bits, &slots);
-            uint32_t unsupported_request = (request & ~0x1f07U) |
-                (!frame_supported ? request & BIT(12) : 0);
+            uint32_t unsupported_request =
+                !frame_supported ? request & BIT(12) : 0;
 
-            if (s->mlb_clock_peer && unsupported_request) {
+            if (!rcc_mcasp_rx_frame_supported(s, instance)) {
+                unsupported_request |= request & BIT(4);
+            }
+            if ((s->mlb_clock_peer || s->mcasp_external_rx_hz[instance]) &&
+                unsupported_request) {
                 qemu_log_mask(LOG_UNIMP, "mh2p-rcc: McASP%u "
                               "state-machine/frame reset request 0x%x is not "
                               "implemented by the clock peer\n",
@@ -5242,7 +5274,7 @@ static MemTxResult rcc_mcasp_write(MH2PRCCMachineState *s, unsigned instance,
         }
         return MEMTX_OK;
     case 0x80:
-        /* W1C cannot create a receive/transmit event while held in reset. */
+        /* W1C cannot create an event without a receive sample source. */
         return MEMTX_OK;
     }
 unsupported:
@@ -7189,6 +7221,38 @@ static void rcc_get_mcasp_reset_request(Object *obj, Visitor *v,
     visit_type_uint32(v, name, &request, errp);
 }
 
+static void rcc_get_mcasp_external_rx_hz(Object *obj, Visitor *v,
+                                        const char *name, void *opaque,
+                                        Error **errp)
+{
+    MH2PRCCMachineState *s = (MH2PRCCMachineState *)obj;
+
+    visit_type_uint32(v, name,
+                     &s->mcasp_external_rx_hz[GPOINTER_TO_UINT(opaque)], errp);
+}
+
+static void rcc_set_mcasp_external_rx_hz(Object *obj, Visitor *v,
+                                        const char *name, void *opaque,
+                                        Error **errp)
+{
+    MH2PRCCMachineState *s = (MH2PRCCMachineState *)obj;
+    unsigned instance = GPOINTER_TO_UINT(opaque);
+    uint32_t hz;
+
+    if (!visit_type_uint32(v, name, &hz, errp)) {
+        return;
+    }
+    if (hz > NANOSECONDS_PER_SECOND) {
+        error_setg(errp, "External McASP receive clock must not exceed 1 GHz");
+        return;
+    }
+    s->mcasp_external_rx_hz[instance] = hz;
+    if (s->mcasp_sync_timer) {
+        s->mcasp[instance].sync_deadline[0] = 0;
+        rcc_mcasp_sync(s);
+    }
+}
+
 static void rcc_set_power_clocks(Object *obj, bool value, Error **errp)
 {
     ((MH2PRCCMachineState *)obj)->power_clocks = value;
@@ -7249,9 +7313,15 @@ static void rcc_machine_init(MachineClass *mc)
                                    rcc_get_uart_efr, rcc_set_uart_efr);
     for (unsigned i = 0; i < ARRAY_SIZE(rcc_mcasp_gblctl); i++) {
         g_autofree char *name = g_strdup_printf("mcasp%u-reset-request", i + 1);
+        g_autofree char *clock_name = g_strdup_printf(
+            "experimental-mcasp%u-rx-clock-hz", i + 1);
 
         object_class_property_add(OBJECT_CLASS(mc), name, "uint32",
                                   rcc_get_mcasp_reset_request, NULL, NULL,
+                                  GUINT_TO_POINTER(i));
+        object_class_property_add(OBJECT_CLASS(mc), clock_name, "uint32",
+                                  rcc_get_mcasp_external_rx_hz,
+                                  rcc_set_mcasp_external_rx_hz, NULL,
                                   GUINT_TO_POINTER(i));
     }
 }

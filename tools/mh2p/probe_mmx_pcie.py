@@ -357,7 +357,7 @@ def probe(qemu, media, nor, mnand, output, timeout=30, *, pci_server=False):
                 "The optional "
                 "original PCI server is started alongside the retrying initializer; "
                 "normal startup waits for that initializer to exit first. "
-                "No MHI2 synthetic endpoint, RCC clock/reset wiring, downstream transactions "
+                "No synthetic endpoint, RCC clock/reset wiring, downstream transactions "
                 "or link-up are supplied. The probe stops during native link retries; "
                 "shutdown/PME completion is not verified.",
     }

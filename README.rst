@@ -1,7 +1,7 @@
-MHI2 fork: macOS quick start
-===========================
+MH2P developer source preview
+=============================
 
-For Audi, Volkswagen and Porsche boot instructions, see `README.md <README.md>`_.
+For build instructions and current limitations, see `README.md <README.md>`_.
 
 ===========
 QEMU README

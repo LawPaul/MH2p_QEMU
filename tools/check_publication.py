@@ -12,7 +12,7 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
-FORK_DIRECTORIES = ("tools/mh2p/", "tools/mhi2/")
+FORK_DIRECTORIES = ("tools/mh2p/",)
 PAYLOAD_SUFFIXES = {
     ".7z", ".bin", ".class", ".dmp", ".elf", ".exe", ".gz", ".ifs",
     ".img", ".jar", ".jxe", ".pcap", ".pcapng", ".pem", ".pfx", ".ppm",

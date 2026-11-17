@@ -3956,6 +3956,101 @@ static void test_mlb_dll_clock_controls(void)
     unlink(logfile);
 }
 
+static void set_mcasp_rx_clock(QTestState *s, unsigned instance, uint32_t hz)
+{
+    g_autofree char *property = g_strdup_printf(
+        "experimental-mcasp%u-rx-clock-hz", instance);
+
+    qtest_qmp_assert_success(s,
+        "{'execute':'qom-set','arguments':{'path':'/machine',"
+        "'property':%s,'value':%u}}", property, hz);
+}
+
+static void test_mcasp_external_rx_clock(void)
+{
+    const uint32_t base = 0x48460000, clock = 0x4a005550;
+    QTestState *s = start_rcc_options("-machine experimental-power-clocks=on");
+    QDict *response;
+
+    qtest_writel(s, base + 0xb0, 0x67);
+    qtest_writel(s, base + 0x70, 0x80);
+    qtest_writel(s, base + 0x74, 0);
+    qtest_writel(s, base + 0x60, 2);
+    qtest_clock_step(s, 1000000);
+    g_assert_cmphex(qtest_readl(s, base + 0x60), ==, 0);
+    set_mcasp_rx_clock(s, 2, 1000000);
+    qtest_clock_step(s, 1000000);
+    g_assert_cmphex(qtest_readl(s, base + 0x60), ==, 0);
+    set_mcasp_rx_clock(s, 1, 1000000);
+    qtest_clock_step(s, 999);
+    g_assert_cmphex(qtest_readl(s, base + 0x60), ==, 0);
+    qtest_clock_step(s, 1);
+    g_assert_cmphex(qtest_readl(s, base + 0x60), ==, 2);
+    qtest_writel(s, base + 0x60, 0x1a);
+    qtest_clock_step(s, 1000);
+    g_assert_cmphex(qtest_readl(s, base + 0x60), ==, 2);
+    qtest_writel(s, base + 0x60, 0x1e);
+    qtest_clock_step(s, 1000);
+    g_assert_cmphex(qtest_readl(s, base + 0x60), ==, 0x1e);
+    qtest_writel(s, base + 0x6c, 2);
+    qtest_clock_step(s, 1000);
+    g_assert_cmphex(qtest_readl(s, base + 0x60), ==, 0xe);
+    qtest_writel(s, base + 0x6c, 0);
+    qtest_clock_step(s, 1000);
+    g_assert_cmphex(qtest_readl(s, base + 0x60), ==, 0x1e);
+    g_assert_cmphex(qtest_readl(s, base + 0x80), ==, 0);
+    g_assert_cmphex(qtest_readl(s, base + 0x100c), ==, 0);
+    g_assert_cmphex(qtest_readl(s, 0x40d11000), ==, 0);
+    set_mcasp_rx_clock(s, 1, 0);
+    qtest_writel(s, base + 0x60, 0);
+    qtest_clock_step(s, 1000000);
+    g_assert_cmphex(qtest_readl(s, base + 0x60), ==, 0x1e);
+    set_mcasp_rx_clock(s, 1, 2000000);
+    qtest_clock_step(s, 499);
+    g_assert_cmphex(qtest_readl(s, base + 0x60), ==, 0x1e);
+    qtest_clock_step(s, 1);
+    g_assert_cmphex(qtest_readl(s, base + 0x60), ==, 0);
+    qtest_writel(s, clock, 0);
+    qtest_writel(s, base + 0x60, 2);
+    qtest_clock_step(s, 1000000);
+    g_assert_cmphex(qtest_readl(s, base + 0x60), ==, 0);
+    qtest_writel(s, clock, 2);
+    qtest_clock_step(s, 500);
+    g_assert_cmphex(qtest_readl(s, base + 0x60), ==, 2);
+
+    /* A pin clock cannot drive a receiver configured for an internal source. */
+    qtest_writel(s, base + 0x70, 0x20);
+    qtest_writel(s, base + 0x60, 0);
+    qtest_clock_step(s, 1000000);
+    g_assert_cmphex(qtest_readl(s, base + 0x60), ==, 2);
+    qtest_writel(s, base + 0x70, 0x80);
+    qtest_clock_step(s, 500);
+    g_assert_cmphex(qtest_readl(s, base + 0x60), ==, 0);
+    response = qtest_qmp(s,
+        "{'execute':'qom-set','arguments':{'path':'/machine',"
+        "'property':'experimental-mcasp1-rx-clock-hz','value':1000000001}}");
+    g_assert_nonnull(qdict_get_qdict(response, "error"));
+    qobject_unref(response);
+    g_assert_cmpuint(uint_property(s, "/machine",
+                                  "experimental-mcasp1-rx-clock-hz"),
+                     ==, 2000000);
+    qtest_system_reset(s);
+    g_assert_cmphex(qtest_readl(s, base + 0x60), ==, 0);
+    g_assert_cmpuint(uint_property(s, "/machine",
+                                  "experimental-mcasp1-rx-clock-hz"),
+                     ==, 2000000);
+    qtest_quit(s);
+
+    s = start_rcc_options("-machine experimental-mcasp1-rx-clock-hz=1000000");
+    qtest_writel(s, clock, 2);
+    qtest_writel(s, base + 0xb0, 0x67);
+    qtest_writel(s, base + 0x70, 0x80);
+    qtest_writel(s, base + 0x60, 2);
+    qtest_clock_step(s, 1000000);
+    g_assert_cmphex(qtest_readl(s, base + 0x60), ==, 0);
+    qtest_quit(s);
+}
+
 static void test_mlb_mcasp_clock_peer(void)
 {
     QTestState *s = start_rcc_options(
@@ -4077,6 +4172,11 @@ static void test_mlb_mcasp_clock_peer_routing(void)
     qtest_writel(s, base + 0x60, 2);
     qtest_clock_step(s, 11);
     g_assert_cmphex(qtest_readl(s, base + 0x60), ==, 2);
+    /* Synchronous RX bypasses its own internal frame generator as well. */
+    qtest_writel(s, base + 0x6c, 0x113);
+    qtest_writel(s, base + 0x60, 0x1e);
+    qtest_clock_step(s, 11);
+    g_assert_cmphex(qtest_readl(s, base + 0x60), ==, 0x1e);
     qtest_writel(s, base + 0x60, 0);
     qtest_clock_step(s, 11);
     g_assert_cmphex(qtest_readl(s, base + 0x60), ==, 0);
@@ -6996,6 +7096,8 @@ int main(int argc, char **argv)
                    test_mlb_mcasp_clock_divider);
     qtest_add_func("/mh2p-rcc/mlb-mcasp-clock-peer",
                    test_mlb_mcasp_clock_peer);
+    qtest_add_func("/mh2p-rcc/mcasp-external-rx-clock",
+                   test_mcasp_external_rx_clock);
     qtest_add_func("/mh2p-rcc/mlb-mcasp-clock-peer-routing",
                    test_mlb_mcasp_clock_peer_routing);
     qtest_add_func("/mh2p-rcc/mcasp-serializer-buffers",

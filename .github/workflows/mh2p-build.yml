@@ -10,7 +10,6 @@ on:
       - 'accel/**'
       - 'target/arm/**'
       - 'tools/mh2p/**'
-      - 'tools/mhi2/**'
       - 'tools/check_publication.py'
       - 'tools/test_check_publication.py'
       - 'subprojects/**'
@@ -72,4 +71,7 @@ jobs:
           PYTHONPATH=tools/mh2p:python "$RUNNER_TEMP/build/pyvenv/bin/python3" \
             -m unittest -v test_hmi_readiness test_rcc_axi_error test_arm_cpsr \
             test_arm_asid test_probe_pcie_sideband test_probe_rcc \
-            test_rcc_counter_clock test_rcc_uart test_rcc_persistence_catalog
+            test_rcc_counter_clock test_rcc_uart test_rcc_persistence_catalog \
+            test_qnx6_read test_shader_programs test_build_graphics_development \
+            test_graphics_smoke test_prepare_carplay_lab_image test_prepare_mnand
+          python3 tools/mh2p/check_sparse_copy.py

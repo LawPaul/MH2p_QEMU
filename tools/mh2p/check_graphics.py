@@ -311,17 +311,9 @@ def check(qemu, renderer, output, machine="mh2p"):
     output.mkdir(parents=True)
     with tempfile.TemporaryDirectory(prefix="mh2p-graphics-") as temporary:
         scratch = Path(temporary)
-        if machine == "mh2p":
-            kernel = scratch / "startup.bin"
-            kernel.write_bytes(bytes.fromhex("feffffea"))
-            args = ["-M", machine, "-m", "256M", "-kernel", str(kernel)]
-        else:
-            nor = scratch / "nor.bin"
-            with nor.open("wb") as stream:
-                stream.truncate(64 * 1024 * 1024)
-            iram = scratch / "iram.bin"
-            iram.write_bytes(bytes(0x40000))
-            args = ["-M", f"{machine},iram={iram}", "-m", "256M", "-bios", str(nor)]
+        kernel = scratch / "startup.bin"
+        kernel.write_bytes(bytes.fromhex("feffffea"))
+        args = ["-M", machine, "-m", "256M", "-kernel", str(kernel)]
         args += ["-display", "none", "-serial", "null", "-serial", "null",
                  "-nic", "none"]
         with BridgeVM(str(qemu), args=args, base_temp_dir=temporary,
@@ -332,7 +324,7 @@ def check(qemu, renderer, output, machine="mh2p"):
 
         (scratch / "tmp").mkdir()
         stress = subprocess.run([
-            sys.executable, str(ROOT / "tools/mhi2/check_gl_transport.py"),
+            sys.executable, str(ROOT / "tools/mh2p/check_gl_transport.py"),
             str(scratch), "--machine", machine, "--qemu", str(qemu),
         ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90)
         (output / "transport.log").write_bytes(stress.stdout)
@@ -343,9 +335,9 @@ def check(qemu, renderer, output, machine="mh2p"):
         os.mkfifo(str(pipe) + ".in")
         os.mkfifo(str(pipe) + ".out")
         frame = output / "frame.ppm"
-        env = dict(os.environ, MHI2_GL_FRAME=str(frame),
+        env = dict(os.environ, MH2P_GL_FRAME=str(frame),
                    EGL_PLATFORM="surfaceless", LIBGL_ALWAYS_SOFTWARE="1")
-        for key in ("MHI2_GL_DUMP_CLIENTS", "MHI2_GL_CAPTURE", "MHI2_GL_TRACE"):
+        for key in ("MH2P_GL_DUMP_CLIENTS", "MH2P_GL_CAPTURE", "MH2P_GL_TRACE"):
             env.pop(key, None)
         with open(str(pipe) + ".out", "r+b", buffering=0) as tx, \
                 open(str(pipe) + ".in", "r+b", buffering=0) as rx, \
@@ -457,7 +449,7 @@ def main():
     parser.add_argument("--qemu", type=Path, default=ROOT / "build/qemu-system-arm")
     parser.add_argument("--renderer", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--machine", choices=("mh2p", "mhi2-harman"), default="mh2p")
+    parser.add_argument("--machine", choices=("mh2p",), default="mh2p")
     args = parser.parse_args()
     print(json.dumps(check(args.qemu.resolve(), args.renderer.resolve(),
                            args.output.resolve(), args.machine), indent=2))

@@ -105,7 +105,7 @@ static const uint16_t mh2p_smmu_groups[] = {
     0xaa4, 0xaa8, 0xaac, /* ISP2B, GPU, GPUB */
 };
 
-/* Local T124 controller setup, not the MHI2 synthetic RCC endpoint. */
+/* Local T124 controller setup. */
 static const struct {
     hwaddr offset;
     uint32_t mask, reset;
