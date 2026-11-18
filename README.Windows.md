@@ -19,8 +19,10 @@ Intel Iris Xe graphics.
 | RCC | McSPI clocks start enabled when IPU1 firmware is loaded directly, as the bootloader leaves them (fixes the M4 `T_M4_Accl_Ctrl` bus fault) |
 | Renderer (`glhost`) | ANGLE default display; TCP transport (`MH2P_GL_CONNECT`); opt-in CPU ASTC decode (`MH2P_ASTC_SOFTWARE=1`) because ANGLE/D3D11 has no ASTC; opt-in live window with touch (`MH2P_GL_WINDOW=1`, `MH2P_GL_INPUT`) |
 
-All new device behaviour is off unless you turn it on, so the default behaviour of the models is
-unchanged.
+The permissive display modes, software ASTC decoding and live window are opt-in.
+Other changes are active by default, including the TMP451 temperature sensor,
+the BCM4359 PCIe model, DSP1 reset-release handling, and TCG TLB changes.
+The Windows port does not establish full head-unit readiness or working audio.
 
 ## Build QEMU
 

@@ -1102,7 +1102,8 @@ def probe(qemu, media, nor, mnand, image, output, timeout=30, *,
                                 "mmx_native_controller_enabled": True,
                                 "mmx_original_initializer_alive_retrying": True,
                                 "mmx_registers": read_registers(
-                                    tests["mmx"], link=config_transport),
+                                    tests["mmx"], link=config_transport,
+                                    wifi=config_transport),
                                 "mmx_clock_profile": clock_profile,
                                 "rcc_endpoint": endpoint,
                             })
@@ -1154,13 +1155,14 @@ def probe(qemu, media, nor, mnand, image, output, timeout=30, *,
                                     mmx.console_socket, captured, log,
                                     "sloginfo", timeout)
                                 verify_native_server(
-                                    slog, processes, device, endpoint=True)
+                                    slog, processes, device, endpoint=True,
+                                    wifi=True)
                                 mmx.cmd("stop")
                                 endpoint_registers = {}
                                 for offset, expected in (
                                     (0, 0xb801104c),
-                                    (0x10, 0x10000), (0x14, 0x14000),
-                                    (0x18, 0),
+                                    (0x10, 0x510000), (0x14, 0x514000),
+                                    (0x18, 0x500000),
                                 ):
                                     value = int(qtest_command(
                                         tests["rcc"],

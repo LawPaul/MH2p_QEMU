@@ -127,11 +127,12 @@ def verify_media(media):
     return manifest
 
 
-def verify_native_server(slog, processes, device, *, endpoint=False):
+def verify_native_server(slog, processes, device, *, endpoint=False, wifi=False):
     normalized = slog.replace(b"\r", b"")
     stages = (
         b"+ PCI Server v1.6 init start +",
-        b"PCIe 0 link is not active",
+        (b"++++ tk1_pcie_init() [PCIe 0] start ++++" if wifi else
+         b"PCIe 0 link is not active"),
         b"tk1_pcie_init() [PCIe 0] end, OK [PCI_ERR_OK]",
         (b"++++ tk1_pcie_init() [PCIe 1] start ++++" if endpoint else
          b"PCIe 1 link is not active"),
@@ -151,15 +152,22 @@ def verify_native_server(slog, processes, device, *, endpoint=False):
             raise RuntimeError(
                 f"Missing ordered original PCI server evidence: {stage!r}")
         position += match.end()
-    topology = [b"B0:D0:F0", b"B2:D0:F0"]
+    topology = [b"B0:D0:F0"]
+    if wifi:
+        topology.append(b"B1:D0:F0")
+    topology.append(b"B2:D0:F0")
     if endpoint:
         topology.append(b"B3:D0:F0")
     if re.findall(rb"Found device (B\d+:D\d+:F\d+)", normalized) != topology:
         raise RuntimeError(
             f"Unexpected PCI topology: expected {topology!r}")
+    if wifi and b"B1:D0:F0 - Check for /lib/dll/pci/pci_cap-0x10-14e443ef.so" not in normalized:
+        raise RuntimeError("Missing Broadcom 14e4:43ef PCI identity")
     if endpoint:
-        for bar, base, length in ((0, 0x10000, 0x4000),
-                                  (1, 0x14000, 0x1000), (2, 0, 0x10000)):
+        offset = 0x500000 if wifi else 0
+        for bar, base, length in ((0, offset + 0x10000, 0x4000),
+                                  (1, offset + 0x14000, 0x1000),
+                                  (2, offset, 0x10000)):
             marker = (f"Setting MEM BAR {bar} for B3:D0:F0 to "
                       f"{base:x} ({length:x})").encode()
             if marker not in normalized:
@@ -176,11 +184,14 @@ def verify_native_server(slog, processes, device, *, endpoint=False):
             "Original PCI resource manager did not expose /dev/pci")
 
 
-def read_registers(qtest, pci_server=False, *, link=False):
+def read_registers(qtest, pci_server=False, *, link=False, wifi=False):
     registers = {}
     for name, (address, expected) in (
         SERVER_REGISTERS if pci_server else REGISTERS
     ).items():
+        if wifi and address in (0x01000f00, 0x01000090):
+            expected = 0x40000000 if address == 0x01000f00 else 0x20110000
+            name = name.replace("_down", "_up")
         if link and address in (0x01001f00, 0x01001090):
             expected = 0x40000000 if address == 0x01001f00 else 0x20110000
             name = name.replace("_down", "_up")

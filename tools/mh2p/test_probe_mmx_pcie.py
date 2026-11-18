@@ -39,6 +39,31 @@ SLOG = b"".join(
 
 
 class MMXPCIeTests(unittest.TestCase):
+    def test_wifi_and_endpoint_topology(self):
+        line = b"Jan 01 00:00:56 5 17 0 PCI INFO [10:1]: "
+        native = SLOG.replace(
+            b"PCIe 0 link is not active",
+            b"++++ tk1_pcie_init() [PCIe 0] start ++++").replace(
+            b"PCIe 1 link is not active",
+            b"++++ tk1_pcie_init() [PCIe 1] start ++++").replace(
+            b"Found device B2:D0:F0",
+            b"Found device B1:D0:F0\n" + line + b"Found device B2:D0:F0")
+        native += (
+            b"Found device B3:D0:F0\n"
+            b"B1:D0:F0 - Check for /lib/dll/pci/pci_cap-0x10-14e443ef.so\n"
+            b"Setting MEM BAR 0 for B3:D0:F0 to 510000 (4000)\n"
+            b"Setting MEM BAR 1 for B3:D0:F0 to 514000 (1000)\n"
+            b"Setting MEM BAR 2 for B3:D0:F0 to 500000 (10000)\n")
+        probe.verify_native_server(native, SERVER_PROCESSES, DEVICE,
+                                   endpoint=True, wifi=True)
+        for missing in (b"Found device B1:D0:F0",
+                        b"pci_cap-0x10-14e443ef.so",
+                        b"Setting MEM BAR 2 for B3:D0:F0 to 500000 (10000)"):
+            with self.subTest(missing=missing), self.assertRaises(RuntimeError):
+                probe.verify_native_server(native.replace(missing, b""),
+                                           SERVER_PROCESSES, DEVICE,
+                                           endpoint=True, wifi=True)
+
     def test_live_endpoint_topology_and_exact_bar_assignments_required(self):
         native = SLOG.replace(
             b"PCIe 1 link is not active",

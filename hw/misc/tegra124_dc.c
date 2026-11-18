@@ -474,33 +474,9 @@ static inline const uint8_t *dc_pixels_at(const DCPixels *p, size_t offset,
     return p->pages[a >> 12] + (a & 4095);
 }
 
-/*
- * Window scanout reads only RAM: it cannot fault and has no side effects,
- * so a frame nobody displays needs no pixel copy to behave as the hardware.
- */
-static bool dc_window_in_ram(AddressSpace *as, hwaddr addr, size_t bytes)
-{
-    RCU_READ_LOCK_GUARD();
-
-    for (hwaddr page = addr & ~(hwaddr)4095; page < addr + bytes;
-         page += 4096) {
-        hwaddr start = MAX(page, addr);
-        hwaddr length = MIN(page + 4096, addr + bytes) - start;
-        hwaddr translated, available = length;
-        MemoryRegion *mr = address_space_translate(as, start, &translated,
-                                                    &available, false,
-                                                    MEMTXATTRS_UNSPECIFIED);
-
-        if (!memory_region_is_ram(mr) || available < length) {
-            return false;
-        }
-    }
-    return true;
-}
-
 static bool dc_draw_window(Tegra124DCState *s, unsigned window,
                            DisplaySurface *surface, uint32_t background,
-                           bool over_window, bool draw)
+                           bool over_window)
 {
     const uint32_t *w = s->window[DC_ACTIVE][window];
     unsigned width = w[0x105] & 0x1fff, height = w[0x105] >> 16;
@@ -519,9 +495,6 @@ static bool dc_draw_window(Tegra124DCState *s, unsigned window,
 
     if ((uint64_t)w[0x200] + bytes > (1ULL << 32)) {
         goto fault;
-    }
-    if (!draw && dc_window_in_ram(&s->dma_as[window], w[0x200], bytes)) {
-        return true;
     }
     if (!dc_pixels_map(&pixels, w[0x200], bytes)) {
         copy = g_malloc(bytes);
@@ -626,13 +599,9 @@ fault:
     return false;
 }
 
-/*
- * Scan out the active state.  Returns whether the frame completed, which
- * the hardware signals; the pixels reach the console surface only when
- * @draw is set, i.e. when a display or screendump asks for them.
- */
-static bool dc_scanout(Tegra124DCState *s, bool draw)
+static void dc_frame(void *opaque)
 {
+    Tegra124DCState *s = opaque;
     uint32_t *r = s->general[DC_ACTIVE];
     unsigned width = r[0x409] & 0x1fff, height = r[0x409] >> 16;
     uint32_t color = r[0x4e4];
@@ -640,7 +609,7 @@ static bool dc_scanout(Tegra124DCState *s, bool draw)
     unsigned windows[2], window_count = 0;
 
     if (!dc_scanout_valid(s, 0)) {
-        return false;
+        return;
     }
     qemu_console_resize(s->console, width, height);
     surface = qemu_console_surface(s->console);
@@ -650,7 +619,7 @@ static bool dc_scanout(Tegra124DCState *s, bool draw)
             if (window_count == ARRAY_SIZE(windows)) {
                 qemu_log_mask(LOG_GUEST_ERROR,
                               "tegra124-dc: too many active windows\n");
-                return false;
+                return;
             }
             windows[window_count++] = window;
         }
@@ -664,9 +633,8 @@ static bool dc_scanout(Tegra124DCState *s, bool draw)
         windows[1] = tmp;
     }
     /* A validated window covers the entire output, including transparent pixels. */
-    if (!window_count ||
-        !dc_draw_window(s, windows[0], surface, color, false, draw)) {
-        for (unsigned y = 0; draw && y < height; y++) {
+    if (!window_count || !dc_draw_window(s, windows[0], surface, color, false)) {
+        for (unsigned y = 0; y < height; y++) {
             uint32_t *row = (uint32_t *)(surface_data(surface) +
                                         y * surface_stride(surface));
             for (unsigned x = 0; x < width; x++) {
@@ -674,29 +642,14 @@ static bool dc_scanout(Tegra124DCState *s, bool draw)
             }
         }
         if (window_count) {
-            return false;
+            return;
         }
     }
-    return window_count != 2 ||
-           dc_draw_window(s, windows[1], surface, color, true, draw);
-}
-
-static bool dc_gfx_update(void *opaque)
-{
-    Tegra124DCState *s = opaque;
-
-    dc_scanout(s, true);
-    qemu_console_update_full(s->console);
-    return true;
-}
-
-static void dc_frame(void *opaque)
-{
-    Tegra124DCState *s = opaque;
-
-    if (!dc_scanout(s, false)) {
+    if (window_count == 2 &&
+        !dc_draw_window(s, windows[1], surface, color, true)) {
         return;
     }
+    qemu_console_update_full(s->console);
     qemu_irq_pulse(s->frame);
     dc_activate(s, s->pending_activation);
     s->pending_activation = 0;
@@ -1032,9 +985,7 @@ static void dc_init(Object *obj)
 
 static void dc_realize(DeviceState *dev, Error **errp)
 {
-    static const GraphicHwOps ops = {
-        .gfx_update = dc_gfx_update,
-    };
+    static const GraphicHwOps ops = {};
     Tegra124DCState *s = TEGRA124_DC(dev);
 
     if (!s->host1x || !s->dma_mr[0] || !s->dma_mr[1] || !s->dma_mr[2]) {
@@ -1044,7 +995,7 @@ static void dc_realize(DeviceState *dev, Error **errp)
     for (unsigned i = 0; i < 3; i++) {
         address_space_init(&s->dma_as[i], s->dma_mr[i], "tegra124-dc-dma");
     }
-    s->console = qemu_graphic_console_create(dev, 0, &ops, s);
+    s->console = qemu_graphic_console_create(dev, 0, &ops, NULL);
 }
 
 static void dc_unrealize(DeviceState *dev)

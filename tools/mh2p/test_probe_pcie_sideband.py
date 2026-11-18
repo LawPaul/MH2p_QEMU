@@ -88,15 +88,16 @@ class PairedProbeTests(unittest.TestCase):
             for address, expected in REGISTERS.values()
         }
         if config_transport:
-            registers.update({0x01001f00: 0x40000000, 0x01001090: 0x20110000,
+            registers.update({0x01000f00: 0x40000000, 0x01000090: 0x20110000,
+                              0x01001f00: 0x40000000, 0x01001090: 0x20110000,
                               0x01003910: 0x1b})
         tests[0].cmd.side_effect = lambda command: (
             f"OK {registers.get(int(command.split()[1], 0), 0):#x}\n")
         tests[1].cmd.return_value = "OK 0x0\n"
         if pci_server:
             endpoint_registers = {
-                0x51000000: 0xb801104c, 0x51000010: 0x10000,
-                0x51000014: 0x14000,
+                0x51000000: 0xb801104c, 0x51000010: 0x510000,
+                0x51000014: 0x514000, 0x51000018: 0x500000,
             }
             endpoint_registers.update(zip(
                 range(0x8cbff000, 0x8cbff014, 4), ipu_shared_words))
@@ -127,6 +128,8 @@ class PairedProbeTests(unittest.TestCase):
                 })
                 registers[0x01001f00] = 0x40000000
                 registers[0x01001090] = 0x20110000
+                registers[0x01000f00] = 0x40000000
+                registers[0x01000090] = 0x20110000
                 registers[0x01003910] = 0x1b
             if command == "wait $!":
                 captured.extend(b"\nPCIE: PCIE: port 0 up\n")
@@ -1184,7 +1187,7 @@ class PairedProbeTests(unittest.TestCase):
         self.assertFalse(report["diagnostic_configuration_window"])
         for boot in report["boots"]:
             self.assertEqual(
-                boot["native_endpoint_registers"]["0x10"], "0x10000")
+                boot["native_endpoint_registers"]["0x10"], "0x510000")
         for qtest in tests:
             self.assertTrue(all(call.args[0].startswith("readl ")
                                 for call in qtest.cmd.call_args_list))

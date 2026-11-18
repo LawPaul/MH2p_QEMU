@@ -365,7 +365,7 @@ static void test_dsp1_native_local_map(void)
     g_assert_cmphex(qtest_readl(s, 0x40d11020), ==, 1);
     qtest_writel(s, 0x48465000, 0x12001);
     qtest_clock_step(s, 300000);
-    g_assert_cmphex(qtest_readl(s, 0x40d11000), ==, 8);
+    g_assert_cmphex(qtest_readl(s, 0x40d11000), ==, 0);
     qtest_writel(s, 0x40d12408, UINT32_MAX);
     g_assert_cmphex(qtest_readl(s, 0x40d12400), ==, 0);
     g_assert_cmphex(qtest_readl(s, 0x48465004), ==, 0);
@@ -440,7 +440,7 @@ static void test_dsp1_native_interrupts(void)
     qtest_quit(s);
 }
 
-static void test_dsp1_held_reset(void)
+static void test_dsp1_reset_without_backend(void)
 {
     g_autofree char *logfile = NULL;
     g_autofree char *contents = NULL;
@@ -486,9 +486,24 @@ static void test_dsp1_held_reset(void)
         g_assert_cmphex(qtest_readl(s, 0x4ae06400), ==, 0x3f0003);
         g_assert_cmphex(qtest_readl(s, 0x4ae06404), ==, 0x3f7);
         qtest_writel(s, 0x4ae06410, value);
-        g_assert_cmphex(qtest_readl(s, 0x4ae06410), ==, 3);
+        g_assert_cmphex(qtest_readl(s, 0x4ae06410), ==, value);
         g_assert_cmphex(qtest_readl(s, 0x4ae06414), ==, 0);
     }
+    qtest_writel(s, 0x4ae06410, 0);
+    g_assert_cmphex(qtest_readl(s, 0x4ae06414), ==, 0);
+    qtest_writel(s, 0x4a005420, 1);
+    g_assert_cmphex(qtest_readl(s, 0x4ae06414), ==, 3);
+    g_assert_cmphex(qtest_readl(s, 0x4a005420), ==, 1);
+    qtest_writel(s, 0x4ae06414, 1);
+    g_assert_cmphex(qtest_readl(s, 0x4ae06414), ==, 2);
+    qtest_writel(s, 0x4ae06410, 3);
+    g_assert_cmphex(qtest_readl(s, 0x4a005420), ==, 0x50001);
+    qtest_writel(s, 0x4ae06414, 2);
+    qtest_writel(s, 0x4ae06410, 1);
+    g_assert_cmphex(qtest_readl(s, 0x4ae06414), ==, 2);
+    qtest_writel(s, 0x4ae06414, 2);
+    qtest_writel(s, 0x4ae06410, 2);
+    g_assert_cmphex(qtest_readl(s, 0x4ae06414), ==, 1);
     qtest_system_reset(s);
     g_assert_cmphex(qtest_readl(s, 0x4a005420), ==, 0x70000);
     g_assert_cmphex(qtest_readl(s, 0x4a005400), ==, 3);
@@ -497,7 +512,7 @@ static void test_dsp1_held_reset(void)
     qtest_quit(s);
     g_assert_true(g_file_get_contents(logfile, &contents, NULL, &error));
     g_assert_no_error(error);
-    g_assert_nonnull(strstr(contents, "unsupported write at 0x4ae06410"));
+    g_assert_null(strstr(contents, "unsupported write at 0x4ae06410"));
     g_assert_nonnull(strstr(contents, "unsupported write at 0x4ae06400"));
     unlink(logfile);
 }
@@ -6983,7 +6998,8 @@ int main(int argc, char **argv)
     qtest_add_func("/mh2p-rcc/boot-devices-and-reset", test_boot_devices);
     qtest_add_func("/mh2p-rcc/architectural-counter-clock",
                    test_architectural_counter_clock);
-    qtest_add_func("/mh2p-rcc/dsp1-held-reset", test_dsp1_held_reset);
+    qtest_add_func("/mh2p-rcc/dsp1-reset-without-backend",
+                   test_dsp1_reset_without_backend);
     qtest_add_func("/mh2p-rcc/pbias-controls", test_pbias_controls);
     qtest_add_func("/mh2p-rcc/ddr-pad-controls", test_ddr_pad_controls);
     qtest_add_data_func("/mh2p-rcc/ipu-mmu-registers",

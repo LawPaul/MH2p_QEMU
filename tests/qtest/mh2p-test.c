@@ -1797,7 +1797,7 @@ static void test_i2c_nack_payload(void)
         qtest_writel(s, base + 0x68, 0xffffffff);
         qtest_writel(s, base + 0x50, 0x10);
         qtest_writel(s, base + 0x50, length - 1);
-        qtest_writel(s, base + 0x50, (1 << 16) | (0x4c << 1));
+        qtest_writel(s, base + 0x50, (1 << 16) | (0x4d << 1));
         g_assert_cmphex(qtest_readl(s, base + 0x68) & 0xc8, ==, 0x88);
         for (unsigned i = 0; i < length; i += 4) {
             qtest_writel(s, base + 0x50, 0x03030303);
@@ -1805,7 +1805,7 @@ static void test_i2c_nack_payload(void)
         qtest_writel(s, base + 0x68, 0xffffffff);
         qtest_writel(s, base + 0x50, 0x10);
         qtest_writel(s, base + 0x50, 0);
-        qtest_writel(s, base + 0x50, (1 << 19) | (0x4c << 1));
+        qtest_writel(s, base + 0x50, (1 << 19) | (0x4d << 1));
         g_assert_cmphex(qtest_readl(s, base + 0x68) & 0xc8, ==, 0xc8);
     }
 
@@ -1813,7 +1813,7 @@ static void test_i2c_nack_payload(void)
     for (unsigned reset = 0; reset < 2; reset++) {
         qtest_writel(s, base + 0x50, 0x10);
         qtest_writel(s, base + 0x50, 8);
-        qtest_writel(s, base + 0x50, 0x4c << 1);
+        qtest_writel(s, base + 0x50, 0x4d << 1);
         if (reset) {
             qtest_writel(s, 0x60006308, 1U << 22);
             qtest_writel(s, 0x6000630c, 1U << 22);
@@ -1824,6 +1824,44 @@ static void test_i2c_nack_payload(void)
         i2c_nack_packet(s, base);
         g_assert_cmphex(qtest_readl(s, base + 0x68) & 0xc8, ==, 0xc8);
     }
+    qtest_quit(s);
+}
+
+static uint8_t tmp451_test_read(QTestState *s, uint64_t base, uint8_t reg)
+{
+    qtest_writel(s, base + 0x68, 0xffffffff);
+    qtest_writel(s, base + 0x50, 0x10);
+    qtest_writel(s, base + 0x50, 0);
+    qtest_writel(s, base + 0x50, (1 << 16) | (0x4c << 1));
+    qtest_writel(s, base + 0x50, reg);
+    qtest_writel(s, base + 0x50, 0x10);
+    qtest_writel(s, base + 0x50, 0);
+    qtest_writel(s, base + 0x50, (1 << 19) | (0x4c << 1));
+    g_assert_cmphex(qtest_readl(s, base + 0x68) & 8, ==, 0);
+    return qtest_readl(s, base + 0x54) & 0xff;
+}
+
+static void test_tmp451(void)
+{
+    const uint64_t base = 0x7000c400;
+    QTestState *s = start_mh2p("");
+
+    qtest_writel(s, base, 0xc00);
+    g_assert_cmphex(tmp451_test_read(s, base, 0xfe), ==, 0x55);
+    g_assert_cmphex(tmp451_test_read(s, base, 0x00), ==, 42);
+    g_assert_cmphex(tmp451_test_read(s, base, 0x01), ==, 45);
+    g_assert_cmphex(tmp451_test_read(s, base, 0x03), ==, 0);
+    qtest_writel(s, base + 0x50, 0x10);
+    qtest_writel(s, base + 0x50, 1);
+    qtest_writel(s, base + 0x50, 0x4c << 1);
+    qtest_writel(s, base + 0x50, 0x0409);
+    g_assert_cmphex(qtest_readl(s, base + 0x68) & 8, ==, 0);
+    g_assert_cmphex(tmp451_test_read(s, base, 0x03), ==, 4);
+    g_assert_cmphex(tmp451_test_read(s, base, 0x00), ==, 106);
+    g_assert_cmphex(tmp451_test_read(s, base, 0x01), ==, 109);
+    qtest_system_reset(s);
+    qtest_writel(s, base, 0xc00);
+    g_assert_cmphex(tmp451_test_read(s, base, 0x03), ==, 0);
     qtest_quit(s);
 }
 
@@ -4791,7 +4829,9 @@ static void test_dc_window_fault_bounded(void)
     const uint32_t iova = 0x90000000, ptb = 0x80000000;
     const uint32_t ptes = 0x80001000, physical = 0x80010000;
     g_autofree char *path = NULL, *options = NULL, *log = NULL;
+    g_autofree char *before_screenshot = NULL;
     g_autoptr(GError) error = NULL;
+    g_autoptr(GBytes) image = NULL;
     int fd = g_file_open_tmp("mh2p-dc-fault-XXXXXX", &path, &error);
     QTestState *s;
 
@@ -4824,6 +4864,14 @@ static void test_dc_window_fault_bounded(void)
     qtest_writel(s, dc + 0x2000, iova);
     qtest_writel(s, dc + 0x104, 0x303);
     qtest_clock_step(s, 200000);
+    g_assert_true(g_file_get_contents(path, &before_screenshot, NULL, &error));
+    g_assert_no_error(error);
+    g_assert_nonnull(strstr(before_screenshot, "window 0 DMA fault"));
+    image = dc_read_pixels(s, 0, 64, 32);
+    g_assert_true(g_file_get_contents(path, &log, NULL, &error));
+    g_assert_no_error(error);
+    g_assert_cmpstr(log, ==, before_screenshot);
+    g_clear_pointer(&log, g_free);
     qtest_quit(s);
     g_assert_true(g_file_get_contents(path, &log, NULL, &error));
     g_assert_no_error(error);
@@ -6172,6 +6220,7 @@ int main(int argc, char **argv)
     qtest_add_func("/mh2p/mnand-handoff-and-cold-reset", test_mnand_handoff);
     qtest_add_func("/mh2p/i2c-nack-and-reset", test_i2c);
     qtest_add_func("/mh2p/i2c-nack-payload", test_i2c_nack_payload);
+    qtest_add_func("/mh2p/tmp451-probe", test_tmp451);
     qtest_add_func("/mh2p/spi-pio-and-reset", test_spi);
     return g_test_run();
 }
