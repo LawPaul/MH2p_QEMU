@@ -2328,6 +2328,12 @@ static bool get_phys_addr_lpae(CPUARMState *env, S1Translate *ptw,
         uint8_t attrindx;
         uint64_t mair;
 
+        /*
+         * nG (bit 11): only non-global entries are tied to the ASID.  In the
+         * EL3 regime bit 11 is NSE and there are no ASIDs at all.
+         */
+        result->f.global = out_space == ARMSS_Root || !extract32(attrs, 11, 1);
+
         switch (out_space) {
         case ARMSS_Root:
             /*

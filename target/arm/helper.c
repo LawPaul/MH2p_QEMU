@@ -2977,6 +2977,23 @@ static void vmsa_tcr_el12_write(CPUARMState *env, const ARMCPRegInfo *ri,
     raw_write(env, ri, value);
 }
 
+/*
+ * The AArch32 long-descriptor ASID that new non-global PL1&0 entries carry:
+ * TTBCR.A1 selects TTBR0 or TTBR1, in the current security state's bank.
+ * -1 where that does not apply (AArch64, short descriptors).
+ */
+static int vmsa_active_asid(CPUARMState *env)
+{
+    int el;
+
+    if (is_a64(env) || !extended_addresses_enabled(env)) {
+        return -1;
+    }
+    el = arm_is_secure_below_el3(env) && !arm_el_is_aa64(env, 3) ? 3 : 1;
+    return extract64(env->cp15.tcr_el[el] & TTBCR_A1 ?
+                     env->cp15.ttbr1_el[el] : env->cp15.ttbr0_el[el], 48, 8);
+}
+
 static void vmsa_ttbr_write(CPUARMState *env, const ARMCPRegInfo *ri,
                             uint64_t value)
 {
@@ -2987,11 +3004,12 @@ static void vmsa_ttbr_write(CPUARMState *env, const ARMCPRegInfo *ri,
 
         /* The tag names every EL1/EL3 TTBR ASID, whichever is active. */
         raw_write(env, ri, value);
-        tlb_flush_asid_switch(CPU(cpu), arm_tlbmask_keep_ptw(),
+        tlb_flush_asid_switch_active(CPU(cpu), arm_tlbmask_keep_ptw(),
                               extract64(env->cp15.ttbr0_el[1], 48, 16) |
                               extract64(env->cp15.ttbr1_el[1], 48, 16) << 16 |
                               extract64(env->cp15.ttbr0_el[3], 48, 16) << 32 |
-                              extract64(env->cp15.ttbr1_el[3], 48, 16) << 48);
+                              extract64(env->cp15.ttbr1_el[3], 48, 16) << 48,
+                              vmsa_active_asid(env));
         return;
     }
     raw_write(env, ri, value);

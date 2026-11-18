@@ -1079,6 +1079,9 @@ bool tcg_exec_realizefn(CPUState *cpu, Error **errp)
     cpu->tb_jmp_cache_set = g_new0(CPUJumpCacheSet, 1);
     cpu->tb_jmp_cache_set->used[0] = true;
     cpu->tb_jmp_cache_set->tag[0] = UINT64_MAX;
+    for (unsigned i = 0; i < TB_JMP_CACHE_BANKS; i++) {
+        cpu->tb_jmp_cache_set->asid[i] = -1;
+    }
     cpu->tb_jmp_cache = &cpu->tb_jmp_cache_set->bank[0];
     tlb_init(cpu);
 #ifndef CONFIG_USER_ONLY

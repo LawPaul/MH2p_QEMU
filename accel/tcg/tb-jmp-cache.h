@@ -48,10 +48,13 @@ typedef struct CPUJumpCacheSet {
     bool used[TB_JMP_CACHE_BANKS];
     uint32_t bank_gen[TB_JMP_CACHE_BANKS];
     uint64_t tag[TB_JMP_CACHE_BANKS];
+    /* ASID of the bank's non-global translations, or -1 if unknown. */
+    int asid[TB_JMP_CACHE_BANKS];
     CPUJumpCache bank[TB_JMP_CACHE_BANKS];
 } CPUJumpCacheSet;
 
 void tcg_switch_jmp_cache(CPUState *cpu, uint64_t tag);
+void tcg_switch_jmp_cache_asid(CPUState *cpu, uint64_t tag, int asid);
 void tcg_flush_jmp_cache_asid(CPUState *cpu, uint32_t asid);
 
 #endif /* ACCEL_TCG_TB_JMP_CACHE_H */

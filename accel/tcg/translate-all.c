@@ -649,6 +649,7 @@ void tcg_flush_jmp_cache(CPUState *cpu)
     tcg_clear_jmp_cache_bank(jc);
     if (qemu_cpu_is_self(cpu)) {
         set->bank_gen[set->current] = gen;
+        set->asid[set->current] = -1;
     }
 }
 
@@ -665,10 +666,23 @@ void tcg_flush_jmp_cache_asid(CPUState *cpu, uint32_t asid)
     if (unlikely(set == NULL || cpu->tb_jmp_cache == NULL)) {
         return;
     }
-    tcg_clear_jmp_cache_bank(cpu->tb_jmp_cache);
+    /*
+     * With known ASIDs, only the banks of @asid hold translations it
+     * invalidates (global ones survive a TLBIASID).
+     */
+    if (set->asid[set->current] < 0 ||
+        set->asid[set->current] == (int)(asid & 0xff)) {
+        tcg_clear_jmp_cache_bank(cpu->tb_jmp_cache);
+    }
     for (i = 0; i < TB_JMP_CACHE_BANKS; i++) {
         uint64_t tag = set->tag[i];
 
+        if (set->used[i] && i != set->current && set->asid[i] >= 0) {
+            if (set->asid[i] == (int)(asid & 0xff)) {
+                set->used[i] = false;
+            }
+            continue;
+        }
         if (set->used[i] && i != set->current &&
             (tag == UINT64_MAX || (tag & 0xff) == asid ||
              ((tag >> 8) & 0xff) == asid || ((tag >> 16) & 0xff) == asid ||
@@ -683,6 +697,11 @@ void tcg_flush_jmp_cache_asid(CPUState *cpu, uint32_t asid)
  * called by @cpu itself, together with a flush of its softmmu TLB.
  */
 void tcg_switch_jmp_cache(CPUState *cpu, uint64_t tag)
+{
+    tcg_switch_jmp_cache_asid(cpu, tag, -1);
+}
+
+void tcg_switch_jmp_cache_asid(CPUState *cpu, uint64_t tag, int asid)
 {
     CPUJumpCacheSet *set = cpu->tb_jmp_cache_set;
     uint32_t gen;
@@ -709,6 +728,7 @@ void tcg_switch_jmp_cache(CPUState *cpu, uint64_t tag)
         set->tag[i] = tag;
         set->bank_gen[i] = gen - 1;
     }
+    set->asid[i] = asid;
     if (set->bank_gen[i] != gen) {
         tcg_clear_jmp_cache_bank(&set->bank[i]);
         set->bank_gen[i] = gen;

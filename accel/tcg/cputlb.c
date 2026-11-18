@@ -294,6 +294,7 @@ static void tlb_mmu_flush_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast)
     desc->n_used_entries = 0;
     desc->large_page_addr = -1;
     desc->large_page_mask = -1;
+    desc->n_large_pages = 0;
     desc->vindex = 0;
     memset(fast->table, -1, sizeof_tlb(fast));
     memset(desc->vtable, -1, sizeof(desc->vtable));
@@ -343,6 +344,79 @@ void tlb_init(CPUState *cpu)
 
     for (i = 0; i < NB_MMU_MODES; i++) {
         tlb_mmu_init(&cpu->neg.tlb.d[i], cpu_tlb_fast(cpu, i), now);
+    }
+}
+
+/*
+ * ASID-tagged TLB behaviour (on by default; QEMU_TCG_TLB_KEEP_GLOBAL=0 turns
+ * it off).  The live TLB holds the global entries plus the non-global
+ * entries of the active ASID, which is what an ASID-tagged TLB would use.
+ * A change of ASID therefore drops only the non-global entries, and a
+ * TLBIASID of an ASID that is not active finds nothing to drop.  Entries
+ * the target cannot prove global (CPUTLBEntryFull.global false) count as
+ * non-global, and an unknown ASID (-1) falls back to a full flush.
+ */
+#define TLB_ASID_CPUS 64
+
+static int tlb_live_asid_plus1[TLB_ASID_CPUS];  /* 0: active ASID unknown */
+
+static bool tlb_keep_global(void)
+{
+    static int keep = -1;
+
+    if (keep < 0) {
+        const char *e = getenv("QEMU_TCG_TLB_KEEP_GLOBAL");
+
+        keep = !(e && *e == '0');
+    }
+    return keep;
+}
+
+bool tlb_asid_precise(void)
+{
+    return tlb_keep_global();
+}
+
+static int tlb_live_asid(CPUState *cpu)
+{
+    unsigned i = cpu->cpu_index;
+
+    return i < TLB_ASID_CPUS ? tlb_live_asid_plus1[i] - 1 : -1;
+}
+
+static void tlb_set_live_asid(CPUState *cpu, int asid)
+{
+    unsigned i = cpu->cpu_index;
+
+    if (i < TLB_ASID_CPUS) {
+        tlb_live_asid_plus1[i] = asid + 1;
+    }
+}
+
+static inline bool tlb_entry_is_empty(const CPUTLBEntry *te);
+
+/* Drop every entry not known to be global.  Called with tlb.c.lock held. */
+static void tlb_flush_nonglobal_locked(CPUState *cpu, MMUIdxMap idxmap)
+{
+    for (MMUIdxMap w = idxmap & cpu->neg.tlb.c.dirty; w; w &= w - 1) {
+        int midx = ctz32(w);
+        CPUTLBDesc *desc = &cpu->neg.tlb.d[midx];
+        CPUTLBDescFast *fast = cpu_tlb_fast(cpu, midx);
+        size_t n = tlb_n_entries(fast);
+
+        for (size_t i = 0; i < n; i++) {
+            CPUTLBEntry *te = &fast->table[i];
+
+            if (!tlb_entry_is_empty(te) && !desc->fulltlb[i].global) {
+                memset(te, -1, sizeof(*te));
+                desc->n_used_entries--;
+            }
+        }
+        for (size_t i = 0; i < CPU_VTLB_SIZE; i++) {
+            if (!desc->vfulltlb[i].global) {
+                memset(&desc->vtable[i], -1, sizeof(desc->vtable[i]));
+            }
+        }
     }
 }
 
@@ -464,6 +538,8 @@ static void tlb_flush_mmuidx_entries(CPUState *cpu, MMUIdxMap asked)
 
 static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
 {
+    /* A full flush may come with a change of the active ASID (TTBCR.A1). */
+    tlb_set_live_asid(cpu, -1);
     tlb_flush_mmuidx_entries(cpu, data.host_int);
     tcg_flush_jmp_cache(cpu);
 }
@@ -488,18 +564,71 @@ void tlb_flush(CPUState *cpu)
  * @tag is retained in a separate bank: guests must invalidate TLBs before
  * reusing an ASID, and every TLB invalidation also invalidates all banks.
  */
-void tlb_flush_asid_switch(CPUState *cpu, MMUIdxMap idxmap, uint64_t tag)
+void tlb_flush_asid_switch_active(CPUState *cpu, MMUIdxMap idxmap,
+                                  uint64_t tag, int asid)
 {
     assert_cpu_is_self(cpu);
+    if (tlb_keep_global() && asid >= 0) {
+        qemu_spin_lock(&cpu->neg.tlb.c.lock);
+        tlb_flush_nonglobal_locked(cpu, idxmap);
+        qemu_spin_unlock(&cpu->neg.tlb.c.lock);
+        tlb_set_live_asid(cpu, asid);
+        /* The jump cache may then rely on the ASID as well. */
+        tcg_switch_jmp_cache_asid(cpu, tag, asid);
+        return;
+    }
+    tlb_set_live_asid(cpu, -1);
     tlb_flush_mmuidx_entries(cpu, idxmap);
     tcg_switch_jmp_cache(cpu, tag);
+}
+
+void tlb_flush_asid_switch(CPUState *cpu, MMUIdxMap idxmap, uint64_t tag)
+{
+    tlb_flush_asid_switch_active(cpu, idxmap, tag, -1);
 }
 
 void tlb_flush_asid(CPUState *cpu, MMUIdxMap idxmap, uint32_t asid)
 {
     assert_cpu_is_self(cpu);
-    tlb_flush_mmuidx_entries(cpu, idxmap);
+    if (tlb_keep_global() && tlb_live_asid(cpu) >= 0) {
+        /* Other ASIDs have no entries here; globals survive TLBIASID. */
+        if (tlb_live_asid(cpu) == (int)(asid & 0xff)) {
+            qemu_spin_lock(&cpu->neg.tlb.c.lock);
+            tlb_flush_nonglobal_locked(cpu, idxmap);
+            qemu_spin_unlock(&cpu->neg.tlb.c.lock);
+        }
+    } else {
+        tlb_flush_mmuidx_entries(cpu, idxmap);
+    }
     tcg_flush_jmp_cache_asid(cpu, asid);
+}
+
+static void tlb_flush_asid_async_work(CPUState *cpu, run_on_cpu_data data)
+{
+    tlb_flush_asid(cpu, (MMUIdxMap)data.target_ptr, data.target_ptr >> 32);
+}
+
+/*
+ * TLBIASIDIS: invalidate one ASID on every vCPU instead of flushing
+ * everything (see tlb_asid_precise()).
+ */
+void tlb_flush_asid_all_cpus_synced(CPUState *src_cpu, MMUIdxMap idxmap,
+                                    uint32_t asid)
+{
+    run_on_cpu_data d =
+        RUN_ON_CPU_TARGET_PTR(idxmap | (vaddr)(asid & 0xff) << 32);
+
+    QEMU_BUILD_BUG_ON(sizeof(MMUIdxMap) > 4 || sizeof(vaddr) < 8);
+    if (tlb_flush_synced_in_place()) {
+        CPUState *cpu;
+
+        CPU_FOREACH(cpu) {
+            tlb_flush_asid_async_work(cpu, d);
+        }
+        return;
+    }
+    flush_all_helper(src_cpu, tlb_flush_asid_async_work, d);
+    tlb_flush_src_cpu(src_cpu, tlb_flush_asid_async_work, d);
 }
 
 void tlb_flush_by_mmuidx_all_cpus_synced(CPUState *src_cpu, MMUIdxMap idxmap)
@@ -589,14 +718,48 @@ static inline void tlb_flush_vtlb_page_locked(CPUState *cpu, int mmu_idx,
     tlb_flush_vtlb_page_mask_locked(cpu, mmu_idx, page, -1);
 }
 
+/*
+ * The tracked large page holding @page, or -1.  Only meaningful when @page
+ * lies inside the covering region (large_page_addr/mask).
+ */
+static int tlb_large_page_region(CPUTLBDesc *d, vaddr page)
+{
+    for (unsigned i = 0; i < d->n_large_pages; i++) {
+        if ((page & d->lp_region_mask[i]) == d->lp_region_addr[i]) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 static void tlb_flush_page_locked(CPUState *cpu, int midx, vaddr page)
 {
     vaddr lp_addr = cpu->neg.tlb.d[midx].large_page_addr;
     vaddr lp_mask = cpu->neg.tlb.d[midx].large_page_mask;
 
-    /* Check if we need to flush due to large pages.  */
+    /*
+     * Check if we need to flush due to large pages.  The covering region
+     * spans everything between the large pages (on QNX, user pages near 0
+     * and kernel sections at the top), so look up the large page itself:
+     * a page outside all of them needs only its own entry flushed.
+     */
     if ((page & lp_mask) == lp_addr) {
-        CPUTLBDescFast *f = &cpu->neg.tlb.f[midx];
+        CPUTLBDesc *d = &cpu->neg.tlb.d[midx];
+        int r = tlb_large_page_region(d, page);
+
+        if (r < 0) {
+            if (tlb_flush_entry_locked(tlb_entry(cpu, midx, page), page)) {
+                tlb_n_used_entries_dec(cpu, midx);
+            }
+            tlb_flush_vtlb_page_locked(cpu, midx, page);
+            return;
+        }
+        lp_addr = d->lp_region_addr[r];
+        lp_mask = d->lp_region_mask[r];
+    }
+    if ((page & lp_mask) == lp_addr) {
+        /* The fast tables are not indexed by mmu_idx: use cpu_tlb_fast(). */
+        CPUTLBDescFast *f = cpu_tlb_fast(cpu, midx);
         vaddr lp_pages = (~lp_mask >> TARGET_PAGE_BITS) + 1;
 
         /*
@@ -780,6 +943,21 @@ void tlb_flush_page_all_cpus_synced(CPUState *src, vaddr addr)
     tlb_flush_page_by_mmuidx_all_cpus_synced(src, addr, ALL_MMUIDX_BITS);
 }
 
+static bool tlb_range_hits_large_page(CPUTLBDesc *d, vaddr addr, vaddr len)
+{
+    vaddr last = addr + len - 1;
+
+    for (unsigned i = 0; i < d->n_large_pages; i++) {
+        vaddr start = d->lp_region_addr[i];
+        vaddr end = start | ~d->lp_region_mask[i];
+
+        if (addr <= end && last >= start) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void tlb_flush_range_locked(CPUState *cpu, int midx,
                                    vaddr addr, vaddr len,
                                    unsigned bits)
@@ -811,7 +989,8 @@ static void tlb_flush_range_locked(CPUState *cpu, int midx,
      * Because large_page_mask contains all 1's from the msb,
      * we only need to test the end of the range.
      */
-    if (((addr + len - 1) & d->large_page_mask) == d->large_page_addr) {
+    if (((addr + len - 1) & d->large_page_mask) == d->large_page_addr &&
+        tlb_range_hits_large_page(d, addr, len)) {
         tlb_debug("forcing full flush midx %d ("
                   "%016" VADDR_PRIx "/%016" VADDR_PRIx ")\n",
                   midx, d->large_page_addr, d->large_page_mask);
@@ -1120,6 +1299,43 @@ static void tlb_add_large_page(CPUState *cpu, int mmu_idx,
     }
     cpu->neg.tlb.d[mmu_idx].large_page_addr = lp_addr & lp_mask;
     cpu->neg.tlb.d[mmu_idx].large_page_mask = lp_mask;
+
+    /* Record the large page itself (see tlb_large_page_region()). */
+    CPUTLBDesc *d = &cpu->neg.tlb.d[mmu_idx];
+    vaddr mask = ~(size - 1);
+    vaddr base = addr & mask;
+    unsigned i, best = 0;
+    int best_bits = -1;
+
+    for (i = 0; i < d->n_large_pages; i++) {
+        if ((base & d->lp_region_mask[i]) == d->lp_region_addr[i] &&
+            ~d->lp_region_mask[i] >= ~mask) {
+            return;
+        }
+    }
+    if (d->n_large_pages < CPU_TLB_LP_REGIONS) {
+        d->lp_region_addr[d->n_large_pages] = base;
+        d->lp_region_mask[d->n_large_pages++] = mask;
+        return;
+    }
+    /* Full: widen the region that needs the smallest merge to cover it. */
+    for (i = 0; i < d->n_large_pages; i++) {
+        vaddr m = d->lp_region_mask[i] & mask;
+
+        while (((d->lp_region_addr[i] ^ base) & m) != 0) {
+            m <<= 1;
+        }
+        if (ctpop64(m) > best_bits) {
+            best_bits = ctpop64(m);
+            best = i;
+        }
+    }
+    mask &= d->lp_region_mask[best];
+    while (((d->lp_region_addr[best] ^ base) & mask) != 0) {
+        mask <<= 1;
+    }
+    d->lp_region_addr[best] = base & mask;
+    d->lp_region_mask[best] = mask;
 }
 
 static inline void tlb_set_compare(CPUTLBEntryFull *full, CPUTLBEntry *ent,

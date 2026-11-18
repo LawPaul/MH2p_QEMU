@@ -60,7 +60,12 @@ static void tlbiasid_is_write(CPUARMState *env, const ARMCPRegInfo *ri,
 {
     CPUState *cs = env_cpu(env);
 
-    tlb_flush_by_mmuidx_all_cpus_synced(cs, arm_tlbmask_keep_ptw());
+    if (tlb_asid_precise() && !arm_feature(env, ARM_FEATURE_PMSA)) {
+        tlb_flush_asid_all_cpus_synced(cs, arm_tlbmask_keep_ptw(),
+                                       value & 0xff);
+    } else {
+        tlb_flush_by_mmuidx_all_cpus_synced(cs, arm_tlbmask_keep_ptw());
+    }
 }
 
 static void tlbimva_is_write(CPUARMState *env, const ARMCPRegInfo *ri,

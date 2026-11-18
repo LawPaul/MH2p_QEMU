@@ -148,6 +148,20 @@ void tlb_flush_asid_switch(CPUState *cpu, MMUIdxMap idxmap, uint64_t tag);
  * TLBIASID.
  */
 void tlb_flush_asid(CPUState *cpu, MMUIdxMap idxmap, uint32_t asid);
+/*
+ * As tlb_flush_asid_switch(), naming the ASID (8 bits) that the new
+ * context's non-global entries carry, or -1 if unknown.
+ */
+void tlb_flush_asid_switch_active(CPUState *cpu, MMUIdxMap idxmap,
+                                  uint64_t tag, int asid);
+/*
+ * True when the TLB keeps global entries across ASIDs, so that a TLBIASID
+ * must only drop that ASID (QEMU_TCG_TLB_KEEP_GLOBAL=0 turns it off).
+ */
+bool tlb_asid_precise(void);
+/* TLBIASIDIS: tlb_flush_asid() on every vCPU, synchronised. */
+void tlb_flush_asid_all_cpus_synced(CPUState *src_cpu, MMUIdxMap idxmap,
+                                    uint32_t asid);
 
 /**
  * tlb_flush_all_cpus_synced:
@@ -261,6 +275,11 @@ static inline void tlb_flush(CPUState *cpu)
 }
 static inline void tlb_flush_asid_switch(CPUState *cpu, MMUIdxMap idxmap,
                                          uint64_t tag)
+{
+}
+static inline void tlb_flush_asid_switch_active(CPUState *cpu,
+                                                MMUIdxMap idxmap,
+                                                uint64_t tag, int asid)
 {
 }
 static inline void tlb_flush_asid(CPUState *cpu, MMUIdxMap idxmap,

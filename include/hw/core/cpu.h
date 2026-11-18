@@ -205,6 +205,8 @@ typedef uint32_t MMUIdxMap;
 
 /* Use a fully associative victim tlb of 8 entries. */
 #define CPU_VTLB_SIZE 8
+/* Large-page regions tracked exactly per MMU mode (see CPUTLBDesc). */
+#define CPU_TLB_LP_REGIONS 8
 
 /*
  * The full TLB entry, which is not accessed by generated TCG code,
@@ -241,6 +243,12 @@ struct CPUTLBEntryFull {
 
     /* Additional tlb flags requested by tlb_fill. */
     uint8_t tlb_fill_flags;
+
+    /*
+     * The translation is known not to depend on the ASID (a global page,
+     * or a regime without ASIDs).  False whenever the target cannot tell.
+     */
+    bool global;
 
     /*
      * Additional tlb flags for use by the slow path. If non-zero,
@@ -283,6 +291,14 @@ typedef struct CPUTLBDesc {
      */
     vaddr large_page_addr;
     vaddr large_page_mask;
+    /*
+     * The large pages themselves, so that flushing a page inside the
+     * region above but outside every large page needs no full flush.
+     * When they are all in use, a new one widens the nearest region.
+     */
+    unsigned n_large_pages;
+    vaddr lp_region_addr[CPU_TLB_LP_REGIONS];
+    vaddr lp_region_mask[CPU_TLB_LP_REGIONS];
     /* host time (in ns) at the beginning of the time window */
     int64_t window_begin_ns;
     /* maximum number of entries observed in the window */
