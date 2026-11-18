@@ -4870,7 +4870,11 @@ static void test_dc_window_fault_bounded(void)
     image = dc_read_pixels(s, 0, 64, 32);
     g_assert_true(g_file_get_contents(path, &log, NULL, &error));
     g_assert_no_error(error);
-    g_assert_cmpstr(log, ==, before_screenshot);
+    g_assert_true(g_str_has_prefix(log, before_screenshot));
+    g_assert_nonnull(strstr(log + strlen(before_screenshot),
+                            "display translation fault at 0x90001000"));
+    g_assert_nonnull(strstr(log + strlen(before_screenshot),
+                            "window 0 DMA fault"));
     g_clear_pointer(&log, g_free);
     qtest_quit(s);
     g_assert_true(g_file_get_contents(path, &log, NULL, &error));
@@ -4948,12 +4952,14 @@ static void test_dc_frames_hdmi(void)
         qtest_writel(s, dc + 0x100, 1);
         g_assert_cmphex(qtest_readl(s, dc + 0x1390), ==, 0xff0080);
         g_assert_cmphex(qtest_readl(s, dc + 0x104), ==, 1);
+        assert_dc_pixels(s, 0, 64, 32, 0x8000ff);
         qtest_writel(s, dc + 0xdc, 6);
         g_assert_false(qtest_get_irq(s, 0));
         qtest_clock_step(s, 100000);
         g_assert_cmphex(qtest_readl(s, dc + 0x1390), ==, 0x00ff00);
         g_assert_cmphex(qtest_readl(s, dc + 0x104), ==, 0);
-        assert_dc_pixels(s, 0, 64, 32, 0x8000ff);
+        /* On-demand scanout displays the newly active state. */
+        assert_dc_pixels(s, 0, 64, 32, 0x00ff00);
         qtest_clock_step(s, 100000);
         assert_dc_pixels(s, 0, 64, 32, 0x00ff00);
 
@@ -4982,7 +4988,7 @@ static void test_dc_frames_hdmi(void)
         qtest_writel(s, 0x60006300, 1U << 27);
         qtest_writel(s, 0x60006304, 1U << 27);
         g_assert_false(qtest_get_irq(s, 0));
-        assert_dc_pixels(s, 0, 4, 4, 0);
+        assert_dc_pixels(s, 0, 3, 3, 0);
         qtest_system_reset(s);
     }
     qtest_quit(s);

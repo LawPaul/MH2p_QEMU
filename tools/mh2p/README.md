@@ -1306,6 +1306,9 @@ the bound. A subsequent native startup diagnostic passed one reversible input
 round in 319 host seconds, but did not encounter that fault and did not
 verify the RCC display connection. It therefore demonstrates neither a
 native fault-path speedup nor complete readiness.
+Display pixels are drawn on demand from the active scanout state, while frame
+ticks still validate DMA and signal completion. A display refresh or
+`screendump` can therefore repeat a scanout DMA read and report a fault.
 The DSP EDMA interrupt enable and pending registers now have shared global
 state with region access masks, rather than independent shadow copies.
 Normal completion pulses the DSP's global and region 0-3 event inputs and
