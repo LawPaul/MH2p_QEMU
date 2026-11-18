@@ -9,6 +9,7 @@
 #include "qemu/error-report.h"
 #include "qemu/main-loop.h"
 #include "qemu/module.h"
+#include "qemu/rcu.h"
 #include "qemu/sockets.h"
 #include "qemu/thread.h"
 #include "qemu/timer.h"
@@ -47,6 +48,9 @@ struct MH2PPCIeConfigState {
     unsigned rx_count, tx_count;
     uint32_t sequence, epoch;
     bool failed, in_flight, peer_ready, replying;
+    bool experimental_socket_wait;
+    bool experimental_server_thread;
+    QemuThread server;
 };
 
 /*
@@ -266,6 +270,44 @@ static gboolean config_receive(QIOChannel *ioc, GIOCondition condition,
     return G_SOURCE_REMOVE;
 }
 
+/*
+ * Block until the socket is readable (or writable), for at most @timeout_ns
+ * (negative: no limit).  Returns > 0 when ready, 0 on timeout, < 0 on error.
+ */
+static int config_socket_wait(MH2PPCIeConfigState *s, bool write,
+                              int64_t timeout_ns)
+{
+#ifdef _WIN32
+    SOCKET sock = _get_osfhandle(s->socket->fd);
+    fd_set ready, failed;
+    struct timeval tv, *limit = NULL;
+    int result;
+
+    FD_ZERO(&ready);
+    FD_SET(sock, &ready);
+    FD_ZERO(&failed);
+    FD_SET(sock, &failed);
+    if (timeout_ns >= 0) {
+        int64_t us = (timeout_ns + 999) / 1000;
+
+        tv.tv_sec = us / 1000000;
+        tv.tv_usec = us % 1000000;
+        limit = &tv;
+    }
+    result = select(0, write ? NULL : &ready, write ? &ready : NULL,
+                    &failed, limit);
+    return result == SOCKET_ERROR ? -1 : result;
+#else
+    GPollFD pollfd = {
+        .fd = s->socket->fd,
+        .events = write ? G_IO_OUT : G_IO_IN,
+    };
+    int result = qemu_poll_ns(&pollfd, 1, timeout_ns);
+
+    return result < 0 && errno == EINTR ? 1 : result;
+#endif
+}
+
 static bool config_transfer(MH2PPCIeConfigState *s, uint8_t *frame,
                             bool write, int64_t deadline, Error **errp)
 {
@@ -279,11 +321,39 @@ static bool config_transfer(MH2PPCIeConfigState *s, uint8_t *frame,
 
         if (count == QIO_CHANNEL_ERR_BLOCK) {
 #ifdef _WIN32
-            if (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) >= deadline) {
+            if (!s->experimental_socket_wait) {
+                /*
+                 * g_usleep() rounds up to whole Sleep() milliseconds: about
+                 * 1.9 ms per round trip with 1 ms timer resolution.
+                 */
+                if (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) >= deadline) {
+                    error_setg(errp, "configuration request timed out");
+                    return false;
+                }
+                g_usleep(20);
+                continue;
+            }
+            /*
+             * experimental-socket-wait: wait on the socket itself, so a
+             * round trip costs tens of microseconds.  Opt-in: the peer then
+             * polls this side several times as often, and serving each
+             * request through the main loop currently costs more than the
+             * wait saved.
+             */
+            int64_t remaining =
+                deadline - qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+            int result =
+                remaining > 0 ? config_socket_wait(s, write, remaining) : 0;
+
+            if (!result) {
                 error_setg(errp, "configuration request timed out");
                 return false;
             }
-            g_usleep(20);
+            if (result < 0) {
+                error_setg(errp, "configuration socket select failed: %d",
+                           WSAGetLastError());
+                return false;
+            }
             continue;
 #else
             GPollFD pollfd = {
@@ -319,6 +389,98 @@ static bool config_transfer(MH2PPCIeConfigState *s, uint8_t *frame,
         }
     }
     return true;
+}
+
+/* Move one whole frame.  1: done, 0: peer closed between frames, -1: error. */
+static int config_server_io(MH2PPCIeConfigState *s, uint8_t *frame,
+                            bool write)
+{
+    QIOChannel *ioc = QIO_CHANNEL(s->socket);
+    unsigned offset = 0;
+
+    while (offset < FRAME_SIZE) {
+        ssize_t count = write ?
+            qio_channel_write(ioc, frame + offset, FRAME_SIZE - offset, NULL) :
+            qio_channel_read(ioc, frame + offset, FRAME_SIZE - offset, NULL);
+
+        if (count == QIO_CHANNEL_ERR_BLOCK) {
+            if (config_socket_wait(s, write, -1) < 0) {
+                return -1;
+            }
+            continue;
+        }
+        if (count <= 0) {
+            return !count && !offset && !write ? 0 : -1;
+        }
+        offset += count;
+    }
+    return 1;
+}
+
+/*
+ * experimental-server-thread: serve the peer's requests on a thread that
+ * blocks on this socket alone, instead of one main-loop round (wakeup, every
+ * socket source checked, a new watch registered) per request.  The access
+ * itself still runs under the BQL, exactly as config_receive() runs it.
+ */
+static void *config_server_thread(void *opaque)
+{
+    MH2PPCIeConfigState *s = opaque;
+    uint8_t frame[FRAME_SIZE];
+
+    rcu_register_thread();
+    for (;;) {
+        int result = config_server_io(s, frame, false);
+
+        bql_lock();
+        if (s->failed) {
+            bql_unlock();
+            break;
+        }
+        if (result <= 0) {
+            if (result) {
+                config_fail(s, "peer closed during a request");
+            } else {
+                config_close(s);
+            }
+            bql_unlock();
+            break;
+        }
+        if (!config_request_valid(frame)) {
+            config_fail(s, "invalid version-1 request");
+            bql_unlock();
+            break;
+        }
+        memcpy(s->rx, frame, FRAME_SIZE);
+        config_respond(s);
+        memcpy(frame, s->tx, FRAME_SIZE);
+        bql_unlock();
+
+        result = config_server_io(s, frame, true);
+        bql_lock();
+        s->replying = false;
+        if (result <= 0) {
+            if (!s->failed) {
+                config_fail(s, "peer closed during a completion");
+            }
+            bql_unlock();
+            break;
+        }
+        bql_unlock();
+    }
+    rcu_unregister_thread();
+    return NULL;
+}
+
+static void config_serve(MH2PPCIeConfigState *s)
+{
+    if (s->experimental_server_thread) {
+        qemu_thread_create(&s->server, "mh2p-pcie-server",
+                           config_server_thread, s, QEMU_THREAD_DETACHED);
+    } else {
+        s->watch = qio_channel_add_watch(QIO_CHANNEL(s->socket),
+                                        G_IO_IN, config_receive, s, NULL);
+    }
 }
 
 static MemTxResult config_rpc(MH2PPCIeConfigState *s, bool ready, unsigned op,
@@ -509,8 +671,7 @@ static void config_realize(DeviceState *dev, Error **errp)
             return;
         }
         if (s->ready) {
-            s->watch = qio_channel_add_watch(QIO_CHANNEL(s->socket),
-                                            G_IO_IN, config_receive, s, NULL);
+            config_serve(s);
         }
         return;
     }
@@ -542,8 +703,7 @@ static void config_realize(DeviceState *dev, Error **errp)
         return;
     }
     if (s->ready) {
-        s->watch = qio_channel_add_watch(QIO_CHANNEL(s->socket),
-                                        G_IO_IN, config_receive, s, NULL);
+        config_serve(s);
     }
     }
 #endif
@@ -562,6 +722,10 @@ static void config_unrealize(DeviceState *dev)
 
 static const Property config_properties[] = {
     DEFINE_PROP_STRING("fd", MH2PPCIeConfigState, fd),
+    DEFINE_PROP_BOOL("experimental-socket-wait", MH2PPCIeConfigState,
+                     experimental_socket_wait, false),
+    DEFINE_PROP_BOOL("experimental-server-thread", MH2PPCIeConfigState,
+                     experimental_server_thread, false),
 };
 
 static const VMStateDescription config_vmstate = {
