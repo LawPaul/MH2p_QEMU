@@ -5,12 +5,12 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
-import subprocess
 
 from prepare_carplay_country_policy import patch_country_policy
 from prepare_carplay_wireless_policy import patch_wireless_policy
 
 from qnx6_read import Qnx6
+from sparse_copy import copy_sparse
 
 
 def find_application(fs, name):
@@ -73,8 +73,7 @@ def prepare(source, output, *, partition_offset=4096 * 512,
         fs.f.close()
     output.mkdir(parents=True)
     image = output / "mnand.bin"
-    subprocess.run(["cp", "--reflink=auto", "--sparse=always", "--",
-                    str(source.resolve()), str(image)], check=True)
+    copy_sparse(source, image)
     if image.stat().st_size != source.stat().st_size or image.samefile(source):
         raise RuntimeError("Laboratory image must be an independent same-sized copy")
     with image.open("r+b") as stream:
@@ -129,7 +128,7 @@ def main():
             args.mnand, args.output, partition_offset=args.partition_offset,
             wireless=args.experimental_carplay_country_veto,
             shared_ap=args.experimental_shared_ap_country_policy)
-    except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+    except (OSError, ValueError) as exc:
         parser.exit(1, f"Laboratory image preparation failed: {exc}\n")
     print(json.dumps(result, indent=2))
 

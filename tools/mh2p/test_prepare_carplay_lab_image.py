@@ -4,7 +4,6 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
-import subprocess
 
 import prepare_carplay_lab_image as lab
 import prepare_carplay_country_policy as country
@@ -92,9 +91,8 @@ class LabImageTests(unittest.TestCase):
             source.write_bytes(before)
             with patch.object(wireless, "ORIGINAL_SHA256", hashlib.sha256(raw).hexdigest()):
                 failed = root / "failed"
-                with patch.object(lab.subprocess, "run",
-                                  side_effect=subprocess.CalledProcessError(1, ["cp"])):
-                    with self.assertRaises(subprocess.CalledProcessError):
+                with patch.object(lab, "copy_sparse", side_effect=OSError("copy failed")):
+                    with self.assertRaises(OSError):
                         lab.prepare(source, failed)
                 self.assertFalse((failed / "manifest.json").exists())
                 output = root / "lab"

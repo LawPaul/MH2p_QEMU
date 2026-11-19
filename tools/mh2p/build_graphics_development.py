@@ -27,7 +27,7 @@ def dependencies(depfile):
     names = shlex.split(depfile.read_text().replace("\\\n", "").partition(":")[2])
     if not names:
         raise ValueError(f"Missing compiler dependencies: {depfile.name}")
-    return {Path(name).resolve().relative_to(ROOT) for name in names}
+    return {Path(name).resolve().relative_to(ROOT.resolve()) for name in names}
 
 
 def replace_resources(source, replacements):
@@ -151,7 +151,7 @@ def verify(directory):
         raise ValueError("Invalid graphics-development build manifest")
     for name, expected in manifest["source_sha256"].items():
         path = (ROOT / name).resolve()
-        if not path.is_relative_to(ROOT) or digest(path.read_bytes()) != expected:
+        if not path.is_relative_to(ROOT.resolve()) or digest(path.read_bytes()) != expected:
             raise ValueError(f"Graphics sources changed; rebuild before launching: {name}")
     image = (directory / "startup.bin").read_bytes()
     if digest(image) != manifest["startup_sha256"]:
