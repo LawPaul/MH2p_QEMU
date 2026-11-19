@@ -197,6 +197,8 @@ struct MH2PRstpChardev {
     RstpTxChannel persistence;
     GByteArray *pers_rx;
     GByteArray *pers_tx;
+    /* Lengths of the replies still pending in pers_tx, oldest first. */
+    GArray *pers_tx_lens;
     GHashTable *pers_store;
     char *pers_file;
     GHashTable *pers_catalog;
@@ -891,22 +893,33 @@ static void rstp_pers_reset_channel(MH2PRstpChardev *s)
 {
     g_byte_array_set_size(s->pers_rx, 0);
     g_byte_array_set_size(s->pers_tx, 0);
+    g_array_set_size(s->pers_tx_lens, 0);
     s->persistence.head = 0;
     s->persistence.count = 0;
 }
 
-/* Move pending reply bytes into free frames of the persistence queue. */
+/*
+ * Move pending reply bytes into free frames of the persistence queue. Every
+ * reply starts in a fresh frame: the backend parses one reply header per
+ * frame, so the tail of a long value must not share a frame with the next
+ * reply.
+ */
 static void rstp_pers_refill(MH2PRstpChardev *s)
 {
     RstpTxChannel *c = &s->persistence;
     GByteArray *tx = s->pers_tx;
     unsigned used = 0;
 
-    while (used < tx->len && c->count < RSTP_TX_DEPTH) {
-        unsigned n = MIN(tx->len - used, RSTP_MAX_DATA);
+    while (s->pers_tx_lens->len && c->count < RSTP_TX_DEPTH) {
+        unsigned *left = &g_array_index(s->pers_tx_lens, unsigned, 0);
+        unsigned n = MIN(*left, RSTP_MAX_DATA);
 
         rstp_tx_queue_channel(s, c, tx->data + used, n);
         used += n;
+        *left -= n;
+        if (!*left) {
+            g_array_remove_index(s->pers_tx_lens, 0);
+        }
     }
     g_byte_array_remove_range(tx, 0, used);
 }
@@ -923,7 +936,11 @@ static void rstp_pers_reply(MH2PRstpChardev *s, const uint8_t *data,
         trace_mh2p_rstp_tx_full(s->persistence.chn, data[0]);
         return;
     }
+    if (!len) {
+        return;
+    }
     g_byte_array_append(s->pers_tx, data, len);
+    g_array_append_val(s->pers_tx_lens, len);
     rstp_pers_refill(s);
 }
 
@@ -1692,6 +1709,7 @@ static void rstp_chr_finalize(Object *obj)
     }
     g_byte_array_unref(s->pers_rx);
     g_byte_array_unref(s->pers_tx);
+    g_array_unref(s->pers_tx_lens);
     g_hash_table_unref(s->pers_store);
     g_free(s->pers_file);
     g_clear_pointer(&s->pers_catalog, g_hash_table_unref);
@@ -1842,6 +1860,7 @@ static void rstp_chr_init(Object *obj)
     s->power_state = -1;
     s->pers_rx = g_byte_array_new();
     s->pers_tx = g_byte_array_new();
+    s->pers_tx_lens = g_array_new(FALSE, FALSE, sizeof(unsigned));
     s->pers_store = rstp_pers_new_store();
     object_property_add_str(obj, "persistence-file",
                             rstp_get_persistence_file,
