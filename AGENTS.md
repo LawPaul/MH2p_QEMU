@@ -38,3 +38,8 @@ generally involve:
 - **Common devices for Virtualization**: e.g. VirtIO and platform devices
 
 If unsure, the linked `security.rst` document provides authoritative guidance.
+
+## Commit Messages
+
+Never add `Co-authored-by` trailers or any other Copilot/AI attribution to
+commit messages.
