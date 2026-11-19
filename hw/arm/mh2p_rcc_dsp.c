@@ -4,6 +4,7 @@
  */
 #include "qemu/osdep.h"
 #include <gmodule.h>
+#include "exec/icount.h"
 #include "hw/arm/mh2p_rcc_dsp.h"
 #include "hw/arm/mh2p_rcc_mmu.h"
 #include "migration/vmstate.h"
@@ -15,12 +16,16 @@
 #include "qemu/error-report.h"
 #include "qemu/host-utils.h"
 #include "qemu/log.h"
+#include "qemu/main-loop.h"
 #include "qemu/module.h"
+#include "qemu/cutils.h"
 #include "qemu/timer.h"
 #include "system/address-spaces.h"
+#include "system/cpu-timers.h"
 #include "system/reset.h"
 
 #define TYPE_MH2P_RCC_DSP "mh2p-rcc-dsp"
+#define DSP_TICK_NS (100 * SCALE_US)
 OBJECT_DECLARE_SIMPLE_TYPE(MH2PRCCDSP, MH2P_RCC_DSP)
 
 typedef struct RCCDSPHostMemory {
@@ -41,6 +46,7 @@ struct MH2PRCCDSP {
     uint32_t event_levels[4], pending_events[4];
     bool clock_running, failed, executing, pending_reset;
     QEMUTimer *timer;
+    int64_t next_tick;
     GModule *module;
     void *backend;
     void *(*create)(uint32_t pc, RCCDSPHostMemory memory);
@@ -118,11 +124,53 @@ MemTxResult mh2p_rcc_dsp_dma_read(DeviceState *dev, uint32_t address,
     return address_space_read(as, address, MEMTXATTRS_UNSPECIFIED, data, size);
 }
 
+static struct {
+    uint64_t reads, writes, bytes, mem_ns, step_ns, steps, cycles, last;
+} dsp_stats;
+
+static void dsp_stats_report(void)
+{
+    int64_t now = get_clock();
+
+    if (!dsp_stats.last) {
+        dsp_stats.last = now;
+    }
+    if (now - dsp_stats.last >= NANOSECONDS_PER_SECOND * 10) {
+        fprintf(stderr, "mh2p-rcc-dsp-stats: wall=%.1fs steps=%" PRIu64
+                " cycles=%" PRIu64 " step=%.2fs mem=%.2fs reads=%" PRIu64
+                " writes=%" PRIu64 " bytes=%" PRIu64 "\n",
+                (now - dsp_stats.last) / 1e9, dsp_stats.steps,
+                dsp_stats.cycles, dsp_stats.step_ns / 1e9,
+                dsp_stats.mem_ns / 1e9, dsp_stats.reads, dsp_stats.writes,
+                dsp_stats.bytes);
+        memset(&dsp_stats, 0, sizeof(dsp_stats));
+        dsp_stats.last = now;
+    }
+}
+
+static bool dsp_stats_enabled(void)
+{
+    static int enabled = -1;
+
+    if (enabled < 0) {
+        enabled = getenv("MH2P_DSP_STATS") != NULL;
+    }
+    return enabled;
+}
+
 static int32_t dsp_read(void *opaque, uint32_t address,
                         uint8_t *data, size_t size)
 {
     MH2PRCCDSP *s = opaque;
+    int64_t t0 = dsp_stats_enabled() ? get_clock() : 0;
+    BQL_LOCK_GUARD();
     MemTxResult result = dsp_memory(s, address, data, size, false);
+
+    if (t0) {
+        dsp_stats.mem_ns += get_clock() - t0;
+        dsp_stats.reads++;
+        dsp_stats.bytes += size;
+    }
 
     if (result != MEMTX_OK) {
         qemu_log_mask(LOG_GUEST_ERROR, "mh2p-rcc-dsp: failed read at "
@@ -136,7 +184,15 @@ static int32_t dsp_write(void *opaque, uint32_t address,
                          const uint8_t *data, size_t size)
 {
     MH2PRCCDSP *s = opaque;
+    int64_t t0 = dsp_stats_enabled() ? get_clock() : 0;
+    BQL_LOCK_GUARD();
     MemTxResult result = dsp_memory(s, address, (uint8_t *)data, size, true);
+
+    if (t0) {
+        dsp_stats.mem_ns += get_clock() - t0;
+        dsp_stats.writes++;
+        dsp_stats.bytes += size;
+    }
 
     if (result != MEMTX_OK) {
         qemu_log_mask(LOG_GUEST_ERROR, "mh2p-rcc-dsp: failed write at "
@@ -146,9 +202,87 @@ static int32_t dsp_write(void *opaque, uint32_t address,
     return 0;
 }
 
+/*
+ * Experimental MH2P_DSP_PACE_CLOCK: slow the guest clock while the native DSP
+ * cannot deliver its cycle budget per virtual tick, and speed it back up when
+ * the DSP has spare host time. Without it, real-time DSP work (BIOS clock,
+ * audio periods) consumes the whole budget and lower-priority tasks starve.
+ */
+static unsigned dsp_pace_min_percent(void)
+{
+    static int percent = -1;
+
+    if (percent < 0) {
+        const char *env = getenv("MH2P_DSP_PACE_CLOCK");
+
+        percent = 0;
+        if (env && (qemu_strtoi(env, NULL, 10, &percent) ||
+                    percent < 1 || percent > 100 || icount_enabled())) {
+            warn_report("MH2P_DSP_PACE_CLOCK requires a minimum clock "
+                        "percentage of 1..100 and cannot be used with icount");
+            percent = 0;
+        }
+    }
+    return percent;
+}
+
+static void dsp_pace_clock(uint32_t cycles, int64_t step_ns)
+{
+    static int64_t last_wall, last_virt, busy_ns, prev_call;
+    static uint64_t done;
+    int64_t wall = get_clock(), virt, wall_ns, virt_ns;
+    unsigned min_percent = dsp_pace_min_percent();
+    uint32_t ppm;
+    double ratio, busy;
+
+    if (!min_percent) {
+        return;
+    }
+    virt = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (wall - prev_call > 50 * SCALE_MS) {
+        last_wall = 0;
+        done = busy_ns = 0;
+    }
+    prev_call = wall;
+    if (!last_wall) {
+        last_wall = wall;
+        last_virt = virt;
+        return;
+    }
+    done += cycles;
+    busy_ns += step_ns;
+    wall_ns = wall - last_wall;
+    if (wall_ns < 100 * SCALE_MS) {
+        return;
+    }
+    virt_ns = virt - last_virt;
+    ppm = cpu_clock_get_rate_ppm();
+    /* Fraction of the per-tick budget delivered over this virtual interval. */
+    ratio = virt_ns > 0 ? (double)done * DSP_TICK_NS / virt_ns / cycles : 1;
+    busy = (double)busy_ns / wall_ns;
+    /* Tick re-arm latency alone loses ~5%, so only react to real shortfall. */
+    if (ratio < 0.8 && busy > 0.5) {
+        ppm = ppm * MAX(ratio, 0.5) * 1.1;
+    } else if (busy < 0.6) {
+        ppm = MIN(ppm * 1.1 + 1000, 1000000);
+    }
+    ppm = MAX(ppm, min_percent * 10000);
+    if (ppm != cpu_clock_get_rate_ppm()) {
+        cpu_clock_set_rate_ppm(ppm);
+    }
+    if (getenv("MH2P_DSP_PACE_LOG")) {
+        fprintf(stderr, "mh2p-rcc-dsp-pace: virt=%.3f ratio=%.2f busy=%.2f "
+                "rate=%u%%\n", virt / 1e9, ratio, busy, ppm / 10000);
+    }
+    last_wall = wall;
+    last_virt = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    done = busy_ns = 0;
+}
+
 static void dsp_tick(void *opaque)
 {
     MH2PRCCDSP *s = opaque;
+    int64_t step_t0, step_ns, now;
     int32_t result;
 
     if (!s->backend || !s->clock_running || s->asserted || s->failed) {
@@ -172,8 +306,29 @@ static void dsp_tick(void *opaque)
     }
     /* Bounded diagnostic pacing; DPLL-derived DSP timing is not implemented. */
     s->executing = true;
-    result = s->step(s->backend, s->diagnostic_cycles_per_tick);
+    step_t0 = dsp_stats_enabled() || dsp_pace_min_percent() ? get_clock() : 0;
+    if (getenv("MH2P_DSP_UNLOCKED_STEP")) {
+        /*
+         * The backend is only used from the main loop; vCPU threads touch
+         * device state under the BQL and defer resets through executing.
+         */
+        bql_unlock();
+        result = s->step(s->backend, s->diagnostic_cycles_per_tick);
+        bql_lock();
+    } else {
+        result = s->step(s->backend, s->diagnostic_cycles_per_tick);
+    }
     s->executing = false;
+    step_ns = step_t0 ? get_clock() - step_t0 : 0;
+    if (!result && !s->pending_reset && dsp_pace_min_percent()) {
+        dsp_pace_clock(s->diagnostic_cycles_per_tick, step_ns);
+    }
+    if (dsp_stats_enabled()) {
+        dsp_stats.step_ns += step_ns;
+        dsp_stats.steps++;
+        dsp_stats.cycles += s->diagnostic_cycles_per_tick;
+        dsp_stats_report();
+    }
     if (s->pending_reset) {
         dsp_stop(s);
         s->pending_reset = s->failed = false;
@@ -188,7 +343,21 @@ static void dsp_tick(void *opaque)
         s->failed = true;
         return;
     }
-    timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000);
+    if (!s->clock_running || s->asserted) {
+        return;
+    }
+    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (dsp_pace_min_percent()) {
+        /* Host-clock mode: virtual time advances during the step itself. */
+        s->next_tick += DSP_TICK_NS;
+        if (s->next_tick < now - 10 * DSP_TICK_NS ||
+            s->next_tick > now + DSP_TICK_NS) {
+            s->next_tick = now + DSP_TICK_NS;
+        }
+    } else {
+        s->next_tick = now + DSP_TICK_NS;
+    }
+    timer_mod(s->timer, s->next_tick);
 }
 
 uint32_t mh2p_rcc_dsp_control(DeviceState *dev, uint32_t reset,
@@ -241,7 +410,8 @@ uint32_t mh2p_rcc_dsp_control(DeviceState *dev, uint32_t reset,
         timer_del(s->timer);
     } else if (s->backend && !s->asserted && !s->failed &&
                !timer_pending(s->timer)) {
-        timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000);
+        s->next_tick = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + DSP_TICK_NS;
+        timer_mod(s->timer, s->next_tick);
     }
     return s->asserted;
 }

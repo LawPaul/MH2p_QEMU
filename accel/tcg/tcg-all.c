@@ -143,6 +143,12 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
     default:
         g_assert_not_reached();
     }
+    if (s->mttcg_enabled == ON_OFF_AUTO_ON &&
+        g_strcmp0(object_get_typename(OBJECT(ms)), "mh2p-rcc-machine") == 0 &&
+        g_getenv("MH2P_IPU_ALLOW_MTTCG")) {
+        /* The two IPUs have two M4s each, outside the machine's SMP count. */
+        max_threads += 4;
+    }
 
     qemu_add_vm_change_state_handler(tcg_vm_change_state, NULL);
 #endif

@@ -35,6 +35,8 @@ int64_t cpu_get_ticks(void);
  * the time between vm_start and vm_stop
  */
 int64_t cpu_get_clock(void);
+void cpu_clock_set_rate_ppm(uint32_t ppm);
+uint32_t cpu_clock_get_rate_ppm(void);
 
 void qemu_timer_notify_cb(void *opaque, QEMUClockType type);
 

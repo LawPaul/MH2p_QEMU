@@ -517,6 +517,21 @@ static void ipu1_cpu_reset(void *opaque)
     }
 }
 
+static void ipu1_apply_hold(CPUState *cpu, run_on_cpu_data data)
+{
+    bool held = data.host_int;
+
+    arm_set_cpu_power_state(ARM_CPU(cpu), held ? PSCI_OFF : PSCI_ON);
+    cpu->halted = held;
+}
+
+static void ipu1_reset_and_release(CPUState *cpu, run_on_cpu_data data)
+{
+    device_cold_reset(DEVICE(data.host_ptr));
+    cpu_reset(cpu);
+    ipu1_apply_hold(cpu, RUN_ON_CPU_HOST_INT(false));
+}
+
 void mh2p_rcc_ipu1_control(MH2PIPU1 *s, uint32_t reset, bool clock)
 {
     if ((reset & 4) && !(s->reset_control & 4)) {
@@ -532,19 +547,26 @@ void mh2p_rcc_ipu1_control(MH2PIPU1 *s, uint32_t reset, bool clock)
     }
     for (unsigned i = 0; i < s->core_count; i++) {
         bool held = !clock || (reset & (4 | BIT(i)));
-        ARMCPU *cpu = s->core[i].cpu;
+        CPUState *cpu = CPU(s->core[i].cpu);
 
         s->reset_pending[i] |= (reset & (4 | BIT(i))) != 0;
         if (held != s->held[i]) {
-            if (!held && s->reset_pending[i]) {
-                device_cold_reset(DEVICE(&s->core[i]));
-                cpu_reset(CPU(cpu));
+            bool restart = !held && s->reset_pending[i];
+            run_on_cpu_func apply = restart ? ipu1_reset_and_release
+                                            : ipu1_apply_hold;
+            run_on_cpu_data data = restart ? RUN_ON_CPU_HOST_PTR(&s->core[i])
+                                           : RUN_ON_CPU_HOST_INT(held);
+
+            if (restart) {
                 s->reset_pending[i] = false;
             }
-            arm_set_cpu_power_state(cpu, held ? PSCI_OFF : PSCI_ON);
-            CPU(cpu)->halted = held;
             s->held[i] = held;
-            qemu_cpu_kick(CPU(cpu));
+            if (qemu_tcg_mttcg_enabled()) {
+                async_run_on_cpu(cpu, apply, data);
+            } else {
+                apply(cpu, data);
+                qemu_cpu_kick(cpu);
+            }
         }
     }
 }
@@ -676,7 +698,8 @@ DeviceState *mh2p_rcc_ipu1_create(Object *owner, const char *firmware,
     if (firmware) {
         ipu1_validate_elf(firmware);
     }
-    if (!tcg_enabled() || qemu_tcg_mttcg_enabled()) {
+    if (!tcg_enabled() ||
+        (qemu_tcg_mttcg_enabled() && !g_getenv("MH2P_IPU_ALLOW_MTTCG"))) {
         error_report("mh2p-ipu1: %sexecution requires "
                      "-accel tcg,thread=single (or -icount)",
                      firmware ? "diagnostic " : "");

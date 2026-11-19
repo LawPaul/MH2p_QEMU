@@ -155,6 +155,25 @@ full job control; Ctrl-C with this stdio backend terminates QEMU.
 Use the stock media to trace original startup instead. Unsupported devices
 can fault; reaching early userspace is not full normal boot.
 
+### Experimental RCC multithreading
+
+The default RCC startup is unchanged. For an RCC run with the native DSP
+backend configured, remove `-icount`, use `-accel tcg,thread=multi`, and set
+these variables for the RCC QEMU process only:
+
+```sh
+export MH2P_IPU_ALLOW_MTTCG=1
+export MH2P_DSP_UNLOCKED_STEP=1
+export MH2P_DSP_PACE_CLOCK=2
+```
+
+Add `-global mh2p-rcc-dsp.diagnostic-cycles-per-tick=5000` to the RCC
+command line. The pacing value is the minimum percentage of host time for
+the RCC virtual clock; the clock adapts while the DSP runs and does not
+disable guest watchdogs. `MH2P_DSP_PACE_LOG=1` reports pacing adjustments,
+and `MH2P_DSP_STATS=1` reports DSP batch timings. This setup targets faster
+paired boot, not real-time audio or long-running stability.
+
 ## Reproducible checks
 
 Firmware-free synthetic-image, protocol and evidence tests:

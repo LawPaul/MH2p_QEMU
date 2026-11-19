@@ -79,24 +79,59 @@ int64_t cpu_get_ticks(void)
  * hardware do not fire during start-up (icount gets this from instruction
  * counting, but only with one host thread for every vCPU).
  */
+static int64_t vm_src_base, vm_host_base;
+static uint32_t vm_rate_ppm;
+
+static void vm_rate_init(void)
+{
+    const char *e = getenv("QEMU_VM_CLOCK_PERCENT");
+    int p = e ? atoi(e) : 100;
+
+    if (p < 1 || p > 100) {
+        p = 100;
+    }
+    if (p != 100) {
+        warn_report("QEMU_VM_CLOCK_PERCENT=%d: guest time runs at %d%% "
+                    "of host time", p, p);
+    }
+    vm_rate_ppm = p * 10000;
+}
+
+/* Callers hold vm_clock_lock or are inside a vm_clock_seqlock read section. */
 static int64_t vm_clock_source(void)
 {
-    static int percent;
-
-    if (!percent) {
-        const char *e = getenv("QEMU_VM_CLOCK_PERCENT");
-        int p = e ? atoi(e) : 100;
-
-        if (p < 1 || p > 100) {
-            p = 100;
-        }
-        if (p != 100) {
-            warn_report("QEMU_VM_CLOCK_PERCENT=%d: guest time runs at %d%% "
-                        "of host time", p, p);
-        }
-        percent = p;
+    if (vm_rate_ppm == 1000000 && !vm_src_base && !vm_host_base) {
+        return get_clock();
     }
-    return percent == 100 ? get_clock() : muldiv64(get_clock(), percent, 100);
+    return vm_src_base +
+           muldiv64(get_clock() - vm_host_base, vm_rate_ppm, 1000000);
+}
+
+/*
+ * Experimental: change the guest/host time ratio at run time. The source is
+ * rebased so that the virtual clock stays continuous and monotonic.
+ */
+void cpu_clock_set_rate_ppm(uint32_t ppm)
+{
+    int64_t now;
+
+    ppm = MAX(MIN(ppm, 1000000), 10000);
+    seqlock_write_lock(&timers_state.vm_clock_seqlock,
+                       &timers_state.vm_clock_lock);
+    if (ppm != vm_rate_ppm) {
+        now = get_clock();
+        vm_src_base += muldiv64(now - vm_host_base, vm_rate_ppm, 1000000);
+        vm_host_base = now;
+        vm_rate_ppm = ppm;
+    }
+    seqlock_write_unlock(&timers_state.vm_clock_seqlock,
+                         &timers_state.vm_clock_lock);
+}
+
+uint32_t cpu_clock_get_rate_ppm(void)
+{
+    QEMU_LOCK_GUARD(&timers_state.vm_clock_lock);
+    return vm_rate_ppm;
 }
 
 int64_t cpu_get_clock_locked(void)
@@ -297,6 +332,7 @@ TimersState timers_state;
 /* initialize timers state and the cpu throttle for convenience */
 void cpu_timers_init(void)
 {
+    vm_rate_init();
     seqlock_init(&timers_state.vm_clock_seqlock);
     qemu_spin_init(&timers_state.vm_clock_lock);
     vmstate_register(NULL, 0, &vmstate_timers, &timers_state);
