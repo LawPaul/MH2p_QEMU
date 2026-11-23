@@ -8,6 +8,15 @@ mh2p_rcc_qdma(unsigned channel, uint32_t source, uint32_t target, unsigned bytes
 mh2p_rcc_uart3_state(const char *operation, uint64_t value, bool clock, unsigned mode, unsigned ier, unsigned lcr, unsigned lsr, unsigned iir, unsigned rx, bool core_irq) "op=%s value=0x%" PRIx64 " clock=%d mode=%u ier=0x%x lcr=0x%x lsr=0x%x iir=0x%x rx=%u core_irq=%d"
 mh2p_rcc_uart3_rhr_origin(int cpu, uint64_t pc, uint64_t value) "cpu=%d pc=0x%" PRIx64 " value=0x%" PRIx64
 mh2p_rcc_gp_timer_write(unsigned timer, uint64_t offset, uint64_t value, unsigned size, uint32_t status, uint32_t enabled, uint32_t control, uint32_t count) "timer=%u offset=0x%" PRIx64 " value=0x%" PRIx64 " size=%u status=0x%x enabled=0x%x control=0x%x count=0x%x"
+mh2p_rcc_dsp_reset_write(int cpu, uint64_t pc, uint32_t old, uint32_t value) "cpu=%d pc=0x%" PRIx64 " old=0x%x value=0x%x"
+mh2p_rcc_mlb_read(uint64_t addr, uint32_t value) "addr=0x%" PRIx64 " value=0x%x"
+mh2p_rcc_mlb_write(uint64_t addr, uint32_t value, uint32_t effective) "addr=0x%" PRIx64 " value=0x%x effective=0x%x"
+mh2p_rcc_mlb_table_write(unsigned index, uint32_t w0, uint32_t w1, uint32_t w2, uint32_t w3) "index=0x%02x words=%08x %08x %08x %08x"
+mh2p_rcc_mlb_tx_dma(unsigned channel, unsigned label, uint32_t address, unsigned dbr, unsigned length) "channel=%u label=%u addr=0x%x dbr=0x%x length=%u"
+mh2p_rcc_mlb_compat_tx(unsigned channel, unsigned length, uint32_t first, uint32_t second, uint32_t third, uint32_t fourth) "channel=%u length=%u first=%08x second=%08x third=%08x fourth=%08x"
+mh2p_rcc_mlb_compat_rx(unsigned channel, uint32_t address, unsigned length) "channel=%u addr=0x%x length=%u"
+mh2p_rcc_gp_timer_read_error(unsigned timer, uint64_t offset, uint32_t clock, int cpu, uint64_t pc) "timer=%u offset=0x%" PRIx64 " clock=0x%x cpu=%d pc=0x%" PRIx64
+mh2p_rcc_gp_timer_clock_write(unsigned timer, uint32_t old, uint32_t value) "timer=%u old=0x%x value=0x%x"
 
 # omap1.c
 omap1_pwl_clocking_scheme(const char *scheme) "omap1 CLKM: clocking scheme set to %s"

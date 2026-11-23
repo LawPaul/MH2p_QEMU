@@ -12,6 +12,7 @@
 #include "hw/i2c/i2c.h"
 #include "hw/i2c/dra7_i2c.h"
 #include "migration/vmstate.h"
+#include "trace.h"
 
 OBJECT_DECLARE_SIMPLE_TYPE(DRA7I2CState, DRA7_I2C)
 
@@ -315,8 +316,14 @@ static MemTxResult dra7_i2c_write(void *opaque, hwaddr offset,
         }
         s->control = value & ~STT;
         if (value & STT) {
+            bool read = !(value & TRX);
+            int result;
+
             s->status &= ~(ARDY | NACK | BF);
-            if (i2c_start_transfer(s->bus, s->address, !(value & TRX))) {
+            result = i2c_start_transfer(s->bus, s->address, read);
+            trace_dra7_i2c_start(s->bus_name, s->address, read,
+                                 s->count, result);
+            if (result) {
                 s->status |= NACK;
                 dra7_i2c_end(s);
             } else {

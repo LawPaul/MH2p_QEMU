@@ -710,6 +710,19 @@ typedef struct RCCPCIEController {
     RCCPCIERegion inbound[4], outbound[4];
 } RCCPCIEController;
 
+typedef enum RCCMLBCompatReply {
+    RCC_MLB_REPLY_NONE,
+    RCC_MLB_REPLY_SYNC,
+    RCC_MLB_REPLY_FIFO,
+    RCC_MLB_REPLY_EHCI_ATTACHED,
+    RCC_MLB_REPLY_EHCI_PROTECTED,
+    RCC_MLB_REPLY_WATCHDOG,
+    RCC_MLB_REPLY_SOCKET,
+    RCC_MLB_REPLY_VERSION,
+    RCC_MLB_REPLY_RETRIES,
+    RCC_MLB_REPLY_STARTUP,
+} RCCMLBCompatReply;
+
 typedef struct MH2PRCCMachineState {
     MachineState parent;
     Notifier init_done;
@@ -775,6 +788,9 @@ typedef struct MH2PRCCMachineState {
     uint32_t mlb_mctl, mlb_madr;
     uint32_t mlb_channel_table[256][4];
     uint32_t mlb_regs[ARRAY_SIZE(rcc_mlb_registers)];
+    uint8_t mlb_dbr[16 * KiB];
+    bool mlb_tx_occupied[64];
+    uint16_t mlb_tx_base[64], mlb_tx_size[64];
     uint32_t ipu1_clkctrl, ipu1_clkstctrl;
     uint32_t dsp1_clkctrl, dsp1_clkstctrl;
     uint32_t dsp1_reset_control, dsp1_reset_status, dsp1_reset_asserted;
@@ -808,6 +824,19 @@ typedef struct MH2PRCCMachineState {
     bool mpu_wdt_warned, mpu_wdt_expired, mpu_wdt_reset_requested;
     bool power_clocks;
     bool mlb_clock_peer;
+    bool mlb_tx_dma_experiment;
+    bool mlb_compat_peer;
+    RCCMLBCompatReply mlb_compat_reply;
+    RCCMLBCompatReply mlb_inic_response_waiting;
+    bool mlb_inic_emergency;
+    bool mlb_inic_watchdog_expired;
+    QEMUTimer *mlb_inic_watchdog_timer;
+    uint8_t mlb_inic_socket_handle;
+    uint8_t mlb_inic_socket_requests[32][7];
+    bool mlb_inic_socket_used[32];
+    bool mlb_inic_retries_configured;
+    bool mlb_inic_version_pending;
+    unsigned mlb_inic_startup_index;
     bool mlb_peer_reset_released;
     uint32_t mcasp_external_rx_hz[8];
     QEMUTimer *mcasp_sync_timer;
@@ -3498,6 +3527,10 @@ static MemTxResult rcc_gp_timer_read(void *opaque, hwaddr offset,
     return MEMTX_OK;
 unsupported:
     *value = 0;
+    trace_mh2p_rcc_gp_timer_read_error(
+        s->number, offset, s->clock_control,
+        current_cpu ? current_cpu->cpu_index : -1,
+        current_cpu ? CPU_GET_CLASS(current_cpu)->get_pc(current_cpu) : 0);
     qemu_log_mask(LOG_UNIMP, "mh2p-rcc: unsupported TIMER%u read 0x%"
                   HWADDR_PRIx " size=%u clock=0x%x\n",
                   s->number, offset, size, s->clock_control);
@@ -5067,6 +5100,18 @@ static void rcc_mlb_peer_reset(void *opaque, int line, int level)
     MH2PRCCMachineState *s = opaque;
 
     s->mlb_peer_reset_released = level;
+    if (!level) {
+        s->mlb_compat_reply = RCC_MLB_REPLY_NONE;
+        s->mlb_inic_response_waiting = RCC_MLB_REPLY_NONE;
+        s->mlb_inic_emergency = false;
+        s->mlb_inic_watchdog_expired = false;
+        timer_del(s->mlb_inic_watchdog_timer);
+        memset(s->mlb_inic_socket_used, 0, sizeof(s->mlb_inic_socket_used));
+        s->mlb_inic_socket_handle = 0;
+        s->mlb_inic_retries_configured = false;
+        s->mlb_inic_version_pending = false;
+        s->mlb_inic_startup_index = 0;
+    }
     for (unsigned i = 0; i < ARRAY_SIZE(s->mcasp); i++) {
         memset(s->mcasp[i].sync_deadline, 0,
                sizeof(s->mcasp[i].sync_deadline));
@@ -5284,6 +5329,474 @@ unsupported:
     return MEMTX_ERROR;
 }
 
+static uint32_t *rcc_mlb_reg(MH2PRCCMachineState *s, hwaddr address)
+{
+    for (unsigned i = 0; i < ARRAY_SIZE(rcc_mlb_registers); i++) {
+        if (rcc_mlb_registers[i].address == address) {
+            return &s->mlb_regs[i];
+        }
+    }
+    g_assert_not_reached();
+}
+
+static void rcc_mlb_dma_irq(MH2PRCCMachineState *s)
+{
+    uint32_t pending0 = *rcc_mlb_reg(s, 0x4842c7d0) &
+                        *rcc_mlb_reg(s, 0x4842c7d8);
+    uint32_t pending1 = *rcc_mlb_reg(s, 0x4842c7d4) &
+                        *rcc_mlb_reg(s, 0x4842c7dc);
+    bool mux = *rcc_mlb_reg(s, 0x4842c7c0) & BIT(1);
+
+    qemu_set_irq(s->crossbar.inputs[228], pending0 || (mux && pending1));
+    qemu_set_irq(s->crossbar.inputs[229], !mux && pending1);
+}
+
+static void rcc_mlb_watchdog_expired(void *opaque)
+{
+    MH2PRCCMachineState *s = opaque;
+
+    for (unsigned i = 0; i < ARRAY_SIZE(s->mlb_tx_occupied); i++) {
+        if (s->mlb_tx_occupied[i]) {
+            s->mlb_tx_occupied[i] = false;
+            s->mlb_channel_table[i][0] &= ~BIT(11);
+            s->mlb_channel_table[i][2] = 0;
+        }
+    }
+    s->mlb_inic_watchdog_expired = true;
+    s->mlb_compat_reply = RCC_MLB_REPLY_NONE;
+    s->mlb_inic_response_waiting = RCC_MLB_REPLY_NONE;
+    memset(s->mlb_inic_socket_used, 0, sizeof(s->mlb_inic_socket_used));
+    s->mlb_inic_socket_handle = 0;
+    s->mlb_inic_retries_configured = false;
+    s->mlb_inic_version_pending = false;
+    s->mlb_inic_startup_index = 0;
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "mh2p-rcc: compatibility INIC watchdog expired\n");
+}
+
+static void rcc_mlb_watchdog_arm(MH2PRCCMachineState *s)
+{
+    timer_mod(s->mlb_inic_watchdog_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              5 * NANOSECONDS_PER_SECOND);
+}
+
+static void rcc_mlb_compat_receive(MH2PRCCMachineState *s)
+{
+    static const uint8_t sync_status[] = { 0, 5, 4, 0x1a, 0x90, 1, 10 };
+    static const uint8_t fifo_status[] = { 0, 3, 2, 0x12, 0x20 };
+    static const uint8_t ehci_attached[] = {
+        0, 11, 5, 0x15, 1, 0x10, 1, 0, 0x30, 0x0c, 0, 1, 2
+    };
+    static const uint8_t ehci_protected[] = {
+        0, 11, 5, 0x15, 1, 0x10, 1, 0, 0x30, 0x0c, 0, 1, 0
+    };
+    static const uint8_t watchdog_status[] = {
+        0, 15, 5, 0x15, 1, 0x10, 1, 0, 0x30, 0xac, 0, 5,
+        0, 0x13, 0x88, 0x13, 0x88
+    };
+    static const uint8_t version_status[] = {
+        0, 30, 5, 0x15, 1, 0x10, 1, 0, 0x20, 0x0c, 0, 20,
+        0, 0, 8, 0x11, 0x10, 0x10, 3, 0x0a, 0, 0x90,
+        0xff, 0, 0, 0, 0xfb, 0x93, 9, 0, 0x63, 0x42
+    };
+    static const uint8_t retry_status[] = {
+        0, 13, 5, 0x15, 1, 0x10, 1, 0, 0x30, 0x3c, 0, 3, 1, 5, 5
+    };
+    static const struct {
+        uint16_t function;
+        uint8_t length;
+        uint8_t data[5];
+    } startup_status[] = {
+        { 0x40e, 5, { 0, 0, 0, 0, 0 } },
+        { 0x407, 1, { 0 } },
+        { 0x003, 2, { 0, 0 } },
+        { 0x004, 1, { 0 } },
+        { 0x503, 1, { 0 } },
+        { 0x502, 1, { 0 } },
+        { 0x506, 1, { 0 } },
+        { 0x50a, 4, { 0, 0, 0, 0 } },
+        { 0x007, 2, { 0, 0 } },
+        { 0x50e, 2, { 0, 0 } },
+        { 0x30a, 5, { 0, 0x13, 0x88, 0x13, 0x88 } },
+        { 0x303, 3, { 1, 5, 5 } },
+    };
+    uint8_t startup_reply[17] = {
+        0, 0, 5, 0x15, 1, 0x10, 1, 0, 0, 0, 0, 0
+    };
+    uint8_t socket_result[] = {
+        0, 11, 5, 0x15, 1, 0x10, 1, 0, 0x40, 0x3c, 0, 1, 0
+    };
+    const uint8_t *reply;
+    size_t reply_len;
+    const unsigned channel = 1;
+    uint32_t *adt = s->mlb_channel_table[0x40 + channel];
+    uint32_t cat = s->mlb_channel_table[0x88][0] >> 16;
+    uint32_t mlb_cat = s->mlb_channel_table[0x80][0] >> 16;
+    uint32_t *cdt = s->mlb_channel_table[channel];
+    unsigned page = !!(adt[0] & BIT(13));
+    unsigned shift = page * 16;
+    uint32_t status = (adt[1] >> shift) & 0xffff;
+    unsigned capacity = (status & 0x7ff) + 1;
+    uint32_t address = adt[2 + page];
+    uint64_t end = (uint64_t)address + capacity;
+
+    if (!s->mlb_compat_peer || !s->mlb_compat_reply ||
+        (cat & 0x3fff) != 0x1901 || !(adt[0] & BIT(15)) ||
+        !(adt[0] & BIT(14)) || !(status & BIT(15)) ||
+        (status & BIT(14)) ||
+        !(*rcc_mlb_reg(s, 0x4842c488) & BIT(channel))) {
+        return;
+    }
+    switch (s->mlb_compat_reply) {
+    case RCC_MLB_REPLY_SYNC:
+        reply = sync_status;
+        reply_len = sizeof(sync_status);
+        break;
+    case RCC_MLB_REPLY_FIFO:
+        reply = fifo_status;
+        reply_len = sizeof(fifo_status);
+        break;
+    case RCC_MLB_REPLY_EHCI_ATTACHED:
+        reply = ehci_attached;
+        reply_len = sizeof(ehci_attached);
+        break;
+    case RCC_MLB_REPLY_EHCI_PROTECTED:
+        reply = ehci_protected;
+        reply_len = sizeof(ehci_protected);
+        break;
+    case RCC_MLB_REPLY_WATCHDOG:
+        reply = watchdog_status;
+        reply_len = sizeof(watchdog_status);
+        break;
+    case RCC_MLB_REPLY_SOCKET:
+        socket_result[12] = s->mlb_inic_socket_handle;
+        reply = socket_result;
+        reply_len = sizeof(socket_result);
+        break;
+    case RCC_MLB_REPLY_VERSION:
+        reply = version_status;
+        reply_len = sizeof(version_status);
+        break;
+    case RCC_MLB_REPLY_RETRIES:
+        reply = retry_status;
+        reply_len = sizeof(retry_status);
+        break;
+    case RCC_MLB_REPLY_STARTUP: {
+        unsigned i = s->mlb_inic_startup_index;
+        uint16_t function;
+
+        assert(i < ARRAY_SIZE(startup_status));
+        function = startup_status[i].function;
+        reply_len = 12 + startup_status[i].length;
+        startup_reply[1] = reply_len - 2;
+        if (function == 0x003 || function == 0x004 || function == 0x007) {
+            startup_reply[3] = 0x05;
+        }
+        startup_reply[8] = function >> 4;
+        startup_reply[9] = (function << 4) | 0x0c;
+        startup_reply[11] = startup_status[i].length;
+        memcpy(startup_reply + 12, startup_status[i].data,
+               startup_status[i].length);
+        reply = startup_reply;
+        break;
+    }
+    default:
+        g_assert_not_reached();
+    }
+    if ((mlb_cat & 0x3fff) != 0x0901 || cdt[0] || cdt[1] || cdt[2] ||
+        cdt[3] != 0x7f) {
+        qemu_log_mask(LOG_UNIMP, "mh2p-rcc: compatibility MLB peer "
+                      "requires the expected RX channel layout\n");
+        return;
+    }
+    if (capacity < reply_len ||
+        !((address >= 0x40300000 && end <= 0x40380000) ||
+          (address >= RCC_RAM_BASE &&
+           end <= RCC_RAM_BASE + MACHINE(s)->ram_size))) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "mh2p-rcc: compatibility MLB RX buffer invalid\n");
+        return;
+    }
+    if (address_space_write(&address_space_memory, address,
+                            MEMTXATTRS_UNSPECIFIED, reply,
+                            reply_len) != MEMTX_OK) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "mh2p-rcc: compatibility MLB RX write failed\n");
+        return;
+    }
+    adt[1] |= BIT(shift + 14);
+    adt[0] ^= BIT(13);
+    *rcc_mlb_reg(s, 0x4842c7d0) |= BIT(channel);
+    if (s->mlb_compat_reply == RCC_MLB_REPLY_WATCHDOG ||
+        (s->mlb_compat_reply == RCC_MLB_REPLY_STARTUP &&
+         startup_status[s->mlb_inic_startup_index].function == 0x30a)) {
+        rcc_mlb_watchdog_arm(s);
+    }
+    if (s->mlb_compat_reply == RCC_MLB_REPLY_EHCI_PROTECTED) {
+        s->mlb_inic_version_pending = true;
+    }
+    if (s->mlb_compat_reply == RCC_MLB_REPLY_VERSION &&
+        s->mlb_inic_version_pending) {
+        s->mlb_inic_startup_index = 0;
+        s->mlb_compat_reply = RCC_MLB_REPLY_STARTUP;
+    } else if (s->mlb_compat_reply == RCC_MLB_REPLY_STARTUP) {
+        if (++s->mlb_inic_startup_index == ARRAY_SIZE(startup_status)) {
+            s->mlb_inic_version_pending = false;
+            /* The guest requests the next state after consuming these. */
+            s->mlb_compat_reply = RCC_MLB_REPLY_NONE;
+        }
+    } else {
+        s->mlb_compat_reply = RCC_MLB_REPLY_NONE;
+    }
+    trace_mh2p_rcc_mlb_compat_rx(channel, address, reply_len);
+}
+
+static void rcc_mlb_tx_experiment(MH2PRCCMachineState *s)
+{
+    uint32_t control = *rcc_mlb_reg(s, 0x4842c7c0);
+
+    if (!(s->mlb_tx_dma_experiment || s->mlb_compat_peer) ||
+        (control & 0x14) != 4 ||
+        !(*rcc_mlb_reg(s, 0x4842c480) & BIT(15)) ||
+        !(*rcc_mlb_reg(s, 0x4842c400) & BIT(0))) {
+        return;
+    }
+
+    for (unsigned channel = 0; channel < 64; channel++) {
+        uint32_t *adt = s->mlb_channel_table[0x40 + channel];
+        uint32_t cat = s->mlb_channel_table[0x88 + channel / 8]
+                         [(channel % 8) / 2] >> ((channel % 2) * 16);
+        unsigned label = cat & 63;
+        uint32_t *cdt = s->mlb_channel_table[label];
+        unsigned page = !!(adt[0] & BIT(13));
+        unsigned shift = page * 16;
+        uint32_t status = (adt[1] >> shift) & 0xffff;
+        uint32_t dbr_base = (cdt[3] >> 16) & 0x3fff;
+        unsigned dbr_size = (cdt[3] & 0xfff) + 1;
+        unsigned capacity = (status & 0x7ff) + 1;
+        uint32_t address = adt[2 + page];
+        uint8_t bytes[2048];
+        unsigned length;
+        uint64_t end;
+
+        if (!(cat & BIT(11)) || (cat & BIT(12)) ||
+            (cat & BIT(13)) || ((cat >> 8) & 7) != 1 ||
+            !(adt[0] & BIT(15)) || !(status & BIT(15)) ||
+            (status & BIT(14)) || s->mlb_tx_occupied[label] ||
+            !(*rcc_mlb_reg(s, 0x4842c488 + 4 * (channel / 32)) &
+              BIT(channel % 32))) {
+            continue;
+        }
+        if (!(adt[0] & BIT(14)) || !(status & BIT(12)) ||
+            cdt[0] || cdt[1] || cdt[2] ||
+            dbr_base + dbr_size > sizeof(s->mlb_dbr) || capacity < 2) {
+            qemu_log_mask(LOG_UNIMP, "mh2p-rcc: experimental MLB DMA "
+                          "channel %u has unsupported descriptor\n", channel);
+            continue;
+        }
+        bool overlap = false;
+        for (unsigned i = 0; i < ARRAY_SIZE(s->mlb_tx_occupied); i++) {
+            if (s->mlb_tx_occupied[i] &&
+                dbr_base < s->mlb_tx_base[i] + s->mlb_tx_size[i] &&
+                s->mlb_tx_base[i] < dbr_base + dbr_size) {
+                overlap = true;
+                break;
+            }
+        }
+        if (overlap) {
+            qemu_log_mask(LOG_UNIMP, "mh2p-rcc: experimental MLB DMA "
+                          "channel %u overlaps an occupied buffer\n", channel);
+            continue;
+        }
+        end = (uint64_t)address + capacity;
+        if (!((address >= 0x40300000 && end <= 0x40380000) ||
+              (address >= RCC_RAM_BASE &&
+               end <= RCC_RAM_BASE + MACHINE(s)->ram_size)) ||
+            address_space_read(&address_space_memory, address,
+                               MEMTXATTRS_UNSPECIFIED, bytes, 2) != MEMTX_OK) {
+            qemu_log_mask(LOG_GUEST_ERROR, "mh2p-rcc: experimental MLB DMA "
+                          "channel %u has invalid memory buffer\n", channel);
+            continue;
+        }
+        length = lduw_be_p(bytes) + 2;
+        if (length < 5 || length > sizeof(bytes) || length > capacity ||
+            length > dbr_size) {
+            qemu_log_mask(LOG_UNIMP, "mh2p-rcc: experimental MLB DMA "
+                          "channel %u has unsupported packet length %u\n",
+                          channel, length);
+            continue;
+        }
+        if (address_space_read(&address_space_memory, address,
+                               MEMTXATTRS_UNSPECIFIED, bytes, length) != MEMTX_OK) {
+            qemu_log_mask(LOG_GUEST_ERROR, "mh2p-rcc: experimental MLB DMA "
+                          "channel %u could not read packet\n", channel);
+            continue;
+        }
+        if (s->mlb_compat_peer &&
+            (s->mlb_compat_reply ||
+             (s->mlb_inic_response_waiting &&
+              !(channel == 2 && length == 5 && bytes[2] == 2 &&
+                bytes[3] == 0x10 && bytes[4] == 2)))) {
+            qemu_log_mask(LOG_UNIMP, "mh2p-rcc: compatibility MLB peer "
+                          "cannot queue another packet before RX completes\n");
+            continue;
+        }
+        if (s->mlb_compat_peer && s->mlb_inic_watchdog_expired &&
+            !(channel == 2 && length == 7 &&
+              bytes[2] == 4 && bytes[3] == 0x18 &&
+              bytes[4] == 0xc0 && bytes[5] == 1 && bytes[6] == 10)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "mh2p-rcc: compatibility INIC rejected TX "
+                          "while awaiting synchronization\n");
+            adt[1] |= BIT(shift + 14) | BIT(shift + 13);
+            adt[0] ^= BIT(13);
+            *rcc_mlb_reg(s, 0x4842c7d0 + 4 * (channel / 32)) |=
+                BIT(channel % 32);
+            continue;
+        }
+        memcpy(s->mlb_dbr + dbr_base, bytes, length);
+        s->mlb_tx_occupied[label] = true;
+        s->mlb_tx_base[label] = dbr_base;
+        s->mlb_tx_size[label] = dbr_size;
+        cdt[0] |= BIT(11);
+        cdt[2] = length % dbr_size;
+        adt[1] |= BIT(shift + 14);
+        adt[0] ^= BIT(13);
+        *rcc_mlb_reg(s, 0x4842c7d0 + 4 * (channel / 32)) |=
+            BIT(channel % 32);
+        trace_mh2p_rcc_mlb_tx_dma(channel, label, address, dbr_base, length);
+        if (s->mlb_compat_peer) {
+            uint8_t prefix[16] = { 0 };
+
+            memcpy(prefix, bytes, MIN(length, sizeof(prefix)));
+            trace_mh2p_rcc_mlb_compat_tx(channel, length, ldl_be_p(prefix),
+                                         ldl_be_p(prefix + 4),
+                                         ldl_be_p(prefix + 8),
+                                         ldl_be_p(prefix + 12));
+            /* The guest periodically sets bit 7 in otherwise identical ICM headers. */
+            if (channel == 2 && length == 7 &&
+                bytes[2] == 4 && bytes[3] == 0x18 &&
+                bytes[4] == 0xc0 && bytes[5] == 1 && bytes[6] == 10) {
+                s->mlb_inic_watchdog_expired = false;
+                s->mlb_compat_reply = RCC_MLB_REPLY_SYNC;
+                s->mlb_tx_occupied[label] = false;
+                cdt[0] = cdt[2] = 0;
+            } else if (channel == 2 && length == 8 &&
+                       bytes[2] == 1 && (bytes[3] & 0x7f) == 0x14 &&
+                       bytes[4] == 0x30 && bytes[5] == 1 &&
+                       bytes[6] == 0 && bytes[7] == 0) {
+                s->mlb_compat_reply = RCC_MLB_REPLY_FIFO;
+                s->mlb_inic_response_waiting = RCC_MLB_REPLY_EHCI_ATTACHED;
+                s->mlb_tx_occupied[label] = false;
+                cdt[0] = cdt[2] = 0;
+            } else if (channel == 2 && length == 9 &&
+                       bytes[2] == 1 && (bytes[3] & 0x7f) == 0x14 &&
+                       bytes[4] == 0x30 && bytes[5] == 0 &&
+                       bytes[6] == 0 && bytes[7] == 1 && bytes[8] == 0) {
+                s->mlb_compat_reply = RCC_MLB_REPLY_FIFO;
+                s->mlb_inic_response_waiting = RCC_MLB_REPLY_EHCI_PROTECTED;
+                s->mlb_tx_occupied[label] = false;
+                cdt[0] = cdt[2] = 0;
+            } else if (channel == 2 && length == 9 &&
+                       bytes[2] == 1 && (bytes[3] & 0x7f) == 0x14 &&
+                       bytes[4] == 0x30 && bytes[5] == 0 &&
+                       bytes[6] == 0 && bytes[7] == 1 && bytes[8] == 2) {
+                s->mlb_compat_reply = RCC_MLB_REPLY_FIFO;
+                s->mlb_inic_response_waiting = RCC_MLB_REPLY_EHCI_ATTACHED;
+                s->mlb_tx_occupied[label] = false;
+                cdt[0] = cdt[2] = 0;
+            } else if (channel == 2 && length == 10 &&
+                       bytes[2] == 1 && (bytes[3] & 0x7f) == 0x14 &&
+                       bytes[4] == 0x30 && bytes[5] == 0 &&
+                       bytes[6] == 0 && bytes[7] == 2 &&
+                       bytes[8] == 1 && bytes[9] == 2) {
+                s->mlb_compat_reply = RCC_MLB_REPLY_FIFO;
+                s->mlb_inic_response_waiting = s->mlb_inic_version_pending
+                                               ? RCC_MLB_REPLY_VERSION
+                                               : RCC_MLB_REPLY_EHCI_ATTACHED;
+                s->mlb_tx_occupied[label] = false;
+                cdt[0] = cdt[2] = 0;
+            } else if (channel == 2 && length == 8 &&
+                       bytes[2] == 1 && (bytes[3] & 0x7f) == 0x14 &&
+                       bytes[4] == 0x30 && bytes[5] == 0xa1 &&
+                       bytes[6] == 0 && bytes[7] == 0) {
+                s->mlb_compat_reply = RCC_MLB_REPLY_FIFO;
+                s->mlb_inic_response_waiting = RCC_MLB_REPLY_WATCHDOG;
+                s->mlb_tx_occupied[label] = false;
+                cdt[0] = cdt[2] = 0;
+            } else if (channel == 2 && length == 9 &&
+                       bytes[2] == 1 && (bytes[3] & 0x7f) == 0x14 &&
+                       bytes[4] == 0x50 && bytes[5] == 0xe0 &&
+                       bytes[6] == 0 && bytes[7] == 1 && bytes[8] <= 1) {
+                s->mlb_inic_emergency = bytes[8];
+                s->mlb_compat_reply = RCC_MLB_REPLY_FIFO;
+                s->mlb_tx_occupied[label] = false;
+                cdt[0] = cdt[2] = 0;
+            } else if (channel == 2 && length == 11 &&
+                       bytes[2] == 1 && (bytes[3] & 0x7f) == 0x14 &&
+                       bytes[4] == 0x30 && bytes[5] == 0x32 &&
+                       bytes[6] == 0 && bytes[7] == 3 &&
+                       bytes[8] == 1 && bytes[9] == 5 && bytes[10] == 5) {
+                s->mlb_inic_retries_configured = true;
+                s->mlb_compat_reply = RCC_MLB_REPLY_FIFO;
+                s->mlb_inic_response_waiting = RCC_MLB_REPLY_RETRIES;
+                s->mlb_tx_occupied[label] = false;
+                cdt[0] = cdt[2] = 0;
+            } else if (channel == 2 && length == 8 &&
+                       bytes[2] == 1 && (bytes[3] & 0x7f) == 0x14 &&
+                       bytes[4] == 0x30 && bytes[5] == 0x90 &&
+                       bytes[6] == 0 && bytes[7] == 0 &&
+                       timer_pending(s->mlb_inic_watchdog_timer)) {
+                rcc_mlb_watchdog_arm(s);
+                s->mlb_compat_reply = RCC_MLB_REPLY_FIFO;
+                s->mlb_tx_occupied[label] = false;
+                cdt[0] = cdt[2] = 0;
+            } else if (channel == 2 && length == 15 &&
+                       bytes[2] == 1 && (bytes[3] & 0x7f) == 0x14 &&
+                       bytes[4] == 0x40 && bytes[5] == 0x32 &&
+                       bytes[6] == 0 && bytes[7] == 7 &&
+                       bytes[8] == 0 && bytes[9] <= 1 && bytes[10] == 1) {
+                unsigned i;
+
+                for (i = 0; i < ARRAY_SIZE(s->mlb_inic_socket_used); i++) {
+                    if (!s->mlb_inic_socket_used[i]) {
+                        break;
+                    }
+                }
+                if (i == ARRAY_SIZE(s->mlb_inic_socket_used)) {
+                    qemu_log_mask(LOG_GUEST_ERROR,
+                                  "mh2p-rcc: compatibility INIC socket "
+                                  "capacity exhausted\n");
+                } else {
+                    s->mlb_inic_socket_used[i] = true;
+                    memcpy(s->mlb_inic_socket_requests[i], bytes + 8, 7);
+                    s->mlb_inic_socket_handle = i + 1;
+                    s->mlb_compat_reply = RCC_MLB_REPLY_FIFO;
+                    s->mlb_inic_response_waiting = RCC_MLB_REPLY_SOCKET;
+                    s->mlb_tx_occupied[label] = false;
+                    cdt[0] = cdt[2] = 0;
+                }
+            } else if (channel == 2 && length == 5 &&
+                       bytes[2] == 2 && bytes[3] == 0x10 &&
+                       bytes[4] == 2) {
+                if (s->mlb_inic_response_waiting) {
+                    s->mlb_compat_reply = s->mlb_inic_response_waiting;
+                    s->mlb_inic_response_waiting = RCC_MLB_REPLY_NONE;
+                }
+                s->mlb_tx_occupied[label] = false;
+                cdt[0] = cdt[2] = 0;
+            } else {
+                qemu_log_mask(LOG_UNIMP,
+                              "mh2p-rcc: compatibility MLB peer does not "
+                              "handle TX channel %u length %u\n", channel, length);
+            }
+        }
+    }
+    rcc_mlb_compat_receive(s);
+    rcc_mlb_dma_irq(s);
+}
+
 static MemTxResult rcc_unknown_read(void *opaque, hwaddr offset,
                                    uint64_t *value, unsigned size,
                                    MemTxAttrs attrs)
@@ -5420,6 +5933,14 @@ static MemTxResult rcc_unknown_read(void *opaque, hwaddr offset,
         if (size == 4 && offset + 0x40000000 ==
             rcc_mlb_registers[i].address) {
             *value = s->mlb_regs[i];
+            trace_mh2p_rcc_mlb_read(rcc_mlb_registers[i].address, *value);
+            if ((s->mlb_tx_dma_experiment || s->mlb_compat_peer) &&
+                (rcc_mlb_registers[i].address == 0x4842c7d0 ||
+                 rcc_mlb_registers[i].address == 0x4842c7d4) &&
+                !(*rcc_mlb_reg(s, 0x4842c7c0) & BIT(0))) {
+                s->mlb_regs[i] = 0;
+                rcc_mlb_dma_irq(s);
+            }
             return MEMTX_OK;
         }
     }
@@ -5731,6 +6252,10 @@ static MemTxResult rcc_unknown_write(void *opaque, hwaddr offset,
     }
     if (size == 4 && offset + 0x40000000 == 0x4ae06410 &&
         !(value & ~3U)) {
+        trace_mh2p_rcc_dsp_reset_write(
+            current_cpu ? current_cpu->cpu_index : -1,
+            current_cpu ? CPU_GET_CLASS(current_cpu)->get_pc(current_cpu) : 0,
+            s->dsp1_reset_control, value);
         s->dsp1_reset_control = value;
         rcc_dsp1_control(s);
         return MEMTX_OK;
@@ -5902,6 +6427,9 @@ static MemTxResult rcc_unknown_write(void *opaque, hwaddr offset,
         if (size == 4 && offset + 0x40000000 == rcc_gp_timers[i].clock &&
             s->gp_timer[i].number != 12 &&
             !(value & ~0x01030002U)) {
+            trace_mh2p_rcc_gp_timer_clock_write(s->gp_timer[i].number,
+                                               s->gp_timer[i].clock_control,
+                                               value);
             rcc_gp_timer_sync(&s->gp_timer[i]);
             s->gp_timer[i].clock_control = value & 0x01000002;
             rcc_gp_timer_arm(&s->gp_timer[i]);
@@ -6115,6 +6643,15 @@ static MemTxResult rcc_unknown_write(void *opaque, hwaddr offset,
                     s->mlb_mdat[i] = entry[i];
                 }
             }
+            if (value & BIT(31)) {
+                trace_mh2p_rcc_mlb_table_write(value & 0xff, entry[0],
+                                               entry[1], entry[2], entry[3]);
+                if ((value & 0xff) < 64 &&
+                    !entry[0] && !entry[1] && !entry[2] && !entry[3]) {
+                    s->mlb_tx_occupied[value & 0xff] = false;
+                }
+                rcc_mlb_tx_experiment(s);
+            }
             /* A completed internal RAM access does not imply a link or DMA. */
             s->mlb_mctl = 1;
         }
@@ -6136,13 +6673,29 @@ static MemTxResult rcc_unknown_write(void *opaque, hwaddr offset,
             }
             if (offset + 0x40000000 == 0x4842c400 &&
                 (value & 1) && !(s->mlb_regs[i] & 1)) {
-                qemu_log_mask(LOG_UNIMP,
-                              "mh2p-rcc: MLB link/DMA transfers are not "
-                              "implemented; no external lock or completion\n");
+                if (s->mlb_compat_peer) {
+                    qemu_log_mask(LOG_UNIMP,
+                                  "mh2p-rcc: compatibility MLB peer supports "
+                                  "only a limited inferred exchange\n");
+                } else if (s->mlb_tx_dma_experiment) {
+                    qemu_log_mask(LOG_UNIMP,
+                                  "mh2p-rcc: experimental MLB TX DMA is "
+                                  "limited; no external link or peer\n");
+                } else {
+                    qemu_log_mask(LOG_UNIMP,
+                                  "mh2p-rcc: MLB link/DMA transfers are not "
+                                  "implemented; no external lock or completion\n");
+                }
             }
             s->mlb_regs[i] = (value & rw) |
                             (s->mlb_regs[i] & value & w0c) |
                             (s->mlb_regs[i] & ~value & w1c);
+            trace_mh2p_rcc_mlb_write(rcc_mlb_registers[i].address, value,
+                                    s->mlb_regs[i]);
+            if (s->mlb_tx_dma_experiment || s->mlb_compat_peer) {
+                rcc_mlb_tx_experiment(s);
+                rcc_mlb_dma_irq(s);
+            }
             return MEMTX_OK;
         }
     }
@@ -6328,6 +6881,8 @@ static const MemoryRegionOps rcc_unknown_ops = {
 static void rcc_reset(void *opaque)
 {
     MH2PRCCMachineState *s = opaque;
+    bool direct_start = s->entry != 0x40300000 && s->entry != 0x40340000;
+    bool clock_handoff = s->power_clocks && direct_start;
     MemTxAttrs secure = { .secure = true };
     MemTxResult result;
 
@@ -6340,7 +6895,7 @@ static void rcc_reset(void *opaque)
     for (unsigned i = 0; i < ARRAY_SIZE(rcc_ddr_registers); i++) {
         s->ddr_regs[i] = rcc_ddr_registers[i].reset;
     }
-    rcc_gpmc_reset(s, s->entry != 0x40300000 && s->entry != 0x40340000);
+    rcc_gpmc_reset(s, direct_start);
     memset(s->spinlocks, 0, sizeof(s->spinlocks));
     for (unsigned i = 0; i < ARRAY_SIZE(s->spi); i++) {
         /*
@@ -6441,9 +6996,26 @@ static void rcc_reset(void *opaque)
     memset(s->mlb_mdat, 0, sizeof(s->mlb_mdat));
     memset(s->mlb_mdwe, 0, sizeof(s->mlb_mdwe));
     memset(s->mlb_channel_table, 0, sizeof(s->mlb_channel_table));
+    memset(s->mlb_dbr, 0, sizeof(s->mlb_dbr));
+    memset(s->mlb_tx_occupied, 0, sizeof(s->mlb_tx_occupied));
+    memset(s->mlb_tx_base, 0, sizeof(s->mlb_tx_base));
+    memset(s->mlb_tx_size, 0, sizeof(s->mlb_tx_size));
+    s->mlb_compat_reply = RCC_MLB_REPLY_NONE;
+    s->mlb_inic_response_waiting = RCC_MLB_REPLY_NONE;
+    s->mlb_inic_emergency = false;
+    s->mlb_inic_watchdog_expired = false;
+    timer_del(s->mlb_inic_watchdog_timer);
+    memset(s->mlb_inic_socket_used, 0, sizeof(s->mlb_inic_socket_used));
+    s->mlb_inic_socket_handle = 0;
+    s->mlb_inic_retries_configured = false;
+    s->mlb_inic_version_pending = false;
+    s->mlb_inic_startup_index = 0;
     s->mlb_mctl = s->mlb_madr = 0;
     for (unsigned i = 0; i < ARRAY_SIZE(rcc_mlb_registers); i++) {
         s->mlb_regs[i] = rcc_mlb_registers[i].reset;
+    }
+    if (s->mlb_tx_dma_experiment || s->mlb_compat_peer) {
+        rcc_mlb_dma_irq(s);
     }
     s->ipu1_clkctrl = s->ipu1_firmware ? 1 : 0;
     s->dsp1_clkctrl = 0;
@@ -6489,8 +7061,7 @@ static void rcc_reset(void *opaque)
     for (unsigned i = 0; i < ARRAY_SIZE(rcc_disabled_clkctrl); i++) {
         s->disabled_clkctrl[i] = rcc_disabled_clkctrl[i].reset;
     }
-    if (s->power_clocks &&
-        s->entry != 0x40300000 && s->entry != 0x40340000) {
+    if (clock_handoff) {
         /*
          * The original IPL enables McASP1/2/3/6/8 and selects MLBP_CLK
          * before entering QNX startup. This does not supply serial clocks.
@@ -6547,8 +7118,14 @@ static void rcc_reset(void *opaque)
     memset(s->atl_config, 0, sizeof(s->atl_config));
     s->timer2_epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     for (unsigned i = 0; i < ARRAY_SIZE(s->gp_timer); i++) {
-        s->gp_timer[i].clock_control = s->gp_timer[i].number == 12 ? 1 : 0;
-        rcc_gp_timer_reset(&s->gp_timer[i]);
+        RCCTimer *timer = &s->gp_timer[i];
+
+        timer->clock_control = timer->number == 12 ? 1 : 0;
+        if (clock_handoff && timer->number == 10) {
+            /* The IPL enables TIMER10 with SYS_CLK1 before direct start. */
+            timer->clock_control = 2;
+        }
+        rcc_gp_timer_reset(timer);
     }
     for (unsigned i = 0; i < ARRAY_SIZE(rcc_pipe3_registers); i++) {
         s->pipe3_regs[i] = rcc_pipe3_registers[i].reset;
@@ -6888,6 +7465,8 @@ static void rcc_init(MachineState *ms)
                                     rcc_mcasp_dma, s);
     s->mcasp_tx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                    rcc_mcasp_tx_tick, s);
+    s->mlb_inic_watchdog_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                             rcc_mlb_watchdog_expired, s);
     memory_region_init_io(&s->mpu_watchdog, OBJECT(ms), &rcc_mpu_wdt_ops, s,
                           "mh2p-rcc-mpu-watchdog", 0x18);
     memory_region_add_subregion(sysmem, 0x482a0000, &s->mpu_watchdog);
@@ -7268,6 +7847,47 @@ static void rcc_set_mlb_clock_peer(Object *obj, bool value, Error **errp)
     ((MH2PRCCMachineState *)obj)->mlb_clock_peer = value;
 }
 
+static bool rcc_get_mlb_tx_dma_experiment(Object *obj, Error **errp)
+{
+    return ((MH2PRCCMachineState *)obj)->mlb_tx_dma_experiment;
+}
+
+static void rcc_set_mlb_tx_dma_experiment(Object *obj, bool value, Error **errp)
+{
+    ((MH2PRCCMachineState *)obj)->mlb_tx_dma_experiment = value;
+}
+
+static bool rcc_get_mlb_compat_peer(Object *obj, Error **errp)
+{
+    return ((MH2PRCCMachineState *)obj)->mlb_compat_peer;
+}
+
+static void rcc_set_mlb_compat_peer(Object *obj, bool value, Error **errp)
+{
+    ((MH2PRCCMachineState *)obj)->mlb_compat_peer = value;
+}
+
+static bool rcc_get_mlb_watchdog_expired(Object *obj, Error **errp)
+{
+    return ((MH2PRCCMachineState *)obj)->mlb_inic_watchdog_expired;
+}
+
+static char *rcc_get_mlb_experiment_dbr(Object *obj, Error **errp)
+{
+    MH2PRCCMachineState *s = (MH2PRCCMachineState *)obj;
+    GString *text;
+
+    if (!s->mlb_tx_dma_experiment) {
+        error_setg(errp, "MLB TX DMA experiment is not enabled");
+        return NULL;
+    }
+    text = g_string_sized_new(sizeof(s->mlb_dbr) * 2);
+    for (unsigned i = 0; i < sizeof(s->mlb_dbr); i++) {
+        g_string_append_printf(text, "%02x", s->mlb_dbr[i]);
+    }
+    return g_string_free(text, false);
+}
+
 static void rcc_machine_init(MachineClass *mc)
 {
     static const char * const cpu_types[] = {
@@ -7309,6 +7929,17 @@ static void rcc_machine_init(MachineClass *mc)
     object_class_property_add_bool(OBJECT_CLASS(mc), "experimental-mlb-clock-peer",
                                    rcc_get_mlb_clock_peer,
                                    rcc_set_mlb_clock_peer);
+    object_class_property_add_bool(OBJECT_CLASS(mc), "experimental-mlb-tx-dma",
+                                   rcc_get_mlb_tx_dma_experiment,
+                                   rcc_set_mlb_tx_dma_experiment);
+    object_class_property_add_bool(OBJECT_CLASS(mc), "experimental-mlb-compat-peer",
+                                   rcc_get_mlb_compat_peer,
+                                   rcc_set_mlb_compat_peer);
+    object_class_property_add_bool(OBJECT_CLASS(mc),
+                                   "experimental-mlb-watchdog-expired",
+                                   rcc_get_mlb_watchdog_expired, NULL);
+    object_class_property_add_str(OBJECT_CLASS(mc), "experimental-mlb-dbr",
+                                  rcc_get_mlb_experiment_dbr, NULL);
     object_class_property_add_bool(OBJECT_CLASS(mc), "experimental-uart-efr",
                                    rcc_get_uart_efr, rcc_set_uart_efr);
     for (unsigned i = 0; i < ARRAY_SIZE(rcc_mcasp_gblctl); i++) {

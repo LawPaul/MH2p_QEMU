@@ -5,6 +5,7 @@
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
 #include "qemu/bitops.h"
+#include "qemu/timer.h"
 #include "libqtest.h"
 #include "qobject/qdict.h"
 #include "qobject/qlist.h"
@@ -452,7 +453,12 @@ static void test_dsp1_reset_without_backend(void)
     g_assert_no_error(error);
     g_assert_cmpint(fd, >=, 0);
     close(fd);
+#ifdef CONFIG_TRACE_LOG
+    options = g_strdup_printf("-d unimp -D %s "
+                              "-trace enable=mh2p_rcc_dsp_reset_write", logfile);
+#else
     options = g_strdup_printf("-d unimp -D %s", logfile);
+#endif
     s = start_rcc_options(options);
     g_assert_cmphex(qtest_readl(s, 0x4ae06400), ==, 0x3f0003);
     g_assert_cmphex(qtest_readl(s, 0x4ae06404), ==, 0x3f7);
@@ -514,6 +520,12 @@ static void test_dsp1_reset_without_backend(void)
     g_assert_no_error(error);
     g_assert_null(strstr(contents, "unsupported write at 0x4ae06410"));
     g_assert_nonnull(strstr(contents, "unsupported write at 0x4ae06400"));
+#ifdef CONFIG_TRACE_LOG
+    g_assert_nonnull(strstr(contents, "mh2p_rcc_dsp_reset_write "
+                            "cpu=-1 pc=0x0 old=0x0 value=0x3"));
+    g_assert_nonnull(strstr(contents, "mh2p_rcc_dsp_reset_write "
+                            "cpu=-1 pc=0x0 old=0x3 value=0x1"));
+#endif
     unlink(logfile);
 }
 
@@ -4117,9 +4129,16 @@ static void test_mlb_mcasp_clock_peer(void)
     qtest_writel(s, base + 0xa0, 0x1f00);
     qtest_clock_step(s, 1000000);
     g_assert_cmphex(qtest_readl(s, base + 0xa0), ==, 0xf00);
+    qtest_writel(s, 0x4842c400, 0x20);
+    qtest_writel(s, 0x4842c400, 0x2c);
     qtest_writel(s, 0x4842c400, 0x2d);
     qtest_clock_step(s, 1000000);
     g_assert_cmphex(qtest_readl(s, 0x4842c400), ==, 0x2d);
+    qtest_writel(s, 0x4842c400, 0xad);
+    qtest_clock_step(s, 1000000000);
+    g_assert_cmphex(qtest_readl(s, 0x4842c400), ==, 0x2d);
+    g_assert_cmphex(qtest_readl(s, 0x4842c7d0), ==, 0);
+    g_assert_cmphex(qtest_readl(s, 0x4842c7d4), ==, 0);
     qtest_system_reset(s);
     g_assert_cmphex(qtest_readl(s, base + 0xa0), ==, 0);
     qtest_writel(s, base + 0xb4, 6);
@@ -5352,6 +5371,502 @@ static void test_mlb_channel_table(void)
     g_assert_nonnull(strstr(contents,
                            "unsupported read at 0x4842c4e0 size=2"));
     unlink(logfile);
+}
+
+static void mlb_table_write(QTestState *s, unsigned index,
+                            uint32_t w0, uint32_t w1, uint32_t w2, uint32_t w3)
+{
+    const uint32_t words[] = { w0, w1, w2, w3 };
+
+    for (unsigned i = 0; i < 4; i++) {
+        qtest_writel(s, 0x4842c4d0 + 4 * i, UINT32_MAX);
+        qtest_writel(s, 0x4842c4c0 + 4 * i, words[i]);
+    }
+    qtest_writel(s, 0x4842c4e4, 0x80000000 | index);
+}
+
+static void test_mlb_tx_dma_experiment(void)
+{
+    const uint32_t base = 0x4842c000, memory = 0x40300100;
+    const uint8_t packet[] = { 0, 5, 0x11, 0x22, 0x33, 0x44, 0x55 };
+    QTestState *s = start_rcc_options("-machine experimental-mlb-tx-dma=on");
+    QDict *response;
+    const char *dbr;
+
+    qtest_irq_intercept_in(s, "/machine/interrupt-controller");
+    qtest_writel(s, 0x4a002a48, 228);
+    qtest_writel(s, 0x4a009358, 2);
+    qtest_memwrite(s, memory, packet, sizeof(packet));
+    mlb_table_write(s, 2, 0, 0, 0, 0x008000ff);
+    mlb_table_write(s, 0x88, 0, 0x902, 0, 0);
+    mlb_table_write(s, 0x42, 0xc000, 0x907f, memory, 0);
+    qtest_writel(s, base + 0x400, 0x2d);
+    qtest_writel(s, base + 0x488, 4);
+    qtest_writel(s, base + 0x7d8, 4);
+    qtest_writel(s, base + 0x7c0, 5);
+    g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 0);
+    qtest_writel(s, base + 0x480, 0x8000);
+    g_assert_cmphex(qtest_readl(s, base + 0x400), ==, 0x2d);
+    g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 4);
+    g_assert_true(qtest_get_irq(s, 4));
+    qtest_writel(s, base + 0x4e4, 0x42);
+    g_assert_cmphex(qtest_readl(s, base + 0x4c0), ==, 0xe000);
+    g_assert_cmphex(qtest_readl(s, base + 0x4c4), ==, 0xd07f);
+    qtest_writel(s, base + 0x4e4, 2);
+    g_assert_cmphex(qtest_readl(s, base + 0x4c0), ==, 0x800);
+    g_assert_cmphex(qtest_readl(s, base + 0x4c8), ==, 7);
+    response = qtest_qmp(s,
+        "{'execute':'qom-get','arguments':{'path':'/machine',"
+        "'property':'experimental-mlb-dbr'}}");
+    g_assert_false(qdict_haskey(response, "error"));
+    dbr = qdict_get_str(response, "return");
+    g_assert_cmpuint(strlen(dbr), ==, 32768);
+    g_assert_true(g_str_has_prefix(dbr + 0x80 * 2, "00051122334455"));
+    g_assert_true(g_str_has_prefix(dbr + 0x87 * 2, "00000000"));
+    qobject_unref(response);
+    qtest_writel(s, base + 0x400, 0x2c);
+    qtest_writel(s, base + 0x7d8, 0);
+    g_assert_false(qtest_get_irq(s, 4));
+    g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 4);
+    qtest_writel(s, base + 0x7d8, 4);
+    g_assert_true(qtest_get_irq(s, 4));
+    qtest_writel(s, base + 0x7d0, 4);
+    g_assert_false(qtest_get_irq(s, 4));
+    qtest_writel(s, base + 0x400, 0x2d);
+    mlb_table_write(s, 0x42, 0xe000, 0x907fd07f, memory, memory);
+    qtest_writel(s, base + 0x4e4, 0x42);
+    g_assert_cmphex(qtest_readl(s, base + 0x4c4), ==, 0x907fd07f);
+    g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 0);
+    qtest_system_reset(s);
+    g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 0);
+    response = qtest_qmp(s,
+        "{'execute':'qom-get','arguments':{'path':'/machine',"
+        "'property':'experimental-mlb-dbr'}}");
+    g_assert_false(qdict_haskey(response, "error"));
+    g_assert_true(g_str_has_prefix(qdict_get_str(response, "return") + 0x80 * 2,
+                                   "00000000000000"));
+    qobject_unref(response);
+    qtest_quit(s);
+}
+
+static void test_mlb_tx_dma_rejects_unsupported(void)
+{
+    const uint32_t base = 0x4842c000, memory = 0x40300100;
+    const uint8_t packet[] = { 0, 5, 0x11, 0x22, 0x33, 0x44, 0x55 };
+    QTestState *s = start_rcc_options("-machine experimental-mlb-tx-dma=on");
+
+    qtest_writel(s, 0x4a009358, 2);
+    qtest_memwrite(s, memory, packet, sizeof(packet));
+    mlb_table_write(s, 2, 0, 0, 0, 0x008000ff);
+    mlb_table_write(s, 0x88, 0, 0x902, 0, 0);
+    qtest_writel(s, base + 0x400, 0x2d);
+    qtest_writel(s, base + 0x488, 4);
+    qtest_writel(s, base + 0x480, 0x8000);
+    qtest_writel(s, base + 0x7c0, 0x15);
+    mlb_table_write(s, 0x42, 0xc000, 0x907f, memory, 0);
+    g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 0);
+    mlb_table_write(s, 0x42, 0xc000, 0x907f, 0x4037fff0, 0);
+    qtest_writel(s, base + 0x7c0, 5);
+    g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 0);
+    mlb_table_write(s, 0x42, 0xc000, 0x9005, memory, 0);
+    g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 0);
+    mlb_table_write(s, 2, 0, 0, 0, 0x3fff000f);
+    mlb_table_write(s, 0x42, 0xc000, 0x907f, memory, 0);
+    g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 0);
+    qtest_writel(s, base + 0x4e4, 0x42);
+    g_assert_cmphex(qtest_readl(s, base + 0x4c4), ==, 0x907f);
+    g_assert_cmphex(qtest_readl(s, base + 0x400), ==, 0x2d);
+    qtest_quit(s);
+}
+
+static void test_mlb_tx_dma_irq_routing(void)
+{
+    const uint32_t base = 0x4842c000, memory = 0x40300100;
+    const uint8_t packet[] = { 0, 5, 0x11, 0x22, 0x33, 0x44, 0x55 };
+    QTestState *s = start_rcc_options("-machine experimental-mlb-tx-dma=on");
+
+    qtest_irq_intercept_in(s, "/machine/interrupt-controller");
+    qtest_writel(s, 0x4a002a48, 228 | (229 << 16));
+    qtest_writel(s, 0x4a009358, 2);
+    qtest_memwrite(s, memory, packet, sizeof(packet));
+    mlb_table_write(s, 2, 0, 0, 0, 0x008000ff);
+    mlb_table_write(s, 0x8c, 0, 0x902, 0, 0);
+    mlb_table_write(s, 0x62, 0xc000, 0x907f, memory, 0);
+    qtest_writel(s, base + 0x400, 0x2d);
+    qtest_writel(s, base + 0x48c, 4);
+    qtest_writel(s, base + 0x7dc, 4);
+    qtest_writel(s, base + 0x7c0, 5);
+    qtest_writel(s, base + 0x480, 0x8000);
+    g_assert_false(qtest_get_irq(s, 4));
+    g_assert_true(qtest_get_irq(s, 7));
+    g_assert_cmphex(qtest_readl(s, base + 0x7d4), ==, 4);
+
+    qtest_writel(s, base + 0x480, 0);
+    qtest_writel(s, base + 0x7c0, 7);
+    g_assert_true(qtest_get_irq(s, 4));
+    g_assert_false(qtest_get_irq(s, 7));
+    qtest_writel(s, base + 0x7c0, 6);
+    g_assert_cmphex(qtest_readl(s, base + 0x7d4), ==, 4);
+    g_assert_false(qtest_get_irq(s, 4));
+    g_assert_cmphex(qtest_readl(s, base + 0x7d4), ==, 0);
+    qtest_quit(s);
+}
+
+static void test_mlb_compat_sync(void)
+{
+    const uint32_t base = 0x4842c000, tx = 0x40300100, rx = 0x40300000;
+    const uint8_t command[] = { 0, 5, 4, 0x18, 0xc0, 1, 10 };
+    const uint8_t reply[] = { 0, 5, 4, 0x1a, 0x90, 1, 10 };
+    const uint8_t data_command[] = { 0, 6, 1, 0x14, 0x30, 1, 0, 0 };
+    const uint8_t protected_command[] = {
+        0, 7, 1, 0x14, 0x30, 0, 0, 1, 0
+    };
+    const uint8_t attached_command[] = {
+        0, 8, 1, 0x14, 0x30, 0, 0, 2, 1, 2
+    };
+    const uint8_t semiprotected_command[] = {
+        0, 7, 1, 0x14, 0x30, 0, 0, 1, 2
+    };
+    const uint8_t watchdog_command[] = { 0, 6, 1, 0x14, 0x30, 0xa1, 0, 0 };
+    const uint8_t emergency_command[] = { 0, 7, 1, 0x14, 0x50, 0xe0, 0, 1, 1 };
+    const uint8_t watchdog_kicks[][8] = {
+        { 0, 6, 1, 0x14, 0x30, 0x90, 0, 0 },
+        { 0, 6, 1, 0x94, 0x30, 0x90, 0, 0 },
+    };
+    const uint8_t unsupported[] = { 0, 6, 1, 0x14, 0x77, 0x10, 0, 0 };
+    const uint8_t retry_command[] = {
+        0, 9, 1, 0x14, 0x30, 0x32, 0, 3, 1, 5, 5
+    };
+    const uint8_t socket_command[] = {
+        0, 13, 1, 0x14, 0x40, 0x32, 0, 7, 0, 0, 1, 0, 0x1c, 0, 8
+    };
+    const uint8_t socket_command2[] = {
+        0, 13, 1, 0x14, 0x40, 0x32, 0, 7, 0, 1, 1, 0, 0x1c, 0, 6
+    };
+    const uint8_t data_reply[] = { 0, 3, 2, 0x12, 0x20 };
+    const uint8_t status_ack[] = { 0, 3, 2, 0x10, 2 };
+    const uint8_t ehci_reply[] = {
+        0, 11, 5, 0x15, 1, 0x10, 1, 0, 0x30, 0x0c, 0, 1, 2
+    };
+    const uint8_t protected_reply[] = {
+        0, 11, 5, 0x15, 1, 0x10, 1, 0, 0x30, 0x0c, 0, 1, 0
+    };
+    const uint8_t watchdog_reply[] = {
+        0, 15, 5, 0x15, 1, 0x10, 1, 0, 0x30, 0xac, 0, 5,
+        0, 0x13, 0x88, 0x13, 0x88
+    };
+    const uint8_t version_reply[] = {
+        0, 30, 5, 0x15, 1, 0x10, 1, 0, 0x20, 0x0c, 0, 20,
+        0, 0, 8, 0x11, 0x10, 0x10, 3, 0x0a, 0, 0x90,
+        0xff, 0, 0, 0, 0xfb, 0x93, 9, 0, 0x63, 0x42
+    };
+    const uint8_t retry_reply[] = {
+        0, 13, 5, 0x15, 1, 0x10, 1, 0, 0x30, 0x3c, 0, 3, 1, 5, 5
+    };
+    const struct {
+        uint16_t function;
+        uint8_t length;
+        uint8_t data[5];
+    } startup[] = {
+        { 0x40e, 5, { 0, 0, 0, 0, 0 } },
+        { 0x407, 1, { 0 } },
+        { 0x003, 2, { 0, 0 } },
+        { 0x004, 1, { 0 } },
+        { 0x503, 1, { 0 } },
+        { 0x502, 1, { 0 } },
+        { 0x506, 1, { 0 } },
+        { 0x50a, 4, { 0, 0, 0, 0 } },
+        { 0x007, 2, { 0, 0 } },
+        { 0x50e, 2, { 0, 0 } },
+        { 0x30a, 5, { 0, 0x13, 0x88, 0x13, 0x88 } },
+        { 0x303, 3, { 1, 5, 5 } },
+    };
+    uint8_t retry_actual[sizeof(retry_reply)];
+    uint8_t version_actual[sizeof(version_reply)];
+    const uint8_t socket_reply[] = {
+        0, 11, 5, 0x15, 1, 0x10, 1, 0, 0x40, 0x3c, 0, 1, 1
+    };
+    const uint8_t socket_reply2[] = {
+        0, 11, 5, 0x15, 1, 0x10, 1, 0, 0x40, 0x3c, 0, 1, 2
+    };
+    uint8_t watchdog_actual[sizeof(watchdog_reply)];
+    uint8_t ehci_actual[sizeof(ehci_reply)];
+    uint8_t actual[sizeof(reply)];
+    QTestState *s = start_rcc_options("-machine experimental-mlb-compat-peer=on");
+    QDict *response;
+
+    qtest_irq_intercept_in(s, "/machine/interrupt-controller");
+    qtest_writel(s, 0x4a002a48, 228);
+    qtest_writel(s, 0x4a009358, 2);
+    qtest_memwrite(s, tx, command, sizeof(command));
+    mlb_table_write(s, 1, 0, 0, 0, 0x0000007f);
+    mlb_table_write(s, 2, 0, 0, 0, 0x008000ff);
+    mlb_table_write(s, 0x80, 0x09010000, 0, 0, 0);
+    mlb_table_write(s, 0x88, 0x19010000, 0x902, 0, 0);
+    mlb_table_write(s, 0x41, 0xc000, 0x007f007f, rx, rx + 0x80);
+    mlb_table_write(s, 0x42, 0xc000, 0x907f, tx, 0);
+    qtest_writel(s, base + 0x400, 0x2d);
+    qtest_writel(s, base + 0x488, 6);
+    qtest_writel(s, base + 0x7d8, 6);
+    qtest_writel(s, base + 0x7c0, 5);
+    qtest_writel(s, base + 0x480, 0x8000);
+    g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 4);
+    qtest_memread(s, rx, actual, sizeof(actual));
+    g_assert_cmpmem(actual, sizeof(actual), "\0\0\0\0\0\0\0", sizeof(actual));
+
+    mlb_table_write(s, 0x41, 0xc000, 0x007f807f, 0xfffffff0, rx + 0x80);
+    g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 4);
+    mlb_table_write(s, 0x41, 0xc000, 0x007f807f, rx, rx + 0x80);
+    g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 6);
+    g_assert_true(qtest_get_irq(s, 4));
+    qtest_memread(s, rx, actual, sizeof(actual));
+    g_assert_cmpmem(actual, sizeof(actual), reply, sizeof(reply));
+    qtest_writel(s, base + 0x4e4, 0x41);
+    g_assert_cmphex(qtest_readl(s, base + 0x4c0), ==, 0xe000);
+    g_assert_cmphex(qtest_readl(s, base + 0x4c4), ==, 0x007fc07f);
+    g_assert_cmphex(qtest_readl(s, base + 0x400), ==, 0x2d);
+    qtest_writel(s, base + 0x7d0, 6);
+    g_assert_false(qtest_get_irq(s, 4));
+    mlb_table_write(s, 0x41, 0xe000, 0x807fc07f, rx, rx + 0x80);
+    mlb_table_write(s, 0x42, 0xe000, 0x907fd07f, tx, tx);
+    qtest_memread(s, rx + 0x80, actual, sizeof(actual));
+    g_assert_cmpmem(actual, sizeof(actual), reply, sizeof(reply));
+    qtest_writel(s, base + 0x4e4, 0x41);
+    g_assert_cmphex(qtest_readl(s, base + 0x4c0), ==, 0xc000);
+    g_assert_cmphex(qtest_readl(s, base + 0x4c4), ==, 0xc07fc07f);
+    g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 6);
+    qtest_writel(s, base + 0x7d0, 6);
+    qtest_memwrite(s, tx, data_command, sizeof(data_command));
+    mlb_table_write(s, 0x41, 0xc000, 0xc07f807f, rx, rx + 0x80);
+    mlb_table_write(s, 0x42, 0xc000, 0xd07f907f, tx, tx);
+    g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 6);
+    qtest_memread(s, rx, actual, sizeof(data_reply));
+    g_assert_cmpmem(actual, sizeof(data_reply), data_reply, sizeof(data_reply));
+    qtest_writel(s, base + 0x7d0, 6);
+    qtest_memwrite(s, tx, status_ack, sizeof(status_ack));
+    mlb_table_write(s, 0x42, 0xe000, 0x907fd07f, tx, tx);
+    g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 4);
+    mlb_table_write(s, 0x41, 0xe000, 0x807fc07f, rx, rx + 0x80);
+    g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 6);
+    qtest_memread(s, rx + 0x80, ehci_actual, sizeof(ehci_actual));
+    g_assert_cmpmem(ehci_actual, sizeof(ehci_actual),
+                    ehci_reply, sizeof(ehci_reply));
+    qtest_writel(s, base + 0x7d0, 6);
+    qtest_memwrite(s, tx, protected_command, sizeof(protected_command));
+    mlb_table_write(s, 0x41, 0xc000, 0xc07f807f, rx, rx + 0x80);
+    mlb_table_write(s, 0x42, 0xc000, 0xd07f907f, tx, tx);
+    g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 6);
+    qtest_memread(s, rx, actual, sizeof(data_reply));
+    g_assert_cmpmem(actual, sizeof(data_reply), data_reply, sizeof(data_reply));
+    qtest_writel(s, base + 0x7d0, 6);
+    qtest_memwrite(s, tx, status_ack, sizeof(status_ack));
+    mlb_table_write(s, 0x42, 0xe000, 0x907fd07f, tx, tx);
+    mlb_table_write(s, 0x41, 0xe000, 0x807fc07f, rx, rx + 0x80);
+    g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 6);
+    qtest_memread(s, rx + 0x80, ehci_actual, sizeof(ehci_actual));
+    g_assert_cmpmem(ehci_actual, sizeof(ehci_actual),
+                    protected_reply, sizeof(protected_reply));
+    qtest_writel(s, base + 0x7d0, 6);
+    qtest_memwrite(s, tx, attached_command, sizeof(attached_command));
+    mlb_table_write(s, 0x41, 0xc000, 0xc07f807f, rx, rx + 0x80);
+    mlb_table_write(s, 0x42, 0xc000, 0xd07f907f, tx, tx);
+    g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 6);
+    qtest_memread(s, rx, actual, sizeof(data_reply));
+    g_assert_cmpmem(actual, sizeof(data_reply), data_reply, sizeof(data_reply));
+    qtest_writel(s, base + 0x7d0, 6);
+    qtest_memwrite(s, tx, status_ack, sizeof(status_ack));
+    mlb_table_write(s, 0x42, 0xe000, 0x907fd07f, tx, tx);
+    mlb_table_write(s, 0x41, 0xe000, 0x807fc07f, rx, rx + 0x80);
+    g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 6);
+    qtest_memread(s, rx + 0x80, version_actual, sizeof(version_actual));
+    g_assert_cmpmem(version_actual, sizeof(version_actual),
+                    version_reply, sizeof(version_reply));
+    qtest_writel(s, base + 0x7d0, 6);
+    for (unsigned i = 0; i < ARRAY_SIZE(startup); i++) {
+        uint8_t expected[17] = {
+            0, 0, 5, 0x15, 1, 0x10, 1, 0, 0, 0, 0, 0
+        };
+        uint8_t received[sizeof(expected)];
+        size_t length = 12 + startup[i].length;
+        bool page = i & 1;
+
+        expected[1] = length - 2;
+        if (startup[i].function == 0x003 ||
+            startup[i].function == 0x004 ||
+            startup[i].function == 0x007) {
+            expected[3] = 0x05;
+        }
+        expected[8] = startup[i].function >> 4;
+        expected[9] = (startup[i].function << 4) | 0x0c;
+        expected[11] = startup[i].length;
+        memcpy(expected + 12, startup[i].data, startup[i].length);
+        mlb_table_write(s, 0x41, page ? 0xe000 : 0xc000,
+                        page ? 0x807fc07f : 0xc07f807f, rx, rx + 0x80);
+        g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 2);
+        qtest_memread(s, rx + (page ? 0x80 : 0), received, length);
+        g_assert_cmpmem(received, length, expected, length);
+        qtest_writel(s, base + 0x7d0, 2);
+    }
+    mlb_table_write(s, 0x41, 0xc000, 0xc07f807f, rx, rx + 0x80);
+    g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 0);
+    qtest_memwrite(s, tx, semiprotected_command, sizeof(semiprotected_command));
+    mlb_table_write(s, 0x41, 0xc000, 0xc07f807f, rx, rx + 0x80);
+    mlb_table_write(s, 0x42, 0xc000, 0xd07f907f, tx, tx);
+    g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 6);
+    qtest_memread(s, rx, actual, sizeof(data_reply));
+    g_assert_cmpmem(actual, sizeof(data_reply), data_reply, sizeof(data_reply));
+    qtest_writel(s, base + 0x7d0, 6);
+    qtest_memwrite(s, tx, status_ack, sizeof(status_ack));
+    mlb_table_write(s, 0x42, 0xe000, 0x907fd07f, tx, tx);
+    mlb_table_write(s, 0x41, 0xe000, 0x807fc07f, rx, rx + 0x80);
+    g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 6);
+    qtest_memread(s, rx + 0x80, ehci_actual, sizeof(ehci_actual));
+    g_assert_cmpmem(ehci_actual, sizeof(ehci_actual),
+                    ehci_reply, sizeof(ehci_reply));
+    qtest_writel(s, base + 0x7d0, 6);
+    qtest_memwrite(s, tx, watchdog_command, sizeof(watchdog_command));
+    mlb_table_write(s, 0x41, 0xc000, 0xc07f807f, rx, rx + 0x80);
+    mlb_table_write(s, 0x42, 0xc000, 0xd07f907f, tx, tx);
+    g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 6);
+    qtest_memread(s, rx, actual, sizeof(data_reply));
+    g_assert_cmpmem(actual, sizeof(data_reply), data_reply, sizeof(data_reply));
+    qtest_writel(s, base + 0x7d0, 6);
+    qtest_memwrite(s, tx, status_ack, sizeof(status_ack));
+    mlb_table_write(s, 0x42, 0xe000, 0x907fd07f, tx, tx);
+    mlb_table_write(s, 0x41, 0xe000, 0x807fc07f, rx, rx + 0x80);
+    g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 6);
+    qtest_memread(s, rx + 0x80, watchdog_actual, sizeof(watchdog_actual));
+    g_assert_cmpmem(watchdog_actual, sizeof(watchdog_actual),
+                    watchdog_reply, sizeof(watchdog_reply));
+    qtest_writel(s, base + 0x7d0, 6);
+    qtest_memwrite(s, tx, emergency_command, sizeof(emergency_command));
+    mlb_table_write(s, 0x41, 0xc000, 0xc07f807f, rx, rx + 0x80);
+    mlb_table_write(s, 0x42, 0xc000, 0xd07f907f, tx, tx);
+    g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 6);
+    qtest_memread(s, rx, actual, sizeof(data_reply));
+    g_assert_cmpmem(actual, sizeof(data_reply), data_reply, sizeof(data_reply));
+    qtest_writel(s, base + 0x7d0, 6);
+    qtest_memwrite(s, tx, status_ack, sizeof(status_ack));
+    mlb_table_write(s, 0x42, 0xe000, 0x907fd07f, tx, tx);
+    g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 4);
+    qtest_writel(s, base + 0x7d0, 4);
+    for (unsigned i = 0; i < ARRAY_SIZE(watchdog_kicks); i++) {
+        qtest_clock_step(s, 4 * NANOSECONDS_PER_SECOND);
+        qtest_memwrite(s, tx, watchdog_kicks[i], sizeof(watchdog_kicks[i]));
+        mlb_table_write(s, 0x41, 0xe000, 0x807fc07f, rx, rx + 0x80);
+        mlb_table_write(s, 0x42, 0xc000, 0xd07f907f, tx, tx);
+        g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 6);
+        qtest_memread(s, rx + 0x80, actual, sizeof(data_reply));
+        g_assert_cmpmem(actual, sizeof(data_reply),
+                        data_reply, sizeof(data_reply));
+        qtest_writel(s, base + 0x7d0, 6);
+        qtest_memwrite(s, tx, status_ack, sizeof(status_ack));
+        mlb_table_write(s, 0x42, 0xe000, 0x907fd07f, tx, tx);
+        qtest_writel(s, base + 0x7d0, 4);
+    }
+    qtest_memwrite(s, tx, socket_command, sizeof(socket_command));
+    mlb_table_write(s, 0x41, 0xc000, 0xc07f807f, rx, rx + 0x80);
+    mlb_table_write(s, 0x42, 0xc000, 0xd07f907f, tx, tx);
+    g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 6);
+    qtest_memread(s, rx, actual, sizeof(data_reply));
+    g_assert_cmpmem(actual, sizeof(data_reply), data_reply, sizeof(data_reply));
+    qtest_writel(s, base + 0x7d0, 6);
+    qtest_memwrite(s, tx, status_ack, sizeof(status_ack));
+    mlb_table_write(s, 0x42, 0xe000, 0x907fd07f, tx, tx);
+    mlb_table_write(s, 0x41, 0xe000, 0x807fc07f, rx, rx + 0x80);
+    g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 6);
+    qtest_memread(s, rx + 0x80, ehci_actual, sizeof(ehci_actual));
+    g_assert_cmpmem(ehci_actual, sizeof(ehci_actual),
+                    socket_reply, sizeof(socket_reply));
+    qtest_writel(s, base + 0x7d0, 6);
+    qtest_memwrite(s, tx, socket_command2, sizeof(socket_command2));
+    mlb_table_write(s, 0x41, 0xc000, 0xc07f807f, rx, rx + 0x80);
+    mlb_table_write(s, 0x42, 0xc000, 0xd07f907f, tx, tx);
+    g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 6);
+    qtest_memread(s, rx, actual, sizeof(data_reply));
+    g_assert_cmpmem(actual, sizeof(data_reply), data_reply, sizeof(data_reply));
+    qtest_writel(s, base + 0x7d0, 6);
+    qtest_memwrite(s, tx, status_ack, sizeof(status_ack));
+    mlb_table_write(s, 0x42, 0xe000, 0x907fd07f, tx, tx);
+    mlb_table_write(s, 0x41, 0xe000, 0x807fc07f, rx, rx + 0x80);
+    g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 6);
+    qtest_memread(s, rx + 0x80, ehci_actual, sizeof(ehci_actual));
+    g_assert_cmpmem(ehci_actual, sizeof(ehci_actual),
+                    socket_reply2, sizeof(socket_reply2));
+    qtest_writel(s, base + 0x7d0, 6);
+    qtest_memwrite(s, tx, retry_command, sizeof(retry_command));
+    mlb_table_write(s, 0x41, 0xc000, 0xc07f807f, rx, rx + 0x80);
+    mlb_table_write(s, 0x42, 0xc000, 0xd07f907f, tx, tx);
+    g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 6);
+    qtest_memread(s, rx, actual, sizeof(data_reply));
+    g_assert_cmpmem(actual, sizeof(data_reply), data_reply, sizeof(data_reply));
+    qtest_writel(s, base + 0x7d0, 6);
+    qtest_memwrite(s, tx, status_ack, sizeof(status_ack));
+    mlb_table_write(s, 0x42, 0xe000, 0x907fd07f, tx, tx);
+    mlb_table_write(s, 0x41, 0xe000, 0x807fc07f, rx, rx + 0x80);
+    g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 6);
+    qtest_memread(s, rx + 0x80, retry_actual, sizeof(retry_actual));
+    g_assert_cmpmem(retry_actual, sizeof(retry_actual),
+                    retry_reply, sizeof(retry_reply));
+    qtest_writel(s, base + 0x7d0, 6);
+    qtest_memwrite(s, tx, unsupported, sizeof(unsupported));
+    mlb_table_write(s, 0x42, 0xc000, 0xd07f907f, tx, tx);
+    g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 4);
+    qtest_writel(s, base + 0x4e4, 2);
+    g_assert_cmphex(qtest_readl(s, base + 0x4c0) & 0x800, ==, 0x800);
+    qtest_writel(s, base + 0x7d0, 4);
+    qtest_clock_step(s, 5 * NANOSECONDS_PER_SECOND - 1);
+    response = qtest_qmp(s,
+        "{'execute':'qom-get','arguments':{'path':'/machine',"
+        "'property':'experimental-mlb-watchdog-expired'}}");
+    g_assert_false(qdict_haskey(response, "error"));
+    g_assert_false(qdict_get_bool(response, "return"));
+    qobject_unref(response);
+    qtest_clock_step(s, 1);
+    response = qtest_qmp(s,
+        "{'execute':'qom-get','arguments':{'path':'/machine',"
+        "'property':'experimental-mlb-watchdog-expired'}}");
+    g_assert_false(qdict_haskey(response, "error"));
+    g_assert_true(qdict_get_bool(response, "return"));
+    qobject_unref(response);
+    qtest_writel(s, base + 0x4e4, 2);
+    g_assert_cmphex(qtest_readl(s, base + 0x4c0) & 0x800, ==, 0);
+    qtest_memwrite(s, tx, data_command, sizeof(data_command));
+    mlb_table_write(s, 0x42, 0xe000, 0x907fd07f, tx, tx);
+    g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 4);
+    qtest_writel(s, base + 0x4e4, 0x42);
+    g_assert_cmphex(qtest_readl(s, base + 0x4c4) & 0x60000000,
+                    ==, 0x60000000);
+    qtest_writel(s, base + 0x4e4, 2);
+    g_assert_cmphex(qtest_readl(s, base + 0x4c0) & 0x800, ==, 0);
+    qtest_writel(s, base + 0x7d0, 4);
+    qtest_memwrite(s, tx, command, sizeof(command));
+    mlb_table_write(s, 0x41, 0xc000, 0xc07f807f, rx, rx + 0x80);
+    mlb_table_write(s, 0x42, 0xc000, 0xf07f907f, tx, tx);
+    g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 6);
+    qtest_memread(s, rx, actual, sizeof(actual));
+    g_assert_cmpmem(actual, sizeof(actual), reply, sizeof(reply));
+    response = qtest_qmp(s,
+        "{'execute':'qom-get','arguments':{'path':'/machine',"
+        "'property':'experimental-mlb-watchdog-expired'}}");
+    g_assert_false(qdict_haskey(response, "error"));
+    g_assert_false(qdict_get_bool(response, "return"));
+    qobject_unref(response);
+    qtest_system_reset(s);
+    g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 0);
+    qtest_memwrite(s, rx, "\0\0\0\0\0\0\0", sizeof(actual));
+    mlb_table_write(s, 1, 0, 0, 0, 0x7f);
+    mlb_table_write(s, 0x80, 0x09010000, 0, 0, 0);
+    mlb_table_write(s, 0x88, 0x19010000, 0, 0, 0);
+    mlb_table_write(s, 0x41, 0xc000, 0x007f807f, rx, rx + 0x80);
+    qtest_writel(s, base + 0x400, 0x2d);
+    qtest_writel(s, base + 0x488, 2);
+    qtest_writel(s, base + 0x7c0, 5);
+    qtest_writel(s, base + 0x480, 0x8000);
+    g_assert_cmphex(qtest_readl(s, base + 0x7d0), ==, 0);
+    qtest_memread(s, rx, actual, sizeof(actual));
+    g_assert_cmpmem(actual, sizeof(actual), "\0\0\0\0\0\0\0", sizeof(actual));
+    qtest_quit(s);
 }
 
 static void test_mlb_configuration(void)
@@ -6804,6 +7319,44 @@ static void test_timer12_fixed_clock(void)
     qtest_quit(s);
 }
 
+static void test_timer10_clock_handoff(void)
+{
+    const uint32_t clock = 0x4a009728, control = 0x48086038;
+    g_autofree char *ipl = NULL;
+    g_autofree char *options = NULL;
+    g_autoptr(GError) error = NULL;
+    uint8_t header[8];
+    QTestState *s = start_rcc_options(
+        "-machine experimental-power-clocks=on");
+    int fd;
+
+    g_assert_cmphex(qtest_readl(s, clock), ==, 2);
+    g_assert_cmphex(qtest_readl(s, control), ==, 0);
+    qtest_writel(s, control, 1);
+    g_assert_cmphex(qtest_readl(s, control), ==, 1);
+    qtest_writel(s, clock, 0);
+    g_assert_cmphex(qtest_readl(s, clock), ==, 0x30000);
+    qtest_system_reset(s);
+    g_assert_cmphex(qtest_readl(s, clock), ==, 2);
+    g_assert_cmphex(qtest_readl(s, control), ==, 0);
+    qtest_quit(s);
+
+    fd = g_file_open_tmp("mh2p-rcc-timer10-XXXXXX", &ipl, &error);
+    g_assert_no_error(error);
+    g_assert_cmpint(fd, >=, 0);
+    stl_le_p(header, 0xfa001061);
+    stl_le_p(header + 4, 0xeafffffd);
+    g_assert_cmpint(write(fd, header, sizeof(header)), ==, sizeof(header));
+    g_assert_cmpint(ftruncate(fd, 128 * 1024), ==, 0);
+    close(fd);
+    options = g_strdup_printf("-machine experimental-power-clocks=on -bios %s",
+                              ipl);
+    s = start_rcc_options(options);
+    unlink(ipl);
+    g_assert_cmphex(qtest_readl(s, clock), ==, 0x30000);
+    qtest_quit(s);
+}
+
 static void test_gp_timer_count_irq_clock_reset(gconstpointer data)
 {
     const unsigned index = GPOINTER_TO_UINT(data);
@@ -7154,6 +7707,13 @@ int main(int argc, char **argv)
     qtest_add_func("/mh2p-rcc/mcasp-tx-first-active-slot",
                    test_mcasp_tx_first_active_slot);
     qtest_add_func("/mh2p-rcc/mlb-channel-table", test_mlb_channel_table);
+    qtest_add_func("/mh2p-rcc/mlb-tx-dma-experiment",
+                   test_mlb_tx_dma_experiment);
+    qtest_add_func("/mh2p-rcc/mlb-tx-dma-rejects-unsupported",
+                   test_mlb_tx_dma_rejects_unsupported);
+    qtest_add_func("/mh2p-rcc/mlb-tx-dma-irq-routing",
+                   test_mlb_tx_dma_irq_routing);
+    qtest_add_func("/mh2p-rcc/mlb-compat-sync", test_mlb_compat_sync);
     qtest_add_func("/mh2p-rcc/mlb-configuration", test_mlb_configuration);
     qtest_add_func("/mh2p-rcc/ipu-peripheral-clock-domain",
                    test_ipu_peripheral_clock_domain);
@@ -7194,6 +7754,7 @@ int main(int argc, char **argv)
                         GUINT_TO_POINTER(0), test_gp_timer_count_irq_clock_reset);
     qtest_add_data_func("/mh2p-rcc/timer11-count-irq-clock-reset",
                         GUINT_TO_POINTER(1), test_gp_timer_count_irq_clock_reset);
+    qtest_add_func("/mh2p-rcc/timer10-clock-handoff", test_timer10_clock_handoff);
     qtest_add_data_func("/mh2p-rcc/timer10-count-irq-clock-reset",
                         GUINT_TO_POINTER(6), test_gp_timer_count_irq_clock_reset);
     for (unsigned timer = 5; timer <= 8; timer++) {

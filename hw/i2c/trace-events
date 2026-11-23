@@ -15,6 +15,9 @@ i2c_send_async(uint8_t address, uint8_t data) "send_async(addr:0x%02x) data:0x%0
 i2c_recv(uint8_t address, uint8_t data) "recv(addr:0x%02x) data:0x%02x"
 i2c_ack(void) ""
 
+# dra7_i2c.c
+dra7_i2c_start(const char *bus, unsigned addr, bool read, unsigned count, int result) "bus=%s addr=0x%02x read=%d count=%u result=%d"
+
 # pm_smbus.c
 
 smbus_ioport_readb(uint16_t addr, uint8_t data) "[0x%04" PRIx16 "] -> val=0x%02x"

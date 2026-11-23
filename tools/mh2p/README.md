@@ -174,6 +174,173 @@ disable guest watchdogs. `MH2P_DSP_PACE_LOG=1` reports pacing adjustments,
 and `MH2P_DSP_STATS=1` reports DSP batch timings. This setup targets faster
 paired boot, not real-time audio or long-running stability.
 
+For DSP recovery diagnostics, enable `-trace enable=mh2p_rcc_dsp_reset_write`
+on the RCC. This shows which guest CPU wrote the DSP reset-control register,
+its program counter, and the previous and requested reset bits. At 2,000
+cycles per tick, original Audio firmware requested a DSP reboot from its
+INIC reset handler with both adaptive pacing and a fixed 10% virtual clock.
+Tracing MOST showed that network-service recovery sends Audio `(0,1)`, and
+the next MediaLB sync check sends `(1,2)` before polling for frame lock.
+In a dedicated 5,000-cycle trace, the original NetServices `MisService`
+raised `0x8400` from its event `0x10` branch, and the general-error handler
+called `wvdNetServiceReset`. The guest armed the 1,000 ms startup retry
+timer and its callback queued event `0x10`. In a repeat run, the trace
+recorded four calls to start PMS synchronization, but no calls to the
+PMS synchronization receive handler or to the startup timer cancellation
+site before the DSP reset. A subsequent paired trace captured four PMS
+synchronization starts, four completed seven-byte control-buffer copies,
+and four updates to `0x007f907f` in word 1 of the control transmit
+routine's table entry `0x42`. The [public DIM2 driver][dim2] defines that
+entry as the AHB descriptor for channel 2, with a 128-byte buffer capacity
+and both packet-start and ready set; the seven bytes copied are not the
+buffer capacity. Its AHB channel is configured to read from system memory;
+the corresponding channel descriptor configures a 256-byte local data buffer
+at offset `0x80`. These are programmed sizes, not evidence that data moved
+into that buffer. It recorded no PMS synchronization receive. The current
+model stores those table writes but does
+not perform link or DMA transfers, so the trace establishes guest
+submission, not delivery to an INIC. A later recovery also called
+`wvdNetServiceReset` directly through the callback on the `0xC302` retry
+path. Neither call was the separate `MnsFireWatchdogTrigger` error site.
+The [DRA72x TRM][dra72x-trm] (sections 24.12.4.2.2 and 24.12.6, MLB_DCTL)
+describes transmit DMA starting when the local buffer has sufficient space
+and the system buffer is ready; it describes frame lock separately as a
+condition for the MediaLB core to read and serialize that data. The observed
+`DCTL=0x5` selects single-packet mode, DMA mode 1 and software interrupt
+clearing. The TRM says single-packet mode sets done when a packet is done or
+the system buffer is full. This supports investigating independent DMA
+progress, but does not establish the exact behavior of this board without
+frame lock, or any peer delivery or reply. Guest-write-only table traces
+cannot observe a hardware-set done bit.
+The separate local `experimental-mlb-tx-dma=on` experiment models only one
+complete, little-endian, single-packet control TX transfer per empty local
+buffer. It reads a PML-framed packet from RCC RAM, copies it into an internal
+buffer and reports an experimental DMA completion and interrupt; it does not
+send a MediaLB frame, drain the buffer, lock the link or produce a reply.
+Unsupported layouts remain pending and are logged. The read-only QOM
+`experimental-mlb-dbr` property exposes a hex dump of the experimental
+buffer for diagnostics and can contain guest data. The implementation is
+an approximation for local investigation, not a validated controller model.
+Its DMA interrupt follows the pending status and mask even when the
+MediaLB interface is disabled; disabling the interface does not itself
+clear a pending status bit.
+The separate `experimental-mlb-compat-peer=on` option enables the same TX
+approximation and adds narrowly inferred synchronization, FIFO completion,
+EHCI state and watchdog-mode responses through control RX DMA, and records
+the requested emergency condition without implementing its network effects.
+It also sends an inferred version notification, a provisional sequence of
+protected-state status notifications, and acknowledges the observed mid-level
+retry configuration. The status payloads are compatibility assumptions,
+not observed hardware responses.
+It also allocates up to 32 virtual handles for the observed seven-byte socket
+request format; those handles do not by themselves route or carry audio.
+The modeled state is not evidence of a real INIC or network state. This is a
+compatibility prototype, not an OS81110 or a MediaLB link implementation: it
+does not assert frame lock. Its inferred five-second watchdog starts after
+the watchdog-mode reply and is refreshed by the observed trigger command.
+The guest periodically sets bit 7 of the control-message header; the peer
+accepts either form for supported INIC commands.
+After expiry, non-synchronization TX packets complete with an error without
+occupying the TX buffer, and previously occupied compatibility TX buffers
+are cleared; a subsequent synchronization can proceed. This timeout and
+recovery behavior are not validated against hardware.
+Unsupported packets are logged, and the option does not establish working
+audio or endurance.
+In an instrumented paired run, the original firmware passed the inferred
+response through `PmsRx` and its status queue to `PmsSyncIn`, then sent
+another control packet that this peer does not yet support. This confirms
+the guest receive path for the candidate, not full synchronization or
+healthy operation. The same run observed four such replies and ultimately
+another DSP reset; it did not meet the audio endurance goal. Subsequent
+runs showed the firmware consume the inferred FIFO completion and send a
+status acknowledgement. Correcting the INIC receive FIFO then reached the
+firmware's EHCI handler and its protected and attached transitions; the next
+watchdog-mode request remained unsupported and initialization still failed.
+Another run consumed an inferred watchdog-mode response but then blocked on
+an emergency-condition command and reset the DSP. Handling that command let
+the next run reach an unsupported watchdog-trigger packet. Watchdog-trigger
+handling and the timer were added subsequently but have not yet established
+firmware endurance. The firmware accepted two inferred socket-creation
+results and a version notification. With the protected-state notifications
+routed to the appropriate firmware handlers, a subsequent paired run reached
+all eight NetServices initialization-completion bits. It then requested a
+further EHCI transition. An early attached-state response preceded some
+service completions and the firmware still timed out; the peer now waits for
+the guest's subsequent transition request before reporting that state. A
+later periodic-header watchdog trigger blocked that run; support for that
+header form is covered by qtest. A subsequent paired host-clock MTTCG run
+reached 300.41 RCC guest seconds without an observed DSP reset or exit,
+fatal M4 watchdog, or ProcessManager shutdown. The final capture found all
+required DIRANA3_APP, PWR_AMP, MIC_ADC, and SYS_LINK threads present. This
+is a firmware endurance result for the compatibility configuration, not
+proof of full HMI readiness, audio transport, or physical link fidelity.
+The responses have not been validated against real hardware.
+In a paired host-clock MTTCG run with this experiment enabled, four
+channel 2 DMA copies of seven bytes were observed. The original guest still
+requested a DSP reset, and the reset observer stopped the run after the last
+audio-clock sample at 12.18 RCC seconds. The copies therefore do not resolve
+the missing peer or establish audio endurance.
+A second paired run with image-verified MOST probes observed four PMS
+synchronization starts, four transmit copies and four experimental DMA
+completions. The channel 2 descriptor trace shows the guest clearing ready
+and then done after each completion. There were no calls to `PmsSyncIn`,
+and the DSP reset observer again stopped the run. The audio-clock observer
+did not write a sample in that run, so no reset time is inferred from it.
+An additional image-verified trace also recorded four synchronization starts
+and four TX completions, but no entries at `PmsRx`,
+`PmsProcessRxStatusQueue`, or `PmsSyncIn` before the DSP reset. Static
+inspection places `PmsSyncIn` downstream of the status queue. These absent
+probe hits do not establish which peer responses the hardware would send.
+In that trace, channel 1 was configured as control receive: both enabled
+128-byte system-buffer slots were marked ready four times, with a 128-byte
+local buffer. No channel 1 done transition appeared in the guest-write
+trace. This shows receive-buffer setup, not receipt; guest-write traces
+alone cannot prove whether hardware changed a descriptor between writes.
+For an OS81110 peer, the [public datasheet][os81110-datasheet], section 7,
+describes `AllFIFOs:Status(SyncS, StartUp)` after MediaLB initialization
+and `AllFIFOs:Status(SyncS, SyncRcvd)` in response to
+`AllFIFOs:Command(SyncC)`. Its default interface depends on the INIC
+configuration. These symbolic messages are not evidence of this board's
+configuration, serialized bytes, bus scheduling, or a received message.
+The sync poll that follows the Audio notification is downstream of that
+notification; it is not itself the immediate reset trigger.
+That second notification does not indicate frame lock: the subsequent poll
+timed out. The experimental MediaLB clock peer supplies no bus framing.
+The same recovery sequence also occurred in a 5,000-cycle MTTCG endurance
+run, which stopped on a guest-requested DSP reset shortly after 12 RCC
+virtual seconds. The quick boot result does not establish audio endurance.
+A bounded icount control also logged MOST recovery, but Audio's reset
+handler saw `(1,2)` without first seeing `(0,1)` and did not request a DSP
+reboot during the 19-second observation. Avoid treating the absent reboot
+in that control as evidence that MediaLB worked.
+To distinguish register programming from frame synchronization, use
+`-trace 'enable=mh2p_rcc_mlb_*'`. In the observed failed boot the driver
+programmed `MLBC0` to `0x2d`, then repeatedly read `0x2d`: the six-pin
+interface, 2048×Fs speed selection, and enable stuck, but the read-only
+frame-lock bit stayed clear.
+The same trace includes `mh2p_rcc_mlb_table_write`, which records effective
+descriptor words after applying the guest's write mask. In a paired run
+the guest made 260 table writes before the first lock poll and repeated
+table setup during retries; all 4,008 lock polls still returned `0x2d`.
+Local descriptor setup is not evidence that the peer transmitted a frame.
+The [MediaLB specification][medialb-spec] defines frame synchronization
+separately from clock presence and channel transfers. A six-pin peer needs
+to supply the FRAMESYNC pattern and the matching System Channel timing;
+neither can be inferred from the nominal McASP clock.
+
+The experimental power-clock handoff also preserves the original IPL's
+TIMER10 enable before direct-starting QNX. Without that handoff, the
+original IPC loader faults when it tries to stop the timer during a DSP
+reboot, and the subsequent reload and run commands lose their IPC device
+paths. This does not prevent the original MediaLB-triggered reset.
+Booting the IPL itself leaves TIMER10 disabled until firmware enables it;
+clock-gated accesses still fail.
+
+[medialb-spec]: https://ww1.microchip.com/downloads/en/DeviceDoc/TB0400AN4V2%20-%20MediaLB%20Specification%204v2.pdf
+[dra72x-trm]: https://www.ti.com/lit/ug/spruic2/spruic2.pdf
+[dim2]: https://github.com/torvalds/linux/blob/v5.10/drivers/staging/most/dim2/reg.h
+[os81110-datasheet]: https://ww1.microchip.com/downloads/aemDocuments/documents/AIS/ProductDocuments/DataSheets/OS81110-Data-Sheet-60001289.pdf
+
 ## Reproducible checks
 
 Firmware-free synthetic-image, protocol and evidence tests:
@@ -1099,6 +1266,18 @@ not necessarily from an externally driven McASP package pin. See
 SPRUHZ6L section 24.6.4.2.1 and table 24-421.
 A separate native trace confirms that MOST releases INIC reset on
 GPIO8 pin 19 before enabling its MediaLB interface, but lock still fails.
+The RCC I2C start trace (`-trace enable=dra7_i2c_start`) records attempted
+transfers even when no target acknowledges. In a paired boot traced through
+the DSP reset, the firmware did not address the OS81110's factory-default
+7-bit address (`0x20`). It reached the board EEPROM at `0x50` and received
+NACKs at other addresses. This does not rule out an INIC with a custom
+address, but the trace does not establish an I2C configuration exchange.
+Static inspection of the original MOST executable also puts its INIC I2C
+open calls in the firmware and configuration programming routines, after
+switching the INIC to boot mode. Its runtime NetServices control receive
+path instead reads the MediaLB ping-pong buffers and passes the payload to
+`PmsRx`. Emulating an I2C programming endpoint alone would not satisfy
+that runtime path.
 
 The public OS81110 hardware reference (Microchip DS60001289B, sections 7
 and 12.1) distinguishes MediaLB operation from MOST network lock: local
@@ -1110,10 +1289,15 @@ P2865 update package specifically supplies OS81110 V01.02.05 firmware and
 a separate customer-configuration image, rather than only naming that
 family in generic support strings. Its packaged customer configuration
 differs from the configuration embedded in the original MOST executable;
-neither has yet been decoded into port/pin settings. Factory defaults must
+the [vendor IPF parser][inic-ipf] identifies identical 16-byte envelopes
+but ten differing bytes in the 128-byte payloads. The parser does not
+decode the port/pin settings, so this comparison does not establish which
+configuration the board uses at cold boot. Factory defaults must
 not be assumed to describe this board. A future external clock/MediaLB
 model must establish those settings and keep clock presence, frame synchronization,
 MOST network lock, and control-message transport distinct.
+
+[inic-ipf]: https://github.com/MicrochipTech/inic-programming-library/blob/3da2d217db13cb448eb9cbe13114cdd5b76f5f55/ipl/src/ipf.c
 
 For local clock-path experiments only,
 `-machine experimental-power-clocks=on,experimental-mlb-clock-peer=on`
