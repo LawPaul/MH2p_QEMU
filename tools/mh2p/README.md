@@ -1335,7 +1335,9 @@ widths in four-bit increments. Slot cadence is derived from the actual
 selected serial clock, retaining fractional-nanosecond phase across slots.
 Only active TXTDM slots transfer another word into each shifter, refill
 serializer buffers and permit further DMA requests. TXTDMSLOT reports
-the current slot. Clock loss cancels pending serial service; reset clears
+the current slot. Overdue transmit instances are serviced in deadline order,
+and a slot-triggered DMA request is scheduled relative to that slot rather
+than the late host callback. Clock loss cancels pending serial service; reset clears
 the timer. This is word-level serial timing, not an audio output sink.
 External frame input, receive state-machine operation, DIT and burst
 timing remain unsupported; their reset requests are not acknowledged as
@@ -1360,6 +1362,9 @@ retry. A fault after early notification is logged and blocks that DMA path;
 the transfer-controller error registers are not modeled. DMA servicing is
 deferred in 1 ns steps, not calibrated bus timing or a general TPTC queue.
 This is not general EDMA emulation.
+In a bounded paired original-firmware run with the deadline ordering change,
+McASP2 reported no transmit underrun through the last observed 10.23 RCC guest
+seconds. This is not an endurance pass or evidence of audible output.
 No MediaLB frame lock, MOST network lock, MediaLB control replies or
 completion interrupts, or watchdog responses are invented.
 The option defaults off.

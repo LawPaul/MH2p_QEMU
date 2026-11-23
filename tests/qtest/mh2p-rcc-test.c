@@ -4509,6 +4509,51 @@ static void test_mcasp_tx_first_active_slot(void)
     qtest_quit(s);
 }
 
+static void test_mcasp_tx_multiple_clocks_dma(gconstpointer data)
+{
+    const uint32_t clock_only = 0x48460000, tx = 0x48464000;
+    const uint32_t edma = 0x40d10000;
+    bool early = GPOINTER_TO_UINT(data);
+    QTestState *s = start_rcc_options(
+        "-machine experimental-power-clocks=on,experimental-mlb-clock-peer=on");
+
+    qtest_writel(s, 0x48053134, ~(1U << 19));
+    qtest_writel(s, 0x48053194, 1U << 19);
+    qtest_writel(s, clock_only + 0xb0, 0x2f);
+    qtest_writel(s, clock_only + 0xb4, 6);
+    qtest_writel(s, clock_only + 0xa8, 0xf0);
+    qtest_writel(s, clock_only + 0xac, 0x412);
+    qtest_writel(s, clock_only + 0xb8, 1);
+    qtest_writel(s, clock_only + 0xa0, 0x1f00);
+    qtest_clock_step(s, 11);
+
+    qtest_writel(s, tx + 0xb0, 0x27);
+    qtest_writel(s, tx + 0xb4, 6);
+    qtest_writel(s, tx + 0xa8, 0xf0);
+    qtest_writel(s, tx + 0xac, 0x412);
+    qtest_writel(s, tx + 0xb8, 0xff);
+    qtest_writel(s, tx + 0x180, 1);
+    qtest_writel(s, tx + 0x1000, 0x12001);
+    qtest_writel(s, 0x80010000, 0x87654321);
+    qtest_writel(s, edma + 0x4000, early ? 0x0010080c : 0xc);
+    qtest_writel(s, edma + 0x4004, 0x80010000);
+    qtest_writel(s, edma + 0x4008, 0x00200004);
+    qtest_writel(s, edma + 0x400c, 0x45c00000);
+    qtest_writel(s, edma + 0x401c, 1);
+    qtest_writel(s, edma + 0x1030, 8);
+    qtest_clock_step(s, 100);
+    qtest_writel(s, tx + 0xa0, 0x1f00);
+    qtest_clock_step(s, 11 + 1000000);
+
+    g_assert_cmphex(qtest_readl(s, clock_only + 0xa0), ==, 0x1f00);
+    g_assert_cmphex(qtest_readl(s, tx + 0xa0), ==, 0x1f00);
+    g_assert_cmphex(qtest_readl(s, tx + 0xc0), ==, 0);
+    g_assert_cmphex(qtest_readl(s, tx + 0x200), ==, 0x87654321);
+    g_assert_cmpuint(qtest_readl(s, tx + 0x1004), >=, 32);
+    g_assert_cmphex(qtest_readl(s, edma + 0x300), ==, 0);
+    qtest_quit(s);
+}
+
 static void test_mcasp_serializer_fifo_service(void)
 {
     const uint32_t base = 0x48464000;
@@ -7709,6 +7754,10 @@ int main(int argc, char **argv)
                    test_mcasp_tx_state_machine_start);
     qtest_add_func("/mh2p-rcc/mcasp-tx-frame-timing",
                    test_mcasp_tx_frame_timing);
+    qtest_add_data_func("/mh2p-rcc/mcasp-tx-multiple-clocks-dma",
+                        GUINT_TO_POINTER(0), test_mcasp_tx_multiple_clocks_dma);
+    qtest_add_data_func("/mh2p-rcc/mcasp-tx-multiple-clocks-early-dma",
+                        GUINT_TO_POINTER(1), test_mcasp_tx_multiple_clocks_dma);
     qtest_add_func("/mh2p-rcc/mcasp-tx-first-active-slot",
                    test_mcasp_tx_first_active_slot);
     qtest_add_func("/mh2p-rcc/mlb-channel-table", test_mlb_channel_table);

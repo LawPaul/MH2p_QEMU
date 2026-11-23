@@ -841,6 +841,7 @@ typedef struct MH2PRCCMachineState {
     uint32_t mcasp_external_rx_hz[8];
     QEMUTimer *mcasp_sync_timer;
     QEMUTimer *mcasp_dma_timer;
+    int64_t mcasp_dma_deadline;
     QEMUTimer *mcasp_tx_timer;
     bool mcasp_dma_blocked[8];
     struct {
@@ -2108,13 +2109,19 @@ static const MemoryRegionOps rcc_edma_ops = {
     .impl = { .min_access_size = 4, .max_access_size = 4 },
 };
 
-static void rcc_mcasp_dma_schedule(MH2PRCCMachineState *s)
+static void rcc_mcasp_dma_schedule_at(MH2PRCCMachineState *s, int64_t deadline)
 {
     if (s->mlb_clock_peer && s->power_clocks &&
-        !timer_pending(s->mcasp_dma_timer)) {
-        timer_mod(s->mcasp_dma_timer,
-                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1);
+        (!timer_pending(s->mcasp_dma_timer) ||
+         timer_expire_time_ns(s->mcasp_dma_timer) > deadline)) {
+        s->mcasp_dma_deadline = deadline;
+        timer_mod(s->mcasp_dma_timer, deadline);
     }
+}
+
+static void rcc_mcasp_dma_schedule(MH2PRCCMachineState *s)
+{
+    rcc_mcasp_dma_schedule_at(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1);
 }
 
 static bool rcc_dsp_edma_decode(hwaddr *offset, unsigned *region,
@@ -4742,7 +4749,7 @@ unsupported:
     return false;
 }
 
-static void rcc_mcasp_dma_finish_early(MH2PRCCMachineState *s,
+static bool rcc_mcasp_dma_finish_early(MH2PRCCMachineState *s,
                                       unsigned instance)
 {
     unsigned channel = s->mcasp_dma_request[instance].channel;
@@ -4760,7 +4767,7 @@ static void rcc_mcasp_dma_finish_early(MH2PRCCMachineState *s,
         goto failed;
     }
     if (words > 64 - s->mcasp[instance].tx_fifo_level) {
-        return;
+        return false;
     }
     for (unsigned n = 0; n < words; n++) {
         MemTxResult result = s->dsp1 ?
@@ -4786,17 +4793,18 @@ static void rcc_mcasp_dma_finish_early(MH2PRCCMachineState *s,
         }
     }
     s->mcasp_dma_request[instance].pending = false;
-    rcc_mcasp_dma_schedule(s);
-    return;
+    return true;
 
 failed:
     s->mcasp_dma_request[instance].pending = false;
     s->mcasp_dma_blocked[instance] = true;
+    return false;
 }
 
 static void rcc_mcasp_dma(void *opaque)
 {
     MH2PRCCMachineState *s = opaque;
+    int64_t deadline = s->mcasp_dma_deadline;
 
     for (unsigned i = 0; i < ARRAY_SIZE(s->mcasp); i++) {
         uint32_t fifo = s->mcasp[i].config[
@@ -4805,7 +4813,9 @@ static void rcc_mcasp_dma(void *opaque)
         uint32_t format = 0;
 
         if (s->mcasp_dma_request[i].pending) {
-            rcc_mcasp_dma_finish_early(s, i);
+            if (rcc_mcasp_dma_finish_early(s, i)) {
+                rcc_mcasp_dma_schedule_at(s, deadline + 1);
+            }
             continue;
         }
         for (unsigned n = 0; n < ARRAY_SIZE(rcc_mcasp_config); n++) {
@@ -4834,7 +4844,7 @@ static void rcc_mcasp_dma(void *opaque)
                 s->mcasp_dma_blocked[i] = true;
                 s->dsp_edma_missed |= BIT_ULL(channel);
             } else {
-                rcc_mcasp_dma_schedule(s);
+                rcc_mcasp_dma_schedule_at(s, deadline + 1);
             }
             break;
         }
@@ -4872,6 +4882,10 @@ static void rcc_mcasp_tx_load(MH2PRCCMachineState *s, unsigned instance)
             continue;
         }
         if (*serializer & BIT(4)) {
+            trace_mh2p_rcc_mcasp_tx_underrun(
+                instance + 1, n, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                s->mcasp[instance].tx_slot, s->mcasp[instance].tx_fifo_level,
+                s->mcasp[instance].reset_latched, s->mcasp[instance].tx_status);
             s->mcasp[instance].tx_status |= BIT(0);
             s->mcasp[instance].tx_underrun = true;
         } else {
@@ -4898,6 +4912,9 @@ static void rcc_mcasp_tx_start(MH2PRCCMachineState *s, unsigned instance,
         s->mcasp[instance].tx_slot = 0;
         s->mcasp[instance].tx_frame_started = false;
     } else if (!(old & BIT(11))) {
+        trace_mh2p_rcc_mcasp_tx_start(
+            instance + 1, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), old, value,
+            s->mcasp[instance].tx_fifo_level, s->mcasp[instance].tx_status);
         rcc_mcasp_tx_load(s, instance);
     }
 }
@@ -4998,11 +5015,18 @@ static void rcc_mcasp_tx_tick(void *opaque)
 {
     MH2PRCCMachineState *s = opaque;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t earliest = INT64_MAX;
 
+    /* A late callback must not advance another instance past its DMA event. */
+    for (unsigned i = 0; i < ARRAY_SIZE(s->mcasp); i++) {
+        if (s->mcasp[i].tx_deadline) {
+            earliest = MIN(earliest, s->mcasp[i].tx_deadline);
+        }
+    }
     for (unsigned i = 0; i < ARRAY_SIZE(s->mcasp); i++) {
         uint32_t active = 0;
 
-        if (!s->mcasp[i].tx_deadline || s->mcasp[i].tx_deadline > now) {
+        if (s->mcasp[i].tx_deadline != earliest || earliest > now) {
             continue;
         }
         s->mcasp[i].tx_slot =
@@ -5017,6 +5041,8 @@ static void rcc_mcasp_tx_tick(void *opaque)
             /* Each active slot consumes one word per transmit serializer. */
             if (s->mcasp[i].tx_frame_started) {
                 rcc_mcasp_tx_load(s, i);
+                /* Refill follows the slot, even when the host runs late. */
+                rcc_mcasp_dma_schedule_at(s, earliest + 1);
             } else {
                 s->mcasp[i].tx_frame_started = true;
             }

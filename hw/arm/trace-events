@@ -9,6 +9,8 @@ mh2p_rcc_uart3_state(const char *operation, uint64_t value, bool clock, unsigned
 mh2p_rcc_uart3_rhr_origin(int cpu, uint64_t pc, uint64_t value) "cpu=%d pc=0x%" PRIx64 " value=0x%" PRIx64
 mh2p_rcc_gp_timer_write(unsigned timer, uint64_t offset, uint64_t value, unsigned size, uint32_t status, uint32_t enabled, uint32_t control, uint32_t count) "timer=%u offset=0x%" PRIx64 " value=0x%" PRIx64 " size=%u status=0x%x enabled=0x%x control=0x%x count=0x%x"
 mh2p_rcc_dsp_reset_write(int cpu, uint64_t pc, uint32_t old, uint32_t value) "cpu=%d pc=0x%" PRIx64 " old=0x%x value=0x%x"
+mh2p_rcc_mcasp_tx_start(unsigned instance, int64_t time, uint32_t old, uint32_t value, unsigned fifo_level, uint32_t status) "instance=%u time=%" PRId64 " old=0x%x value=0x%x fifo=%u status=0x%x"
+mh2p_rcc_mcasp_tx_underrun(unsigned instance, unsigned serializer, int64_t time, unsigned slot, unsigned fifo_level, uint32_t reset, uint32_t status) "instance=%u serializer=%u time=%" PRId64 " slot=%u fifo=%u reset=0x%x status=0x%x"
 mh2p_rcc_mlb_read(uint64_t addr, uint32_t value) "addr=0x%" PRIx64 " value=0x%x"
 mh2p_rcc_mlb_write(uint64_t addr, uint32_t value, uint32_t effective) "addr=0x%" PRIx64 " value=0x%x effective=0x%x"
 mh2p_rcc_mlb_table_write(unsigned index, uint32_t w0, uint32_t w1, uint32_t w2, uint32_t w3) "index=0x%02x words=%08x %08x %08x %08x"
