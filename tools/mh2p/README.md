@@ -429,7 +429,14 @@ hardware evidence with guessed enumeration tables or readiness stubs.
 RCC I2C transfer termination asserts register-access-ready (ARDY), including
 when the transfer ends with NACK. The NACK remains visible: completion does
 not mean that an amplifier or microphone acknowledged the access, and no
-audio slave is supplied by this controller behavior.
+audio slave is supplied by this controller behavior. The DRA7 DATA register
+transfers one FIFO byte per access, including 16-bit and 32-bit accesses.
+With temporary diagnostic I2C responders, the original driver completed a
+20-byte amplifier read that previously faulted when each halfword read
+consumed two FIFO bytes. Those responders are not audio-device models.
+With the corrected controller and no diagnostic I2C responders, a paired
+firmware run also reached 300.56 RCC guest seconds with the required audio
+threads present and no observed DSP reset or exit.
 
 RCC McSPI master transfers also complete on an unattached SSI bus: SPI has
 no acknowledgement phase. Such accesses report a guest error and receive

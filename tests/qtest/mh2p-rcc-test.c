@@ -2424,6 +2424,8 @@ static void test_i2c_real_slave_fifo_transfer(void)
     g_assert_cmphex(qtest_readl(s, base + 0xc0), ==, 0x4200);
     g_assert_true(qtest_get_irq(s, 56));
     g_assert_cmphex(qtest_readw(s, base + 0x9c), ==, 0x19);
+    g_assert_cmphex(qtest_readl(s, base + 0xc0), ==, 0x4100);
+    g_assert_cmphex(qtest_readl(s, base + 0x9c), ==, 0);
     g_assert_cmphex(qtest_readl(s, base + 0xc0), ==, 0x4000);
     g_assert_false(qtest_get_irq(s, 56));
 
@@ -2431,7 +2433,9 @@ static void test_i2c_real_slave_fifo_transfer(void)
     qtest_writel(s, base + 0xa4, 0x8603);
     qtest_writel(s, base + 0xa4, 0x8403); /* Cannot change an active direction. */
     g_assert_cmphex(qtest_readl(s, base + 0xa4), ==, 0x8602);
-    qtest_writew(s, base + 0x9c, 0x0101); /* TMP105 shutdown configuration. */
+    qtest_writew(s, base + 0x9c, 0xab01);
+    g_assert_cmphex(qtest_readl(s, base + 0x98), ==, 1);
+    qtest_writel(s, base + 0x9c, 0xcd01); /* TMP105 shutdown configuration. */
     g_assert_cmphex(qtest_readl(s, base + 0x98), ==, 0);
     qtest_writel(s, base + 0x98, 1);
     qtest_writel(s, base + 0xa4, 0x8601);
@@ -2447,8 +2451,9 @@ static void test_i2c_real_slave_fifo_transfer(void)
     qtest_writel(s, base + 0xa4, 0x8403);
     g_assert_cmphex(qtest_readl(s, base + 0xc0), ==, 0x5000);
     g_assert_cmphex(qtest_readl(s, base + 0x98), ==, 4);
-    for (unsigned i = 0; i < 10; i++) {
-        qtest_readw(s, base + 0x9c);
+    for (unsigned i = 0; i < 20; i++) {
+        g_assert_cmphex(qtest_readw(s, base + 0x9c), ==,
+                        i == 0 ? 0x19 : i == 1 ? 0 : 0xff);
     }
     g_assert_cmphex(qtest_readl(s, base + 0x98), ==, 0);
     g_assert_cmphex(qtest_readl(s, base + 0xc0), ==, 0x4000);
